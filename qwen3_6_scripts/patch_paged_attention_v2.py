@@ -32,7 +32,8 @@ VLLM_ROOTS = [
     "/usr/local/corex/lib64/python3/dist-packages/vllm",
 ]
 
-V2_MODULE = "paged_attention_v2_pytorch.py"
+V2_MODULE_PYTORCH = "paged_attention_v2_pytorch.py"
+V2_MODULE_TRITON = "paged_attention_v2_triton.py"
 
 
 def find_vllm_root():
@@ -50,7 +51,15 @@ def patch_custom_ops(vllm_root):
         content = f.read()
     
     # Add import at the top (after existing imports)
-    import_line = "from vllm.paged_attention_v2_pytorch import paged_attention_v2_pytorch"
+    import_line = "# Try Triton V2 (single-launch, GPU-parallel) first; PyTorch V2 as fallback
+try:
+    from vllm.paged_attention_v2_triton import paged_attention_v2_triton as _v2_impl
+    _V2_BACKEND = "triton"
+except Exception:
+    from vllm.paged_attention_v2_pytorch import paged_attention_v2_pytorch as _v2_impl
+    _V2_BACKEND = "pytorch"
+import logging
+logging.getLogger("vllm").info(f"PagedAttention V2 backend: {_V2_BACKEND}")"
     if import_line in content:
         print("  [skip] V2 import already present")
     else:
@@ -77,7 +86,7 @@ def patch_custom_ops(vllm_root):
     blocksparse_head_sliding_step: int = 0,
 ) -> None:
     # BI-V100: PyTorch V2 implementation (replaces NotImplementedError)
-    paged_attention_v2_pytorch(
+    _v2_impl(
         out, exp_sum, max_logits, tmp_out,
         query, key_cache, value_cache,
         num_kv_heads, scale, block_tables, seq_lens,

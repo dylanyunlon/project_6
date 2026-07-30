@@ -6,6 +6,7 @@ WORKDIR /workspace/
 # Copy all scripts and the V2 module
 COPY ./qwen3_6_scripts /workspace/qwen3_6_scripts
 COPY ./paged_attention_v2_pytorch.py /workspace/paged_attention_v2_pytorch.py
+COPY ./paged_attention_v2_triton.py /workspace/paged_attention_v2_triton.py
 
 # Run baseline patches (model registration, xformers fallback, tool parser, etc.)
 RUN cd ./qwen3_6_scripts && ./patch_ops.sh
