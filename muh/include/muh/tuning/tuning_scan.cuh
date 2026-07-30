@@ -5,6 +5,13 @@
 //
 // vllm impact: Prefix scan in paged attention block table lookup
 // Competition weight: Input TPS × 2.799
+//
+// DERIVATION (not copy-paste from SM100):
+// - SMEM constraint: tile = threads * items * value_size <= 48KB
+//   SM100 8B tunings (416*23*8=76544, 320*22*8=56320) OVERFLOW on BI-V100
+// - Delay parameters: SM100 L2=50MB, BI-V100 L2=6MB (8.3x smaller)
+//   Smaller L2 → faster coherence → shorter delays
+//   Heuristic: ns *= 0.5, l2w *= 0.6 (to be refined by benchmark)
 
 #pragma once
 
@@ -68,7 +75,7 @@ struct bi100_lookback_1B_o4 {
   static constexpr int threads = 512;
   static constexpr int items   = 18;
   static constexpr LookbackDelayPolicy delay = {
-    LookbackDelayAlgorithm::exponential_backon, 768, 820};
+    LookbackDelayAlgorithm::exponential_backon, 384, 492};
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
   static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
   static constexpr CacheLoadModifier load_mod      = LOAD_DEFAULT;
@@ -79,7 +86,7 @@ struct bi100_lookback_2B_o4 {
   static constexpr int threads = 512;
   static constexpr int items   = 13;
   static constexpr LookbackDelayPolicy delay = {
-    LookbackDelayAlgorithm::exponential_backon, 1384, 720};
+    LookbackDelayAlgorithm::exponential_backon, 692, 432};
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
   static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
   static constexpr CacheLoadModifier load_mod      = LOAD_DEFAULT;
@@ -90,7 +97,7 @@ struct bi100_lookback_4B_o4 {
   static constexpr int threads = 384;
   static constexpr int items   = 22;
   static constexpr LookbackDelayPolicy delay = {
-    LookbackDelayAlgorithm::exponential_backon_jitter, 1904, 830};
+    LookbackDelayAlgorithm::exponential_backon_jitter, 952, 498};
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
   static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
   static constexpr CacheLoadModifier load_mod      = LOAD_DEFAULT;
@@ -101,29 +108,31 @@ struct bi100_lookback_4B_o8 {
   static constexpr int threads = 416;
   static constexpr int items   = 19;
   static constexpr LookbackDelayPolicy delay = {
-    LookbackDelayAlgorithm::exponential_backon, 956, 550};
+    LookbackDelayAlgorithm::exponential_backon, 478, 330};
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
   static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
   static constexpr CacheLoadModifier load_mod      = LOAD_CA;
 };
 
 struct bi100_lookback_8B_o4 {
-  // SM100 ref: ipt_23.tpb_416.ns_772.dcid_5.l2w_710 → 1.089x
+  // SM100 ref: ipt_23.tpb_416 → tile=76544 > 49152 SMEM OVERFLOW
+  // Derived: items = 49152/(416*8) = 14. Delay halved (L2 6MB vs 50MB).
   static constexpr int threads = 416;
-  static constexpr int items   = 23;
+  static constexpr int items   = 14;
   static constexpr LookbackDelayPolicy delay = {
-    LookbackDelayAlgorithm::exponential_backon_jitter_window, 772, 710};
+    LookbackDelayAlgorithm::exponential_backon_jitter_window, 386, 426};
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
   static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
   static constexpr CacheLoadModifier load_mod      = LOAD_DEFAULT;
 };
 
 struct bi100_lookback_8B_o8 {
-  // SM100 ref: ipt_22.tpb_320.ns_328.dcid_2.l2w_965 → 1.080x
+  // SM100 ref: ipt_22.tpb_320 → tile=56320 > 49152 SMEM OVERFLOW
+  // Derived: items = 49152/(320*8) = 19. Delay: ns*0.5, l2w*0.6.
   static constexpr int threads = 320;
-  static constexpr int items   = 22;
+  static constexpr int items   = 19;
   static constexpr LookbackDelayPolicy delay = {
-    LookbackDelayAlgorithm::exponential_backoff, 328, 965};
+    LookbackDelayAlgorithm::exponential_backoff, 164, 579};
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
   static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
   static constexpr CacheLoadModifier load_mod      = LOAD_DEFAULT;

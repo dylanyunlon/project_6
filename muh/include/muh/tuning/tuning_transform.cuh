@@ -92,9 +92,10 @@ struct policy_selector {
     if (items_for_vec < 1) items_for_vec = 1;
 
     // items_for_latency: enough items to hide memory latency
-    // CCCL uses cc_to_min_bytes_in_flight(cc) which is ~48KB for SM90+
-    // For BI-V100: estimate 48KB in flight, 256 threads
-    int bytes_in_flight = 48 * 1024;
+    // CCCL cc_to_min_bytes_in_flight: B200=64KB, H100=48KB, A100=16KB, V100=12KB
+    // BI-V100 per-SM BW = 900/50 = 18 GB/s ≈ A100 (2000/108 = 18.5 GB/s)
+    // → Use 16KB (A100-level), not 48-64KB
+    int bytes_in_flight = 16 * 1024;
     int items_for_latency = bytes_in_flight / (256 * min_elem_size);
     if (items_for_latency < 1) items_for_latency = 1;
 

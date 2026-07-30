@@ -106,6 +106,17 @@ int main() {
     CHECK_EQ(p.lookback.threads_per_block, 384, "scan.f32.lookback.threads=384");
     CHECK_EQ(p.lookback.items_per_thread, 22, "scan.f32.lookback.items=22");
     CHECK_NONZERO(p.lookahead.reduce_and_scan_warps, "scan.f32.lookahead.warps");
+
+    // 8-byte scan: was SMEM overflow with SM100 values (416*23*8=76544 > 49152)
+    auto ps8 = policy_selector{
+      .input_value_size = 8, .accum_size = 8, .offset_size = 4,
+      .input_type = type_t::int64, .accum_type = type_t::int64,
+      .operation_t = op_kind_t::plus, .is_primitive_accum = true,
+    };
+    auto p8 = ps8(hw);
+    CHECK_EQ(p8.lookback.items_per_thread, 14, "scan.8B.items=14(derived)");
+    CHECK_TRUE(p8.lookback.threads_per_block * p8.lookback.items_per_thread * 8 <= 49152,
+               "scan.8B.tile_fits_48KB_smem");
   }
 
   // --- batch_memcpy: two-tier ---
