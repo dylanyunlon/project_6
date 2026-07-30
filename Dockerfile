@@ -23,6 +23,11 @@ RUN python3 /workspace/qwen3_6_scripts/patch_triton_tuning.py
 #    Triton Flash Attention is 10-50x faster than PyTorch for-loop fallback
 RUN python3 /workspace/qwen3_6_scripts/patch_enable_triton.py
 
+# 5. head_dim=256 support: Qwen3.6 uses head_dim=256
+#    BLOCK=64 overflows SMEM (64×256×2×2=64KB > 48KB)
+#    → BLOCK=32 for head_dim=256 (32×256×2×2=32KB ≤ 48KB)
+RUN python3 /workspace/qwen3_6_scripts/patch_head256_triton.py
+
 # 4. Raise decode threshold: compiled paged_attention_v1 up to 65536
 #    instead of falling back to Python at 32768
 RUN python3 /workspace/qwen3_6_scripts/patch_vectorized_decode.py
