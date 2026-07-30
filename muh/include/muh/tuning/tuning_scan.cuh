@@ -200,10 +200,8 @@ struct policy_selector {
 
   /// Get the best lookback policy for BI-V100
   constexpr ScanLookbackPolicy get_lookback(const hardware_capability& hw) const {
-    if (!hw.at_least(hardware_capability::vendor_t::iluvatar, 100))
-      goto fallback;
-
-    if (operation_t == op_kind_t::plus && is_primitive_accum) {
+    if (hw.at_least(hardware_capability::vendor_t::iluvatar, 100)
+        && operation_t == op_kind_t::plus && is_primitive_accum) {
       if (offset_size == 4) {
         switch (input_value_size) {
           case 1: return {bi100_lookback_1B_o4::threads, bi100_lookback_1B_o4::items,
@@ -222,6 +220,7 @@ struct policy_selector {
                           bi100_lookback_8B_o4::load_algo, bi100_lookback_8B_o4::load_mod,
                           bi100_lookback_8B_o4::store_algo, BLOCK_SCAN_WARP_SCANS,
                           bi100_lookback_8B_o4::delay};
+          default: break;
         }
       } else if (offset_size == 8) {
         switch (input_value_size) {
@@ -233,11 +232,12 @@ struct policy_selector {
                           bi100_lookback_8B_o8::load_algo, bi100_lookback_8B_o8::load_mod,
                           bi100_lookback_8B_o8::store_algo, BLOCK_SCAN_WARP_SCANS,
                           bi100_lookback_8B_o8::delay};
+          default: break;
         }
       }
     }
 
-  fallback:
+    // Fallback
     return {bi100_lookback_default::threads, bi100_lookback_default::items,
             bi100_lookback_default::load_algo, bi100_lookback_default::load_mod,
             bi100_lookback_default::store_algo, BLOCK_SCAN_WARP_SCANS,

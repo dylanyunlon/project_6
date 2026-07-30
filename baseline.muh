@@ -1,24 +1,14 @@
-# baseline.muh — Competition reference configuration
-# Corresponds to: dev.modelhub.org.cn EngineX-Iluvatar/enginex-vllm-bi100-qwen36
+# baseline.muh — Competition vllm launch configuration
 #
-# This is the starting point. All tuning values are pending BI-V100 benchmarks.
-# Child .muh files use 'extends: baseline.muh' to override specific algorithms.
-
-# --- Hardware description ---
-hardware:
-  name: Iluvatar-BI-V100-50c-200G
-  gpu_count: 4
-  # These need to be confirmed on actual hardware:
-  warp_size: 32
-  max_threads_per_block: 1024
-  max_shared_memory_per_block: 49152
-  max_registers_per_thread: 255
-  l2_cache_size_bytes: 6291456
-  memory_bandwidth_gbps: 900
-  compute_capability: iluvatar_bi100
+# This file stores ONLY the vllm server launch config.
+# Kernel tuning values live in muh/include/muh/tuning/tuning_*.cuh
+# as constexpr structs — NOT here.
+#
+# Pipeline:
+#   muh/tuning/*.cuh (bi100_* values) → gen_patch.py → vllm kernel patches
+#   baseline.muh (vllm config)        → gen_yaml.py → computility-run.yaml
 
 # --- vllm launch configuration ---
-# Maps directly to computility-run.yaml command
 vllm:
   model_path: /model
   served_model_name: llm
@@ -37,86 +27,7 @@ vllm:
   reasoning_parser: qwen3
   enable_prefix_caching: true
 
-# --- Concurrency ---
 concurrency: 1
 
-# --- Environment ---
 env:
   VLLM_ENGINE_ITERATION_TIMEOUT_S: 3600
-
-# --- Tuning overrides (per CCCL algorithm) ---
-# Each key corresponds to a tuning_*.cuh schema in muh/schema/
-# Values are TBD until we run benchmarks on BI-V100
-#
-# Priority order (by competition score impact):
-#   1. reduce   — attention reduction (Output TPS × 16.796)
-#   2. topk     — sampling top-k/top-p (Output TPS × 16.796)
-#   3. scan     — prefix scan in paged attention
-#   4. transform — activation kernels (SiLU, GELU)
-#   5. batch_memcpy — KV cache management (Cache TPS × 0.56)
-#   6. for      — RoPE position encoding
-
-tuning:
-  reduce:
-    _priority: P0
-    _vllm_impact: attention_reduction
-    _score_weight: Output TPS × 16.796
-    # CCCL SM90 reference: threads=128, items=24, vec_size=4
-    # CCCL SM100 reference: threads varies by accum_size
-    threads_per_block: null
-    items_per_thread: null
-    vec_size: null
-
-  topk:
-    _priority: P0
-    _vllm_impact: sampling_decode
-    _score_weight: Output TPS × 16.796
-    # CCCL reference: threads=512, items=4, bits_per_pass=11
-    threads_per_block: null
-    items_per_thread: null
-    bits_per_pass: null
-
-  scan:
-    _priority: P0
-    _vllm_impact: paged_attention_prefix_scan
-    _score_weight: Input TPS × 2.799
-    # CCCL SM90 lookback: threads=128, items=24, delay=fixed(688, 1140) for float32
-    # CCCL SM100 lookback: threads=384, items=22, delay=exponential_backon(1904, 830)
-    # CCCL SM100 lookahead: warps=4, items=80-1, lookahead_items=3
-    threads_per_block: null
-    items_per_thread: null
-    load_algorithm: null
-    store_algorithm: null
-    scan_algorithm: null
-
-  transform:
-    _priority: P1
-    _vllm_impact: activation_elementwise
-    _score_weight: Output TPS × 16.796
-    threads_per_block: null
-    items_per_thread: null
-
-  batch_memcpy:
-    _priority: P1
-    _vllm_impact: kv_cache_copy
-    _score_weight: Cache TPS × 0.56
-    threads_per_block: null
-
-  for:
-    _priority: P2
-    _vllm_impact: rope_position_encoding
-    threads_per_block: null
-    items_per_thread: null
-
-  radix_sort:
-    _priority: P2
-    _vllm_impact: beam_search_token_sort
-    threads_per_block: null
-    items_per_thread: null
-    radix_bits: null
-
-  merge:
-    _priority: P2
-    _vllm_impact: sequence_merging
-    threads_per_block: null
-    items_per_thread: null
