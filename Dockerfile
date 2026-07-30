@@ -10,11 +10,19 @@ COPY ./paged_attention_v2_pytorch.py /workspace/paged_attention_v2_pytorch.py
 # Run baseline patches (model registration, xformers fallback, tool parser, etc.)
 RUN cd ./qwen3_6_scripts && ./patch_ops.sh
 
-# BI-V100 performance patches:
 # 1. PagedAttention V2 — fills the NotImplementedError hole
 #    Enables partitioned attention for long sequences (>8192 tokens)
-#    Expected: 30-50% Output TPS improvement on decode-heavy workloads
 RUN python3 /workspace/qwen3_6_scripts/patch_paged_attention_v2.py
 
-# 2. Triton kernel tuning — NUM_WARPS 8→4 for better SM occupancy
+# 2. Triton kernel tuning: BLOCK=64, NUM_WARPS=4
+#    SMEM: BLOCK_N=64 × head_dim=128 × 2B × 2(K+V) = 32KB ≤ 48KB
+#    Occupancy: 4 warps allows 2 blocks/SM vs 1 at 8 warps
 RUN python3 /workspace/qwen3_6_scripts/patch_triton_tuning.py
+
+# 3. Enable Triton kernels with automatic fallback to PyTorch if they hang
+#    Triton Flash Attention is 10-50x faster than PyTorch for-loop fallback
+RUN python3 /workspace/qwen3_6_scripts/patch_enable_triton.py
+
+# 4. Raise decode threshold: compiled paged_attention_v1 up to 65536
+#    instead of falling back to Python at 32768
+RUN python3 /workspace/qwen3_6_scripts/patch_vectorized_decode.py
