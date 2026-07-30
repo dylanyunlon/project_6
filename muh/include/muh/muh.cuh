@@ -1,28 +1,7 @@
 // muh/include/muh/muh.cuh — Top-level muh header
 //
-// Provides the complete tuning dispatch for Iluvatar BI-V100.
+// Complete BI-V100 tuning dispatch for all 26 CCCL algorithms.
 // Include this single header to get all tuning policies.
-//
-// Usage:
-//   #include <muh/muh.cuh>
-//
-//   auto hw = muh::target_hw;  // BI-V100 by default
-//   auto reduce_policy = muh::tuning::reduce::policy_selector{
-//       .accum_t = muh::tuning::type_t::float32,
-//       .operation_t = muh::tuning::op_kind_t::plus,
-//       .offset_size = 4,
-//       .accum_size = 4,
-//   }(hw);
-//
-//   auto scan_policy = muh::tuning::scan::policy_selector{
-//       .input_value_size = 4,
-//       .accum_size = 4,
-//       .offset_size = 4,
-//       .input_type = muh::tuning::type_t::float32,
-//       .accum_type = muh::tuning::type_t::float32,
-//       .operation_t = muh::tuning::op_kind_t::plus,
-//       .is_primitive_accum = true,
-//   }(hw);
 
 #pragma once
 
@@ -32,34 +11,52 @@
 // Shared types (compatible with CCCL)
 #include "muh/tuning/common.cuh"
 
-// Per-algorithm tuning (P0 = highest priority for competition)
-#include "muh/tuning/tuning_reduce.cuh"      // P0: attention reduction
-#include "muh/tuning/tuning_topk.cuh"        // P0: sampling top-k/top-p
-#include "muh/tuning/tuning_scan.cuh"        // P0: prefix scan in paged attention
+// P0: Highest priority for competition (Output TPS × 16.796)
+#include "muh/tuning/tuning_reduce.cuh"
+#include "muh/tuning/tuning_topk.cuh"
+#include "muh/tuning/tuning_scan.cuh"
 
-// P1
-#include "muh/tuning/tuning_transform.cuh"   // P1: activation kernels
-#include "muh/tuning/tuning_batch_memcpy.cuh" // P1: KV cache management
+// P1: High priority
+#include "muh/tuning/tuning_transform.cuh"
+#include "muh/tuning/tuning_transform_tile.cuh"
+#include "muh/tuning/tuning_batch_memcpy.cuh"
+#include "muh/tuning/tuning_radix_sort.cuh"
+#include "muh/tuning/tuning_reduce_by_key.cuh"
+#include "muh/tuning/tuning_scan_by_key.cuh"
+#include "muh/tuning/tuning_select_if.cuh"
+#include "muh/tuning/tuning_histogram.cuh"
+#include "muh/tuning/tuning_merge.cuh"
+#include "muh/tuning/tuning_merge_sort.cuh"
+#include "muh/tuning/tuning_unique_by_key.cuh"
+#include "muh/tuning/tuning_batched_topk.cuh"
 
-// P2
-#include "muh/tuning/tuning_for.cuh"         // P2: RoPE position encoding
+// P2: Segmented/specialized
+#include "muh/tuning/tuning_for.cuh"
+#include "muh/tuning/tuning_segmented_reduce.cuh"
+#include "muh/tuning/tuning_segmented_scan.cuh"
+#include "muh/tuning/tuning_segmented_sort.cuh"
+#include "muh/tuning/tuning_segmented_radix_sort.cuh"
+#include "muh/tuning/tuning_three_way_partition.cuh"
+#include "muh/tuning/tuning_rle_encode.cuh"
+#include "muh/tuning/tuning_rle_non_trivial_runs.cuh"
+
+// P3: Utility
+#include "muh/tuning/tuning_adjacent_difference.cuh"
+#include "muh/tuning/tuning_find.cuh"
+#include "muh/tuning/tuning_find_bound_sorted_values.cuh"
 
 namespace muh {
-
-/// Version info
 constexpr int MUH_VERSION_MAJOR = 0;
-constexpr int MUH_VERSION_MINOR = 1;
+constexpr int MUH_VERSION_MINOR = 2;
 constexpr int MUH_VERSION_PATCH = 0;
+constexpr int MUH_ALGORITHM_COUNT = 26;
 
-/// Competition scoring formula
-/// Token吞吐加权值 = Output TPS × 16.796 + Input TPS × 2.799 + Cache TPS × 0.56
 struct scoring {
   static constexpr double output_weight = 16.796;
   static constexpr double input_weight  = 2.799;
   static constexpr double cache_weight  = 0.56;
-  static constexpr double baseline_threshold = 8000.0;  // minimum to pass
-  static constexpr double advanced_uplift    = 0.30;    // 30% for advanced prize
-  static constexpr double special_uplift     = 0.50;    // 50% for special prize
+  static constexpr double baseline_threshold = 8000.0;
+  static constexpr double advanced_uplift    = 0.30;
+  static constexpr double special_uplift     = 0.50;
 };
-
 } // namespace muh
