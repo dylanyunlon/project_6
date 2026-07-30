@@ -4,6 +4,18 @@
 //
 // vllm impact: Top-k / top-p sampling in decode stage
 // Competition weight: Output TPS × 16.796 (highest priority, tied with reduce)
+//
+// CCCL SM90+ policy_selector (the ground truth):
+//   bits_per_pass = calc_bits_per_pass(key_size):
+//     key_size 1   → 8
+//     key_size 2   → 8   (but note: CCCL default returns 11 for 2/4/8,
+//                          only key_size=1 returns 8. See switch below.)
+//     key_size 4   → 11
+//     key_size 8   → 11
+//   items_per_thread = max(1, 4 * 4 / key_size)  // 16 bytes per thread
+//   threads_per_block = 512
+//   load_algorithm = BLOCK_LOAD_VECTORIZE  (NOT BLOCK_LOAD_DIRECT)
+//   scan_algorithm = BLOCK_SCAN_WARP_SCANS
 
 #pragma once
 
@@ -12,7 +24,7 @@
 
 namespace muh::tuning::topk {
 
-/// Top-k policy (mirrors cub's topk_policy)
+/// Top-k policy (mirrors cub::detail::topk::topk_policy)
 struct TopkPolicy {
   int threads_per_block;
   int items_per_thread;
@@ -22,82 +34,68 @@ struct TopkPolicy {
 };
 
 // ============================================================
-// BI-V100 tuning values
+// bits_per_pass calculation — must match CCCL exactly
 //
-// CCCL reference from tuning_topk.cuh policy_selector:
-//   The CCCL topk uses radix-based selection with configurable bits_per_pass.
-//   Key insight: bits_per_pass trades off #passes vs per-pass work.
-//   For small key_size (1-2B): 4-6 bits optimal
-//   For large key_size (4-8B): 8-11 bits optimal
+// CCCL source (tuning_topk.cuh):
+//   case 1: default: return 8;
+//   case 2: case 4: case 8: return 11;
 //
-//   Default: threads=512, items=nominal_4b*4/key_size, bits=calc_bits_per_pass(key_size)
-//   calc_bits_per_pass: key_size<=2 → 8, key_size<=4 → 9, key_size<=8 → 10, else → 11
+// Previous muh version had a wrong mapping:
+//   key_size<=2 → 8, key_size<=4 → 9, key_size<=8 → 10
+// This was WRONG. CCCL's actual function returns 11 for 2/4/8.
 // ============================================================
 
-/// BI-V100 topk for 2-byte keys (float16/bfloat16 — most relevant for LLM logits)
-struct bi100_topk_2B {
-  // LLM decode: logits are typically fp16/bf16, so key_size=2
-  // CCCL default for 2B: bits_per_pass=8, items=4*4/2=8
-  static constexpr int threads        = 512;
-  static constexpr int items           = 8;    // nominal_4b_items=4, scaled: 4*4/2=8
-  static constexpr int bits_per_pass   = 8;
-  static constexpr BlockLoadAlgorithm load_algo = BLOCK_LOAD_DIRECT;
-  static constexpr BlockScanAlgorithm scan_algo = BLOCK_SCAN_WARP_SCANS;
-};
-
-/// BI-V100 topk for 4-byte keys (float32)
-struct bi100_topk_4B {
-  static constexpr int threads        = 512;
-  static constexpr int items           = 4;    // nominal_4b_items=4, scaled: 4*4/4=4
-  static constexpr int bits_per_pass   = 9;
-  static constexpr BlockLoadAlgorithm load_algo = BLOCK_LOAD_DIRECT;
-  static constexpr BlockScanAlgorithm scan_algo = BLOCK_SCAN_WARP_SCANS;
-};
-
-/// BI-V100 default fallback
-struct bi100_topk_default {
-  static constexpr int threads        = 256;
-  static constexpr int items           = 4;
-  static constexpr int bits_per_pass   = 8;
-  static constexpr BlockLoadAlgorithm load_algo = BLOCK_LOAD_DIRECT;
-  static constexpr BlockScanAlgorithm scan_algo = BLOCK_SCAN_WARP_SCANS;
-};
+constexpr int calc_bits_per_pass(int key_size) {
+  switch (key_size) {
+    case 1:
+    default:
+      return 8;
+    case 2:
+    case 4:
+    case 8:
+      return 11;
+  }
+}
 
 // ============================================================
 // policy_selector
+//
+// Matches CCCL's SM90+ path exactly:
+//   threads = 512
+//   items = max(1, nominal_4b(4) * 4 / key_size)
+//   load = BLOCK_LOAD_VECTORIZE
+//   scan = BLOCK_SCAN_WARP_SCANS
+//   bits = calc_bits_per_pass(key_size)
+//
+// BI-V100 values: using SM100 as starting point.
+// Once benchmarked on BI-V100, items/threads may diverge.
 // ============================================================
 
 struct policy_selector {
   int key_size;
 
-  static constexpr int calc_bits_per_pass(int ks) {
-    if (ks <= 2) return 8;
-    if (ks <= 4) return 9;
-    if (ks <= 8) return 10;
-    return 11;
-  }
-
   constexpr TopkPolicy operator()(const hardware_capability& hw) const {
     if (hw.at_least(hardware_capability::vendor_t::iluvatar, 100)) {
-      switch (key_size) {
-        case 1:
-        case 2:
-          return {bi100_topk_2B::threads, bi100_topk_2B::items,
-                  bi100_topk_2B::load_algo, bi100_topk_2B::scan_algo,
-                  bi100_topk_2B::bits_per_pass};
-        case 4:
-          return {bi100_topk_4B::threads, bi100_topk_4B::items,
-                  bi100_topk_4B::load_algo, bi100_topk_4B::scan_algo,
-                  bi100_topk_4B::bits_per_pass};
-      }
+      // SM90+ path from CCCL: 16 bytes per thread
+      constexpr int nominal_4b_items = 4;
+      int items = nominal_4b_items * 4 / key_size;
+      if (items < 1) items = 1;
+
+      return {512, items,
+              BLOCK_LOAD_VECTORIZE,  // CCCL uses VECTORIZE, not DIRECT
+              BLOCK_SCAN_WARP_SCANS,
+              calc_bits_per_pass(key_size)};
     }
 
-    // Fallback
-    int items = (4 * 4) / key_size;
+    // Fallback: older arch path
+    constexpr int nominal_4b_items = 4;
+    int items = nominal_4b_items * 4 / key_size;
     if (items < 1) items = 1;
-    if (items > 4) items = 4;
-    return {bi100_topk_default::threads, items,
-            bi100_topk_default::load_algo, bi100_topk_default::scan_algo,
+    if (items > nominal_4b_items) items = nominal_4b_items;
+
+    return {512, items,
+            BLOCK_LOAD_VECTORIZE,
+            BLOCK_SCAN_WARP_SCANS,
             calc_bits_per_pass(key_size)};
   }
 };

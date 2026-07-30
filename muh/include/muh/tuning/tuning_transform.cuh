@@ -4,6 +4,14 @@
 //
 // vllm impact: Activation functions (SiLU, GELU), RMSNorm, residual add
 // Competition weight: Output TPS × 16.796
+//
+// CCCL structure: three transform policy types selected by iterator properties:
+//   1. TransformVectorizedPolicy — contiguous + trivially_relocatable inputs
+//   2. TransformAsyncCopyPolicy — SM90+ bulk copy (cp.async.bulk)
+//   3. TransformPrefetchPolicy — fallback when stable_address needed
+//
+// For vllm: activations are contiguous dense fp16/bf16 tensors.
+// → primarily hits the vectorized path.
 
 #pragma once
 
@@ -12,86 +20,103 @@
 
 namespace muh::tuning::transform {
 
-/// Bulk transform policy (for contiguous input/output)
-struct BulkPolicy {
+/// Vectorized transform: coalesced loads via vector types
+struct VectorizedPolicy {
   int threads_per_block;
   int items_per_thread;
-  int vec_size;          // vectorization width
+  int vec_size;
 };
 
-/// No-input policy (for fill/memset operations)
+/// Async copy transform: SM90+ bulk shared memory copy
+struct AsyncCopyPolicy {
+  int threads_per_block;
+  int min_items_per_thread;
+  int store_vec_size;
+};
+
+/// Prefetch transform: prefetch-based fallback
+struct PrefetchPolicy {
+  int threads_per_block;
+};
+
+/// Fill policy (no input, e.g. memset)
 struct FillPolicy {
   int threads_per_block;
-  int items_per_thread_no_input;
+  int items_per_thread;
 };
 
-/// Full transform policy
+/// Full transform policy — selected at dispatch time based on iterator properties
 struct TransformPolicy {
-  BulkPolicy bulk;
+  VectorizedPolicy vectorized;
+  AsyncCopyPolicy async_copy;
+  PrefetchPolicy prefetch;
   FillPolicy fill;
 };
 
 // ============================================================
-// BI-V100 tuning values
+// BI-V100 tuning
 //
-// CCCL reference from tuning_transform.cuh:
-//   Default bulk: threads=256, items=auto, vec_size=auto
-//   The transform kernel is bandwidth-bound for large elementwise ops.
-//   Key insight: vec_size should match the hardware's natural vector width.
-//   For NVIDIA: vec_size is typically 4 (128-bit loads).
-//   For BI-V100: TBD, likely also 4 or 8.
+// CCCL SM90+ vectorized path:
+//   threads = 256 (SM90) or 128 (SM100)
+//   items = computed from: max(items_for_vec, items_for_latency)
+//     items_for_vec = ceil(vec_bytes / min_elem_size)
+//     items_for_latency = (min_bytes_in_flight) / (threads * elem_size)
+//   vec_size = auto (power-of-2 aligned to hardware vector width)
 //
-//   items_per_thread is computed as:
-//     items_for_vec = ceil(vector_bytes / min_elem_size)
-//     items_for_latency = (latency * bandwidth) / (threads * elem_size)
-//     items = max(items_for_vec, items_for_latency)
-// ============================================================
-
-struct bi100_bulk_default {
-  static constexpr int threads  = 256;
-  static constexpr int items    = 8;    // conservative starting point
-  static constexpr int vec_size = 4;    // 128-bit vector loads
-};
-
-struct bi100_fill_default {
-  static constexpr int threads = 256;
-  static constexpr int items   = 2;
-};
-
-// ============================================================
-// policy_selector
+// CCCL SM90+ async_copy path:
+//   threads = 256 (SM90) or 128 (SM100)
+//   min_items_per_thread = computed from SMEM capacity
+//   store_vec_size = auto_ublkcp_store_vec_size(output.value_type_size)
+//
+// CCCL prefetch:
+//   threads = 256
+//
+// For BI-V100: start with SM100 values (128 threads for bulk/async,
+// 256 for prefetch). vec_size = 4 (128-bit loads, standard for most GPUs).
 // ============================================================
 
 struct policy_selector {
-  int min_elem_size;    // minimum element size across all inputs
-  int max_elem_size;    // maximum element size
-  int num_inputs;       // number of input iterators
+  int min_elem_size;
+  int max_elem_size;
+  int num_inputs;
+  bool all_contiguous;
+  bool all_trivially_relocatable;
+  bool requires_stable_address;
 
   constexpr TransformPolicy operator()(const hardware_capability& hw) const {
-    if (hw.at_least(hardware_capability::vendor_t::iluvatar, 100)) {
-      // For BI-V100: start with CCCL defaults, tune via benchmark
-      int vec_size = bi100_bulk_default::vec_size;
+    // Compute vectorization params
+    int vec_size = 4; // 128-bit, matches CCCL default
 
-      // Compute items_per_thread based on vectorization
-      int items_for_vec = (vec_size * 4) / min_elem_size; // 4 = sizeof(int)
-      if (items_for_vec < 1) items_for_vec = 1;
+    // items_for_vec: how many items fit in one vector load
+    int items_for_vec = (vec_size * 4) / min_elem_size; // 4 = sizeof(int)
+    if (items_for_vec < 1) items_for_vec = 1;
 
-      // Ensure items is a multiple of vec_size
-      int items = items_for_vec;
-      if (items % vec_size != 0) {
-        items = ((items / vec_size) + 1) * vec_size;
-      }
+    // items_for_latency: enough items to hide memory latency
+    // CCCL uses cc_to_min_bytes_in_flight(cc) which is ~48KB for SM90+
+    // For BI-V100: estimate 48KB in flight, 256 threads
+    int bytes_in_flight = 48 * 1024;
+    int items_for_latency = bytes_in_flight / (256 * min_elem_size);
+    if (items_for_latency < 1) items_for_latency = 1;
 
-      return {
-        {bi100_bulk_default::threads, items, vec_size},
-        {bi100_fill_default::threads, bi100_fill_default::items}
-      };
+    int bulk_items = items_for_vec > items_for_latency ? items_for_vec : items_for_latency;
+
+    // Ensure items is a multiple of vec_size for aligned access
+    if (bulk_items % vec_size != 0) {
+      bulk_items = ((bulk_items / vec_size) + 1) * vec_size;
     }
 
-    // Fallback
+    // BI-V100: 128 threads for bulk (SM100-like), 256 for prefetch
+    int bulk_threads = hw.at_least(hardware_capability::vendor_t::iluvatar, 100) ? 128 : 256;
+
     return {
-      {bi100_bulk_default::threads, bi100_bulk_default::items, bi100_bulk_default::vec_size},
-      {bi100_fill_default::threads, bi100_fill_default::items}
+      // vectorized
+      {bulk_threads, bulk_items, vec_size},
+      // async_copy (BI-V100 may not support cp.async.bulk — conservative)
+      {bulk_threads, 4, vec_size},
+      // prefetch
+      {256},
+      // fill
+      {256, 2},
     };
   }
 };

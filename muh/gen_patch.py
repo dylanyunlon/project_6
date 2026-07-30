@@ -116,6 +116,36 @@ VLLM_INJECTION_POINTS = {
 }
 
 
+def extract_hardcoded_values(filepath):
+    """Fallback: extract key values from policy_selector return statements.
+    
+    For algorithms where bi100_* structs don't exist (values computed inline).
+    Extracts the threads_per_block from the first return in the iluvatar branch.
+    """
+    with open(filepath, 'r') as f:
+        content = f.read()
+    
+    algo = algo_from_filename(filepath)
+    
+    # Find iluvatar branch
+    iluvatar_match = re.search(
+        r'hw\.at_least\(.*iluvatar.*?\)\s*\{(.*?)(?=\n\s{2,4}\})',
+        content, re.DOTALL
+    )
+    if not iluvatar_match:
+        return []
+    
+    branch = iluvatar_match.group(1)
+    
+    # Find return {N, ...} — first integer is typically threads_per_block
+    return_match = re.search(r'return\s*\{(\d+)', branch)
+    if not return_match:
+        return []
+    
+    threads = int(return_match.group(1))
+    return [('__inline__', {'threads': threads})]
+
+
 def generate_patches(header_dir):
     """Read all tuning headers, extract bi100 values, generate patches."""
     patches = []
@@ -131,8 +161,11 @@ def generate_patches(header_dir):
         structs = extract_bi100_structs(hpath)
 
         if not structs:
-            summary.append(f"SKIP {algo}: no bi100_* structs found")
-            continue
+            # Fallback: try extracting inline values from policy_selector
+            structs = extract_hardcoded_values(hpath)
+            if not structs:
+                summary.append(f"SKIP {algo}: no bi100_* structs and no inline values found")
+                continue
 
         # Use the first non-default struct as the primary tuning
         # (default is fallback; prefer the type-specific ones)

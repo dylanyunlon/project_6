@@ -45,7 +45,7 @@ muh 是我们设计的 **tuning DSL（领域特定语言）**，用于：
 
 **为什么需要它**: CCCL 有 27 个 tuning_*.cuh 文件（17000+ 行），每个算法都有针对不同 NVIDIA SM 架构的特化参数。天垓100 不是 NVIDIA GPU，不能直接用这些参数，但 tuning 的维度（block size、warp 策略、shared memory 用量、prefetch 策略）是通用的。muh 让迁移过程变成"改配置 + 跑 benchmark"而不是"手改 kernel + 祈祷"。
 
-**muh 的状态**: PRD 设计阶段，还没有代码。
+**muh 的状态**: v0.3 — 6个算法的C++ tuning headers已就绪(reduce/scan/topk/transform/batch_memcpy/for)，compile_test 33项通过，gen_patch.py从C++ headers提取bi100值生成vllm patches。参数值从CCCL SM100复制，等BI-V100实测替换。
 
 ## 四、已完成的工作
 
@@ -93,9 +93,9 @@ muh 是我们设计的 **tuning DSL（领域特定语言）**，用于：
 
 ## 五、还没做的（下一步）
 
-1. **muh 语言 PRD 设计** — 定义 muh 的 schema、语法、codegen target、参数空间
-2. **muh PRD items 写入 project 6** — 作为真实 Issue，带 label 和测试用例
-3. **从 CCCL tuning_*.cuh 提取参数空间** — 建立"CCCL tuning 维度 → muh 配置项"的映射
+1. ~~muh 语言 PRD 设计~~ ✅ Done — muh是C++ header-only lib，不是独立语言
+2. ~~从 CCCL tuning_*.cuh 提取参数空间~~ ✅ Done — 6个算法的policy_selector已实现
+3. **在BI-V100上跑benchmark** — 用实测数据替换bi100_*中的SM100复制值
 4. **获取 enginex-vllm-bi100-qwen36 的实际代码** — 需要在 Phanthy Cloud 开发环境里操作
 5. **设计 muh → vllm kernel 的 codegen 管道**
 6. **实际在天垓100 上跑 benchmark**

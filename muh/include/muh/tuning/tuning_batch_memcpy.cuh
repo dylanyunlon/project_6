@@ -4,6 +4,12 @@
 //
 // vllm impact: KV cache block copy between GPU memory regions
 // Competition weight: Cache TPS × 0.56
+//
+// CCCL structure: two-tier (SmallBuffer handled by single block,
+// LargeBuffer by multi-block collaboration). Thresholds:
+//   warp_level: 128 bytes
+//   block_level: 8 KiB
+// muh must replicate this structure, not flatten it.
 
 #pragma once
 
@@ -12,51 +18,68 @@
 
 namespace muh::tuning::batch_memcpy {
 
-/// Batch memcpy policy
-struct BatchMemcpyPolicy {
+/// Small buffer policy: single thread block handles many small buffers
+struct SmallBufferPolicy {
   int threads_per_block;
+  int buffers_per_thread;
+  int bytes_per_thread;
+  bool prefer_pow2_bits;
+  int block_level_tile_size;
+  int warp_level_threshold;
+  int block_level_threshold;
   LookbackDelayPolicy buffer_lookback_delay;
   LookbackDelayPolicy block_lookback_delay;
 };
 
-// ============================================================
-// BI-V100 tuning values
-//
-// CCCL reference from tuning_batch_memcpy.cuh:
-//   Default: threads=256
-//   Buffer lookback delay and block lookback delay are separate —
-//   they control the two decoupled lookback scans that coordinate
-//   the batch copy across thread blocks.
-//
-//   For vllm: KV cache copies are typically large contiguous blocks
-//   (head_dim × num_layers × sizeof(half)), so high throughput matters
-//   more than latency.
-// ============================================================
+/// Large buffer policy: multiple blocks collaborate on one large buffer
+struct LargeBufferPolicy {
+  int threads_per_block;
+  int bytes_per_thread;
+};
 
-struct bi100_default {
-  static constexpr int threads = 256;
-  static constexpr LookbackDelayPolicy buffer_delay = {
-    LookbackDelayAlgorithm::fixed_delay, 350, 450};
-  static constexpr LookbackDelayPolicy block_delay = {
-    LookbackDelayAlgorithm::fixed_delay, 350, 450};
+/// Full batch memcpy policy
+struct BatchMemcpyPolicy {
+  SmallBufferPolicy small_buffer;
+  LargeBufferPolicy large_buffer;
 };
 
 // ============================================================
-// policy_selector
+// BI-V100 tuning values — from CCCL SM70+ defaults
+//
+// CCCL policy_selector (all architectures):
+//   small: 128 threads, 4 bufs/thread, 8 bytes/thread
+//          prefer_pow2_bits = (cc < 7.0)
+//          warp_threshold = 128, block_threshold = 8192
+//          delays = default_delay_constructor_policy(true)
+//   large: 256 threads, 32 bytes/thread
+//
+// For BI-V100: start with CCCL defaults.
+// The delay policy is arch-sensitive (CCCL uses
+// default_delay_constructor_policy which picks fixed_delay for
+// primitive types). We use fixed_delay as starting point.
 // ============================================================
 
 struct policy_selector {
-  constexpr BatchMemcpyPolicy operator()(const hardware_capability& hw) const {
-    if (hw.at_least(hardware_capability::vendor_t::iluvatar, 100)) {
-      return {bi100_default::threads,
-              bi100_default::buffer_delay,
-              bi100_default::block_delay};
-    }
 
-    // Fallback
-    return {256,
-            {LookbackDelayAlgorithm::fixed_delay, 350, 450},
-            {LookbackDelayAlgorithm::fixed_delay, 350, 450}};
+  constexpr BatchMemcpyPolicy operator()(const hardware_capability& hw) const {
+    // BI-V100: assume >= SM70 equivalent (no prefer_pow2_bits)
+    bool prefer_pow2 = false;
+
+    LargeBufferPolicy large{256, 32};
+
+    SmallBufferPolicy small{
+      /* threads_per_block = */    128,
+      /* buffers_per_thread = */   4,
+      /* bytes_per_thread = */     8,
+      /* prefer_pow2_bits = */     prefer_pow2,
+      /* block_level_tile_size = */ large.threads_per_block * large.bytes_per_thread,
+      /* warp_level_threshold = */  128,
+      /* block_level_threshold = */ 8 * 1024,
+      /* buffer_lookback_delay = */ {LookbackDelayAlgorithm::fixed_delay, 350, 450},
+      /* block_lookback_delay = */  {LookbackDelayAlgorithm::fixed_delay, 350, 450},
+    };
+
+    return {small, large};
   }
 };
 
