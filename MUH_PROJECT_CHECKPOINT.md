@@ -146,3 +146,63 @@ env:
 ```
 
 基础镜像: `harbor.4pd.io/modelhubxc/enginex-iluvatar/bi100-3.2.3-x86-ubuntu20.04-py3.10-poc-llm-infer:v1.2.3`
+
+## 九、CCCL Tuning 文件全量模型输入记录
+
+**所有 27 个 tuning_*.cuh 文件的完整源码已在本 context 中作为模型输入读取。** 关键发现：
+
+### policy_selector 统一模式
+
+每个算法都有一个 `policy_selector` struct，接受 `::cuda::compute_capability cc` 参数，内部按 SM 版本做 if-else 分支：
+
+```
+if (cc >= {10, 0}) → sm100 tuning (Blackwell)
+if (cc >= {9, 0})  → sm90 tuning (Hopper)  
+if (cc >= {8, 0})  → sm80 tuning (Ampere)
+if (cc >= {7, 0})  → sm70 tuning (Volta)
+if (cc >= {6, 0})  → sm60 tuning (Pascal)
+fallback           → sm50 tuning
+```
+
+**muh 的核心工作就是给每个 policy_selector 添加一个 `cc == {iluvatar, 100}` 分支，填入在天垓100 上跑出的最优 benchmark 数据。**
+
+### 各算法提取的参数维度
+
+| 算法 | 文件 | 行数 | 参数维度 |
+|------|------|------|---------|
+| reduce | tuning_reduce.cuh | 478 | threads, items, vec_size, reduce_algorithm, load_modifier, determinism |
+| scan | tuning_scan.cuh | 1525 | threads, items, load_algo, load_mod, store_algo, scan_algo, delay_policy + lookahead variant |
+| radix_sort | tuning_radix_sort.cuh | 2381 | histogram(threads,items,partitions,radix_bits) + exclusive_sum + onesweep(threads,items,store,rank,scan,partitions,radix_bits) + downsweep + upsweep + single_tile |
+| reduce_by_key | tuning_reduce_by_key.cuh | 1735 | threads, items, load_algo, load_mod, scan_algo, delay_policy |
+| select_if | tuning_select_if.cuh | 2729 | threads, items, load_algo, load_mod, scan_algo, delay_policy |
+| histogram | tuning_histogram.cuh | 363 | threads, pixels_per_thread, vec_size, load_algo, load_mod, rle_compress, mem_preference, work_stealing |
+| topk | tuning_topk.cuh | 121 | threads, items (simple, no SM-specific tuning yet) |
+| batched_topk | tuning_batched_topk.cuh | 186 | worker_policy array × 6 tiers + multi_worker_policy |
+| merge | tuning_merge.cuh | 180 | threads, items, load_mod, store_algo, bulk_copy_keys, bulk_copy_values |
+| merge_sort | tuning_merge_sort.cuh | 193 | threads, items, load_algo, load_mod, store_algo |
+| transform | tuning_transform.cuh | 549 | threads, items, load_algo, store_algo, load_mod |
+| rle_encode | tuning_rle_encode.cuh | 626 | threads, items, load_algo, load_mod, scan_algo, delay_policy |
+| rle_non_trivial | tuning_rle_non_trivial_runs.cuh | 691 | threads, items, load_algo, load_mod, store_time_slicing, scan_algo, delay |
+| adjacent_diff | tuning_adjacent_difference.cuh | 118 | threads, items, load_algo, load_mod, store_algo (single policy, no SM branching) |
+| for | tuning_for.cuh | 78 | threads, items (trivial, 256×2) |
+| find | tuning_find.cuh | 90 | threads, items, vec_size, load_mod |
+| batch_memcpy | tuning_batch_memcpy.cuh | 227 | small_buffer + large_buffer sub-policies |
+| scan_by_key | tuning_scan_by_key.cuh | ~2000 | same as reduce_by_key pattern |
+| unique_by_key | tuning_unique_by_key.cuh | ~1500 | same pattern |
+| three_way_partition | tuning_three_way_partition.cuh | ~780 | same pattern |
+| segmented_* | 4 files | ~1300 total | segmented variants of reduce/scan/sort |
+
+### Benchmark 注释格式
+
+每个 sm100 tuning 都有注释格式：
+```
+// ipt_22.tpb_384.ns_1904.dcid_6.l2w_830.trp_1.ld_0 1.148442 0.997167 1.139902 1.462651
+```
+- `ipt` = items_per_thread
+- `tpb` = threads_per_block  
+- `ns` = delay nanoseconds
+- `dcid` = delay constructor ID
+- `l2w` = L2 cache window
+- `trp` = transpose (0=DIRECT, 1=WARP_TRANSPOSE)
+- `ld` = load modifier (0=DEFAULT, 1=LDG, 2=CA)
+- 4 个数字 = 4 种 problem size 下的加速比 (vs 前代 SM)
