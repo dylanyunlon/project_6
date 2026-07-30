@@ -1,0 +1,32 @@
+# muh schema index — all extracted CCCL tuning algorithms
+
+algorithms:
+  - adjacent_difference
+  - batch_memcpy
+  - batched_topk
+  - find
+  - find_bound_sorted_values
+  - for
+  - histogram
+  - merge
+  - merge_sort
+  - radix_sort
+  - reduce
+  - reduce_by_key
+  - rle_encode
+  - rle_non_trivial_runs
+  - scan
+  - scan_by_key
+  - segmented_radix_sort
+  - segmented_reduce
+  - segmented_scan
+  - segmented_sort
+  - select_if
+  - three_way_partition
+  - topk
+  - transform
+  - transform_tile
+  - unique_by_key
+
+total: 26
+source: cccl_upstream/cub/cub/device/dispatch/tuning/
