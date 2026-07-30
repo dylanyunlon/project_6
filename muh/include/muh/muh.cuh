@@ -1,55 +1,37 @@
 // muh/include/muh/muh.cuh — Top-level muh header
 //
-// Complete BI-V100 tuning dispatch for all 26 CCCL algorithms.
-// Include this single header to get all tuning policies.
+// Only includes tuning headers for algorithms that are on vllm's hot path.
+// Not every CCCL algorithm needs a muh tuning header — only the ones
+// that actually execute during Qwen3.6 inference on BI-V100.
+//
+// vllm hot path analysis (by competition scoring weight):
+//   Output TPS × 16.796 (83%): attention, sampling, activations, layernorm, RoPE
+//   Input TPS × 2.799 (14%):   paged attention prefix scan
+//   Cache TPS × 0.56 (3%):     KV cache block copy
 
 #pragma once
 
-// Hardware descriptor
 #include "muh/hardware.cuh"
-
-// Shared types (compatible with CCCL)
 #include "muh/tuning/common.cuh"
 
-// P0: Highest priority for competition (Output TPS × 16.796)
-#include "muh/tuning/tuning_reduce.cuh"
-#include "muh/tuning/tuning_topk.cuh"
-#include "muh/tuning/tuning_scan.cuh"
+// --- Algorithms that appear on vllm hot path ---
 
-// P1: High priority
-#include "muh/tuning/tuning_transform.cuh"
-#include "muh/tuning/tuning_transform_tile.cuh"
-#include "muh/tuning/tuning_batch_memcpy.cuh"
-#include "muh/tuning/tuning_radix_sort.cuh"
-#include "muh/tuning/tuning_reduce_by_key.cuh"
-#include "muh/tuning/tuning_scan_by_key.cuh"
-#include "muh/tuning/tuning_select_if.cuh"
-#include "muh/tuning/tuning_histogram.cuh"
-#include "muh/tuning/tuning_merge.cuh"
-#include "muh/tuning/tuning_merge_sort.cuh"
-#include "muh/tuning/tuning_unique_by_key.cuh"
-#include "muh/tuning/tuning_batched_topk.cuh"
+#include "muh/tuning/tuning_reduce.cuh"       // attention score reduction
+#include "muh/tuning/tuning_topk.cuh"         // top-k/top-p sampling
+#include "muh/tuning/tuning_scan.cuh"         // prefix scan in paged attention
+#include "muh/tuning/tuning_transform.cuh"    // SiLU, GELU, RMSNorm
+#include "muh/tuning/tuning_batch_memcpy.cuh" // KV cache block copy
+#include "muh/tuning/tuning_for.cuh"          // RoPE position encoding
 
-// P2: Segmented/specialized
-#include "muh/tuning/tuning_for.cuh"
-#include "muh/tuning/tuning_segmented_reduce.cuh"
-#include "muh/tuning/tuning_segmented_scan.cuh"
-#include "muh/tuning/tuning_segmented_sort.cuh"
-#include "muh/tuning/tuning_segmented_radix_sort.cuh"
-#include "muh/tuning/tuning_three_way_partition.cuh"
-#include "muh/tuning/tuning_rle_encode.cuh"
-#include "muh/tuning/tuning_rle_non_trivial_runs.cuh"
-
-// P3: Utility
-#include "muh/tuning/tuning_adjacent_difference.cuh"
-#include "muh/tuning/tuning_find.cuh"
-#include "muh/tuning/tuning_find_bound_sorted_values.cuh"
+// That's it. 6 algorithms, not 26.
+// histogram, rle_encode, merge_sort, select_if, etc. are CCCL algorithms
+// that vllm does not call on the inference hot path.
 
 namespace muh {
 constexpr int MUH_VERSION_MAJOR = 0;
-constexpr int MUH_VERSION_MINOR = 2;
+constexpr int MUH_VERSION_MINOR = 3;
 constexpr int MUH_VERSION_PATCH = 0;
-constexpr int MUH_ALGORITHM_COUNT = 26;
+constexpr int MUH_ALGORITHM_COUNT = 6; // only the ones that matter
 
 struct scoring {
   static constexpr double output_weight = 16.796;
