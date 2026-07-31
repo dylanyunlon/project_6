@@ -83,3 +83,30 @@ Priority to add (by SMEM overflow risk):
 4. `scan_by_key` (88KB) — MEDIUM risk
 5. `unique_by_key` (61KB) — LOW risk
 6. Others: LOW risk (small tile sizes, unlikely SMEM overflow)
+
+## SMEM Overflow Detection (from muh/dispatch.py)
+
+Running `python3 muh_kernel_map.py` against all 6 tuning headers
+detected 5 lookahead structs with incorrect SMEM estimates:
+
+| Struct | SMEM calc | Limit | Status |
+|--------|----------:|------:|--------|
+| bi100_lookahead_1B | 162,816 | 49,152 | ✗ OVERFLOW |
+| bi100_lookahead_2B | 97,280 | 49,152 | ✗ OVERFLOW |
+| bi100_lookahead_4B | 80,896 | 49,152 | ✗ OVERFLOW |
+| bi100_lookahead_4B_float | 89,088 | 49,152 | ✗ OVERFLOW |
+| bi100_lookahead_8B | 89,088 | 49,152 | ✗ OVERFLOW |
+
+**Root cause**: Lookahead SMEM ≠ `threads × items × elem_bytes`.
+The lookahead pipeline uses multi-stage buffering where SMEM =
+`(reduce_squad + scan_store_squad) × items × accum_size × stages`.
+The simple tile formula overestimates by including lookahead items
+that live in registers, not SMEM.
+
+**Impact**: These are currently non-functional on BI-V100 anyway
+(lookahead requires SM90+ warpspeed pipeline support). The dispatch
+correctly falls back to lookback algorithm. But the values in the
+structs are misleading — they should either be corrected or removed.
+
+**Action**: Issue #27 (scan benchmark) TC-04 covers this:
+"lookahead 可行性评估 — 测试 ScanAlgorithm::lookahead 是否能在 BI-V100 上编译运行"
