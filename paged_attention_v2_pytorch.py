@@ -158,16 +158,10 @@ def paged_attention_v2_pytorch(
             # Will handle GQA in the bmm below via broadcast
         else:
             v_perm = v_flat.permute(1, 0, 2).float().contiguous()  # [H, seq_len, d]
-        if padded_len > seq_len:
-            v_padded = torch.zeros(
-                (num_heads, padded_len, head_size),
-                dtype=v_perm.dtype, device=v_perm.device)
-            v_padded[:, :seq_len, :] = v_perm
-        else:
-            v_padded = v_perm
-        v_parts = v_padded.view(num_heads, num_partitions, _PARTITION_SIZE, head_size)
-
-        # Weighted V sum per partition — GQA broadcast (avoid 2.4GB expansion)
+        # Weighted V sum per partition
+        # NOTE: v_perm shape differs by GQA mode:
+        #   GQA: v_perm = v_kv = [kv_h, seq_len, d]
+        #   No GQA: v_perm = [H, seq_len, d]
         # scores_exp: [H, P, part_sz] → [kv_h, gqa, P, part_sz]
         # v_perm: [kv_h, seq_len, d] → [kv_h, P, part_sz, d]
         if gqa_ratio > 1:
@@ -189,6 +183,15 @@ def paged_attention_v2_pytorch(
             ).squeeze(3)                        # [kv_h, gqa, P, d]
             part_out = part_out_grouped.reshape(num_heads, num_partitions, head_size)
         else:
+            # Non-GQA: v_perm is [H, seq_len, d], pad and reshape normally
+            if padded_len > seq_len:
+                v_padded = torch.zeros(
+                    (num_heads, padded_len, head_size),
+                    dtype=v_perm.dtype, device=v_perm.device)
+                v_padded[:, :seq_len, :] = v_perm
+            else:
+                v_padded = v_perm
+            v_parts = v_padded.view(num_heads, num_partitions, _PARTITION_SIZE, head_size)
             HP = num_heads * num_partitions
             scores_exp_flat = scores_exp.reshape(HP, 1, _PARTITION_SIZE)
             v_parts_flat = v_parts.reshape(HP, _PARTITION_SIZE, head_size)
