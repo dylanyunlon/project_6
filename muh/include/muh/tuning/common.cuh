@@ -167,6 +167,13 @@ constexpr scaling_result scale_mem_bound(
   int threads = nominal_4B_threads < max_threads_by_smem
                   ? nominal_4B_threads : max_threads_by_smem;
 
+  // Step 4: floor at one warp (32 threads)
+  // Defensive: if SMEM is so tight that max_threads_by_smem rounds to 0
+  // (e.g. target_type_size=49152 and items=1 → raw=1 → round_up(1,32)=32,
+  // but if items were large enough to make raw=0 → round_up(0,32)=0),
+  // ensure we never launch 0 threads.
+  if (threads < 32) threads = 32;
+
   return {items, threads}; // items-first, matching CCCL scaling_result
 }
 
