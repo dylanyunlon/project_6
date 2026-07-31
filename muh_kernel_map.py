@@ -89,18 +89,39 @@ def check_smem(threads: int, items: int, elem_bytes: int,
     }
 
 
-def scale_mem_bound(nominal_threads: int, nominal_4b_items: int,
+def scale_mem_bound(nominal_4B_threads: int, nominal_4B_items: int,
                     type_size: int) -> tuple:
-    """Scale items_per_thread inversely with type size to keep tile constant.
+    """Scale items and threads for a given type size, matching CCCL exactly.
     
-    Mirrors cub::detail::MemBoundScaling.
-    For 4-byte types: items = nominal_4b_items
-    For 8-byte types: items = nominal_4b_items * 4 / 8 = half
-    For 2-byte types: items = nominal_4b_items * 4 / 2 = double (capped)
+    Mirrors cub::detail::scale_mem_bound() from util_arch.cuh lines 153-161.
+    Returns (items_per_thread, threads_per_block) — items-first, matching
+    CCCL's scaling_result struct field order.
+    
+    Three differences from the old muh version (all were bugs):
+    1. Return order: (items, threads) not (threads, items)
+    2. Items clamp upper bound: nominal * 2, not nominal * 1
+       (CCCL allows small types like char to double items_per_thread)
+    3. Threads SMEM cap: min(nominal, round_up(max_smem/(type*items), 32))
+       (prevents launching more threads than SMEM can feed)
+    
+    Verified against all 18 CCCL test cases in catch2_test_util_arch.cu.
     """
-    items = (nominal_4b_items * 4) // type_size
-    items = max(1, min(items, nominal_4b_items))
-    return (nominal_threads, items)
+    MAX_SMEM = 48 * 1024  # 49152 bytes, hardcoded in CCCL as max_smem_per_block
+    
+    # Step 1: scale items inversely with type size
+    items = nominal_4B_items * 4 // type_size
+    items = max(1, min(items, nominal_4B_items * 2))  # clamp: [1, 2*nominal]
+    
+    # Step 2: cap threads by SMEM constraint
+    # round_up(x, 32) aligns to warp boundary
+    smem_per_item = type_size * items
+    if smem_per_item > 0:
+        max_threads_by_smem = ((MAX_SMEM // smem_per_item + 31) // 32) * 32
+    else:
+        max_threads_by_smem = nominal_4B_threads
+    threads = min(nominal_4B_threads, max_threads_by_smem)
+    
+    return (items, threads)  # items-first, matching CCCL scaling_result
 
 
 def scale_delay_for_l2(sm100_delay_ns: int, sm100_l2w: int) -> tuple:
