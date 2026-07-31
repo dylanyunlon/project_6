@@ -138,6 +138,20 @@ struct bi100_lookback_8B_o8 {
   static constexpr CacheLoadModifier load_mod      = LOAD_DEFAULT;
 };
 
+struct bi100_lookback_1B_o8 {
+  // CCCL SM100 ref: ipt_14.tpb_384.ns_228.dcid_7.l2w_775 → 1.107x
+  // BI-V100 derived: delay halved (L2 6MB vs 50MB), LOAD_CA matches SM100
+  // nominal_tile = 384*14*4 = 21504 ≤ 49152 ✓
+  static constexpr int threads = 384;
+  static constexpr int items   = 14;
+  static constexpr LookbackDelayPolicy delay = {
+    LookbackDelayAlgorithm::exponential_backon, 114, 465};
+  static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
+  static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
+  static constexpr CacheLoadModifier load_mod      = LOAD_CA;
+};
+
+
 // --- Lookahead tunings for BI-V100 ---
 
 struct bi100_lookahead_1B {
@@ -233,6 +247,10 @@ struct policy_selector {
         }
       } else if (offset_size == 8) {
         switch (input_value_size) {
+          case 1: return {bi100_lookback_1B_o8::threads, bi100_lookback_1B_o8::items,
+                          bi100_lookback_1B_o8::load_algo, bi100_lookback_1B_o8::load_mod,
+                          bi100_lookback_1B_o8::store_algo, BLOCK_SCAN_WARP_SCANS,
+                          bi100_lookback_1B_o8::delay};
           case 4: return {bi100_lookback_4B_o8::threads, bi100_lookback_4B_o8::items,
                           bi100_lookback_4B_o8::load_algo, bi100_lookback_4B_o8::load_mod,
                           bi100_lookback_4B_o8::store_algo, BLOCK_SCAN_WARP_SCANS,
