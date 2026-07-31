@@ -119,21 +119,55 @@ enum class op_kind_t { plus, min, max, other };
 
 namespace muh::tuning {
 
-/// Memory-bound scaling: given nominal params for 4-byte types,
-/// scale items_per_thread inversely with actual type size
-/// to keep shared memory footprint constant.
-/// Directly mirrors cub::detail::MemBoundScaling.
-struct scaled_params {
-  int threads_per_block;
+/// Scaling result — matches CCCL's cub::detail::scaling_result field order:
+///   { items_per_thread, threads_per_block }
+/// Callers destructure as: auto [items, threads] = scale_mem_bound(...);
+struct scaling_result {
   int items_per_thread;
+  int threads_per_block;
 };
 
-constexpr scaled_params scale_mem_bound(
-    int nominal_threads, int nominal_4b_items, int type_size) {
-  int items = (nominal_4b_items * 4) / type_size;
+/// Memory-bound scaling for non-4-byte types.
+///
+/// Mirrors cub::detail::scale_mem_bound() from cub/util_arch.cuh lines 153-161.
+/// Returns {items_per_thread, threads_per_block} — items-first, matching CCCL.
+///
+/// Three operations:
+///   1. Scale items inversely with type size (4B nominal → 8B halves, 1B doubles)
+///   2. Clamp items to [1, nominal*2] (allows small types to increase items)
+///   3. Cap threads by SMEM: min(nominal, round_up(48KB / (type_size * items), 32))
+///
+/// CCCL source reference:
+///   items  = clamp(nominal_items * 4 / target_size, 1, nominal_items * 2)
+///   threads = min(nominal_threads, round_up(max_smem / (target_size * items), 32))
+///
+/// The previous muh version had three bugs:
+///   a) Return order was {threads, items} — should be {items, threads}
+///   b) Upper clamp was nominal*1 — should be nominal*2
+///   c) No SMEM cap on threads — CCCL caps threads to prevent SMEM overflow
+constexpr scaling_result scale_mem_bound(
+    int nominal_4B_threads, int nominal_4B_items, int target_type_size) {
+  constexpr int max_smem = 48 * 1024; // 49152 bytes
+
+  // Step 1+2: scale items, clamp to [1, nominal*2]
+  int items = nominal_4B_items * 4 / target_type_size;
   if (items < 1) items = 1;
-  if (items > nominal_4b_items) items = nominal_4b_items;
-  return {nominal_threads, items};
+  if (items > nominal_4B_items * 2) items = nominal_4B_items * 2;
+
+  // Step 3: cap threads by SMEM
+  // round_up(x, 32) = ((x + 31) / 32) * 32
+  int smem_per_thread = target_type_size * items;
+  int max_threads_by_smem;
+  if (smem_per_thread > 0) {
+    int raw = max_smem / smem_per_thread;
+    max_threads_by_smem = ((raw + 31) / 32) * 32;
+  } else {
+    max_threads_by_smem = nominal_4B_threads;
+  }
+  int threads = nominal_4B_threads < max_threads_by_smem
+                  ? nominal_4B_threads : max_threads_by_smem;
+
+  return {items, threads}; // items-first, matching CCCL scaling_result
 }
 
 } // namespace muh::tuning
