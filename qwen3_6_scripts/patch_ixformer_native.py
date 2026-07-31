@@ -144,6 +144,26 @@ def patch_custom_ops():
     _PARTITION_SIZE = 512
     max_num_partitions = (max_seq_len + _PARTITION_SIZE - 1) // _PARTITION_SIZE
 
+    # V2 native kernel expects different cache layout than V1:
+    #   V1: K=[blocks, kv_heads, head_dim/x, block_size, x] (5D), V=[blocks, kv_heads, head_dim, block_size] (4D)
+    #   V2: K=[blocks, kv_heads, block_size, head_dim] (4D),      V=[blocks, kv_heads, block_size, head_dim] (4D)
+    # Convert on the fly. This is a view/permute, not a data copy (for contiguous inputs).
+    if key_cache.dim() == 5:
+        # K: [B, H, d/x, bs, x] → [B, H, bs, d]
+        B, H, dx, bs, xp = key_cache.shape
+        key_cache_v2 = key_cache.permute(0, 1, 3, 2, 4).reshape(B, H, bs, dx * xp)
+    elif key_cache.dim() == 4 and key_cache.shape[3] != query.shape[2]:
+        # K: [B, H, d, bs] → [B, H, bs, d]
+        key_cache_v2 = key_cache.permute(0, 1, 3, 2).contiguous()
+    else:
+        key_cache_v2 = key_cache
+
+    if value_cache.dim() == 4 and value_cache.shape[3] != query.shape[2]:
+        # V: [B, H, d, bs] → [B, H, bs, d]
+        value_cache_v2 = value_cache.permute(0, 1, 3, 2).contiguous()
+    else:
+        value_cache_v2 = value_cache
+
     return ixf_F.vllm_single_query_cached_kv_attention_v2(
             out,
             max_num_partitions,
@@ -151,8 +171,8 @@ def patch_custom_ops():
             max_logits,
             tmp_out,
             query,
-            key_cache,
-            value_cache,
+            key_cache_v2,
+            value_cache_v2,
             head_mapping,
             scale,
             block_tables,
