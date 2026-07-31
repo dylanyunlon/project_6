@@ -11,6 +11,11 @@ COPY ./paged_attention_v2_triton.py /workspace/paged_attention_v2_triton.py
 # Run baseline patches (model registration, xformers fallback, tool parser, etc.)
 RUN cd ./qwen3_6_scripts && ./patch_ops.sh
 
+# CRITICAL: Enable ixformer native V1/V2 paged attention kernels.
+# Fixes: V1 head_mapping int→Tensor, V2 NotImplementedError → native kernel,
+# Triton path mismatch.
+RUN python3 /workspace/qwen3_6_scripts/patch_ixformer_native.py
+
 # 1. PagedAttention V2 — fills the NotImplementedError hole
 #    Enables partitioned attention for long sequences (>8192 tokens)
 RUN python3 /workspace/qwen3_6_scripts/patch_paged_attention_v2.py
