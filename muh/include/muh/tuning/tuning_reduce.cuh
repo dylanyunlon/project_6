@@ -20,6 +20,10 @@
 // Similarly int64 uses threads=512, items=15 → tile = 61440 > 49152.
 //
 // Fix: derive threads/items from SMEM constraint, not copy from SM100.
+//
+// NOTE: scale_mem_bound returns {items, threads} (items-first), matching
+// CCCL's scaling_result struct. Destructure as auto [i, t] = ...;
+// NOT auto [t, i] which was the old (buggy) order.
 
 #pragma once
 
@@ -127,19 +131,19 @@ struct policy_selector {
   constexpr ReducePolicy get_deterministic(const hardware_capability& hw) const {
     if (hw.at_least(hardware_capability::vendor_t::iluvatar, 100)) {
       if (accum_t == type_t::float32) {
-        auto [t, i] = scale_mem_bound(bi100_det_float32::threads,
+        auto [i, t] = scale_mem_bound(bi100_det_float32::threads,
                                        bi100_det_float32::items, accum_size);
         ReducePassPolicy rp{t, i, 1, BLOCK_REDUCE_RAKING, LOAD_DEFAULT};
         return {rp, rp};
       }
       if (accum_t == type_t::float64) {
-        auto [t, i] = scale_mem_bound(bi100_det_float64::threads,
+        auto [i, t] = scale_mem_bound(bi100_det_float64::threads,
                                        bi100_det_float64::items, accum_size);
         ReducePassPolicy rp{t, i, 1, BLOCK_REDUCE_RAKING, LOAD_DEFAULT};
         return {rp, rp};
       }
     }
-    auto [t, i] = scale_mem_bound(256, 16, accum_size);
+    auto [i, t] = scale_mem_bound(256, 16, accum_size);
     ReducePassPolicy rp{t, i, 1, BLOCK_REDUCE_RAKING, LOAD_DEFAULT};
     return {rp, rp};
   }
@@ -149,35 +153,35 @@ struct policy_selector {
         hw.at_least(hardware_capability::vendor_t::iluvatar, 100)) {
 
       if (accum_t == type_t::float32 && offset_size == 4 && accum_size == 4) {
-        auto [t, i] = scale_mem_bound(bi100_float32_plus_o4::threads,
+        auto [i, t] = scale_mem_bound(bi100_float32_plus_o4::threads,
                                        bi100_float32_plus_o4::items, accum_size);
         ReducePassPolicy rp{t, i, bi100_float32_plus_o4::items_per_vec_load,
                             BLOCK_REDUCE_WARP_REDUCTIONS, LOAD_LDG};
         return {rp, rp};
       }
       if (accum_t == type_t::float64 && offset_size == 4 && accum_size == 8) {
-        auto [t, i] = scale_mem_bound(bi100_float64_plus_o4::threads,
+        auto [i, t] = scale_mem_bound(bi100_float64_plus_o4::threads,
                                        bi100_float64_plus_o4::items, accum_size);
         ReducePassPolicy rp{t, i, bi100_float64_plus_o4::items_per_vec_load,
                             BLOCK_REDUCE_WARP_REDUCTIONS, LOAD_LDG};
         return {rp, rp};
       }
       if (offset_size == 4 && accum_size == 8) {
-        auto [t, i] = scale_mem_bound(bi100_int64_plus_o4::threads,
+        auto [i, t] = scale_mem_bound(bi100_int64_plus_o4::threads,
                                        bi100_int64_plus_o4::items, accum_size);
         ReducePassPolicy rp{t, i, bi100_int64_plus_o4::items_per_vec_load,
                             BLOCK_REDUCE_WARP_REDUCTIONS, LOAD_LDG};
         return {rp, rp};
       }
       if (offset_size == 8 && accum_size == 8) {
-        auto [t, i] = scale_mem_bound(bi100_int64_plus_o8::threads,
+        auto [i, t] = scale_mem_bound(bi100_int64_plus_o8::threads,
                                        bi100_int64_plus_o8::items, accum_size);
         ReducePassPolicy rp{t, i, bi100_int64_plus_o8::items_per_vec_load,
                             BLOCK_REDUCE_WARP_REDUCTIONS, LOAD_LDG};
         return {rp, rp};
       }
     }
-    auto [t, i] = scale_mem_bound(bi100_default::threads, bi100_default::items, accum_size);
+    auto [i, t] = scale_mem_bound(bi100_default::threads, bi100_default::items, accum_size);
     ReducePassPolicy rp{t, i, bi100_default::items_per_vec_load,
                         BLOCK_REDUCE_WARP_REDUCTIONS, LOAD_LDG};
     return {rp, rp};
