@@ -10,7 +10,7 @@ command:
     - --max-model-len
     - '100000'
     - --gpu-memory-utilization
-    - '0.95'
+    - '0.9'
     - --trust-remote-code
     - -tp
     - '4'
@@ -19,10 +19,10 @@ command:
     - --disable-log-requests
     - --disable-frontend-multiprocessing
     - --max-num-batched-tokens
-    - '16384'
+    - '8192'
     - --enable-chunked-prefill
     - --max-seq-len-to-capture
-    - '65536'
+    - '32768'
     - --enable-auto-tool-choice
     - --tool-call-parser
     - qwen3_coder
