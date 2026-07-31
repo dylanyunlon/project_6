@@ -61,6 +61,92 @@ def classify_dtype(dtype: torch.dtype) -> dict:
     }
     return type_map.get(dtype, {"size": dtype.itemsize, "type_t": "other", "is_float": False})
 
+
+# ============================================================
+# C++ header reader — single source of truth for tuning values
+#
+# Architecture: "read once, not write twice + assert equal"
+# muh_dispatch.py never hand-writes tuning values. It reads them
+# from the C++ headers via gen_patch.extract_bi100_structs().
+# If headers aren't available (e.g. in a deployed container),
+# falls back to compiled-in defaults with a warning.
+# ============================================================
+
+_TUNING_CACHE = {}
+
+def _read_reduce_config(accum_size: int) -> dict:
+    """Read reduce tuning values from tuning_reduce.cuh.
+    
+    Returns {"threads": int, "items": int} for the given accum_size.
+    Single source of truth: C++ header → Python, no hand-written copy.
+    """
+    cache_key = f"reduce_{accum_size}"
+    if cache_key in _TUNING_CACHE:
+        return _TUNING_CACHE[cache_key]
+    
+    # Try to read from C++ headers
+    header_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "muh", "include", "muh", "tuning", "tuning_reduce.cuh"
+    )
+    
+    result = None
+    if os.path.exists(header_path):
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from gen_patch import extract_bi100_structs
+            structs = extract_bi100_structs(header_path)
+            
+            # Select struct by accum_size
+            target_struct = None
+            if accum_size <= 4:
+                target_struct = "bi100_float32_plus_o4"
+            else:
+                target_struct = "bi100_float64_plus_o4"
+            
+            for name, fields in structs:
+                if name == target_struct:
+                    result = {
+                        "threads": fields.get("threads", fields.get("threads_per_block", 256)),
+                        "items": fields.get("items", fields.get("items_per_thread", 16)),
+                    }
+                    break
+            
+            if result is None:
+                # Struct not found — try default
+                for name, fields in structs:
+                    if "default" in name:
+                        result = {
+                            "threads": fields.get("threads", 256),
+                            "items": fields.get("items", 16),
+                        }
+                        break
+        except Exception as e:
+            import warnings
+            warnings.warn(
+                f"muh_dispatch: failed to read {header_path}: {e}. "
+                f"Using compiled-in fallback values.",
+                RuntimeWarning, stacklevel=2
+            )
+    
+    # Fallback: compiled-in defaults (last-resort, should not be the normal path)
+    if result is None:
+        # These values match the C++ headers as of commit 3a2b67c1.
+        # If you're seeing this warning in production, the header path is wrong.
+        import warnings
+        warnings.warn(
+            "muh_dispatch: C++ headers not found, using compiled-in fallback. "
+            "This means tuning values may be stale.",
+            RuntimeWarning, stacklevel=2
+        )
+        if accum_size <= 4:
+            result = {"threads": 512, "items": 16}
+        else:
+            result = {"threads": 512, "items": 12}
+    
+    _TUNING_CACHE[cache_key] = result
+    return result
+
 # ============================================================
 # Attention kernel configuration
 # ============================================================
@@ -173,14 +259,10 @@ def select_attention_config(
     vec_size = min(16 // accum_size, 4)  # 128-bit / accum_size
     
     # Reduce config (for V2's final reduction across partitions):
-    # Derived from muh/include/muh/tuning/tuning_reduce.cuh bi100_float32_plus_o4
-    if accum_size <= 4:
-        reduce_threads = 512
-        reduce_items = 16
-    else:
-        # fp64 accumulator: smaller tile
-        reduce_threads = 384
-        reduce_items = 16
+    # Read from C++ headers — single source of truth, no hand-written copy.
+    reduce_cfg = _read_reduce_config(accum_size)
+    reduce_threads = reduce_cfg["threads"]
+    reduce_items = reduce_cfg["items"]
     
     # Sanity check: reduce tile fits SMEM
     reduce_tile = reduce_threads * reduce_items * accum_size
@@ -224,60 +306,6 @@ def qwen36_config() -> AttentionConfig:
     )
 
 
-
-
-# ============================================================
-# Verification: check hand-written values match C++ headers
-# Closes the loop: muh_dispatch.py values must come from tuning_*.cuh
-# ============================================================
-
-def verify_against_headers(header_dir: str = "muh/include/muh/tuning") -> list:
-    """Verify that muh_dispatch.py's hand-written values match C++ headers.
-    
-    Returns list of mismatches. Empty list = all values verified.
-    This is the closed-loop check that prevents the gen_patch pipeline
-    from diverging from the runtime dispatch values.
-    """
-    mismatches = []
-    
-    try:
-        # Import from sibling module
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from gen_patch import extract_bi100_structs
-    except ImportError:
-        return [("IMPORT_ERROR", "Cannot import gen_patch.extract_bi100_structs")]
-    
-    header_map = {
-        "tuning_reduce.cuh": {
-            "bi100_float32_plus_o4": {"items": 16, "threads": 512},  # must match reduce_items, reduce_threads
-        },
-    }
-    
-    reduce_header = os.path.join(header_dir, "tuning_reduce.cuh")
-    if os.path.exists(reduce_header):
-        structs = extract_bi100_structs(reduce_header)
-        for name, fields in structs:
-            if name == "bi100_float32_plus_o4":
-                cpp_threads = fields.get("threads", fields.get("threads_per_block"))
-                cpp_items = fields.get("items", fields.get("items_per_thread"))
-                
-                # Compare against AttentionConfig defaults
-                cfg = qwen36_config()
-                if cfg.reduce_threads != cpp_threads:
-                    mismatches.append((
-                        "reduce_threads",
-                        f"muh_dispatch={cfg.reduce_threads} vs tuning_reduce.cuh={cpp_threads}"
-                    ))
-                if cfg.reduce_items != cpp_items:
-                    mismatches.append((
-                        "reduce_items",
-                        f"muh_dispatch={cfg.reduce_items} vs tuning_reduce.cuh={cpp_items}"
-                    ))
-    else:
-        mismatches.append(("HEADER_MISSING", reduce_header))
-    
-    return mismatches
-
 # ============================================================
 # Self-test
 # ============================================================
@@ -300,13 +328,4 @@ if __name__ == "__main__":
         print(f"    decode: partition={cfg.partition_size} v1_thresh={cfg.v1_v2_threshold}")
         print(f"    reduce: threads={cfg.reduce_threads} items={cfg.reduce_items} vec={cfg.vec_size}")
         print()
-    # Verification: check values match C++ headers
-    print("\n=== Verification against C++ headers ===")
-    mismatches = verify_against_headers()
-    if mismatches:
-        for field, msg in mismatches:
-            print(f"  ✗ MISMATCH {field}: {msg}")
-        print(f"\n  {len(mismatches)} mismatches found — update muh_dispatch.py!")
-    else:
-        print("  ✓ All hand-written values match C++ headers")
 
