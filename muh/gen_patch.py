@@ -116,6 +116,48 @@ VLLM_INJECTION_POINTS = {
 }
 
 
+# --- Complete tuning algorithm registry ---
+# All 26 algorithms with muh tuning headers.
+# 'injection': algorithms with known vllm kernel injection points
+# 'library': algorithms used via CCCL library calls (no direct vllm injection)
+# 'struct_mode': 'named' = has bi100_* structs, 'inline' = computes in policy_selector
+
+TUNING_REGISTRY = {
+    # === 6 algorithms with vllm injection points (struct_mode='named') ===
+    'reduce':       {'mode': 'injection', 'struct_mode': 'named',  'vllm_files': ['csrc/attention/attention_kernels.cu', 'csrc/attention/paged_attention_v2.cu']},
+    'scan':         {'mode': 'injection', 'struct_mode': 'named',  'vllm_files': ['csrc/attention/paged_attention_v1.cu']},
+    'topk':         {'mode': 'injection', 'struct_mode': 'named',  'vllm_files': ['csrc/sampling/sampling_kernels.cu']},
+    'transform':    {'mode': 'injection', 'struct_mode': 'named',  'vllm_files': ['csrc/activation_kernels.cu', 'csrc/layernorm_kernels.cu']},
+    'batch_memcpy': {'mode': 'injection', 'struct_mode': 'named',  'vllm_files': ['csrc/cache_kernels.cu']},
+    'for':          {'mode': 'injection', 'struct_mode': 'named',  'vllm_files': ['csrc/pos_encoding_kernels.cu']},
+
+    # === 20 algorithms without direct vllm injection (struct_mode='inline') ===
+    # These are used via CCCL device-level APIs, not via #define injection.
+    # Their tuning values affect performance when vllm calls CUB functions.
+    'adjacent_difference':       {'mode': 'library', 'struct_mode': 'inline'},
+    'batched_topk':              {'mode': 'library', 'struct_mode': 'inline'},
+    'find':                      {'mode': 'library', 'struct_mode': 'inline'},
+    'find_bound_sorted_values':  {'mode': 'library', 'struct_mode': 'inline'},
+    'histogram':                 {'mode': 'library', 'struct_mode': 'inline'},
+    'merge':                     {'mode': 'library', 'struct_mode': 'inline'},
+    'merge_sort':                {'mode': 'library', 'struct_mode': 'inline'},
+    'radix_sort':                {'mode': 'library', 'struct_mode': 'inline'},
+    'reduce_by_key':             {'mode': 'library', 'struct_mode': 'inline'},
+    'rle_encode':                {'mode': 'library', 'struct_mode': 'inline'},
+    'rle_non_trivial_runs':      {'mode': 'library', 'struct_mode': 'inline'},
+    'scan_by_key':               {'mode': 'library', 'struct_mode': 'inline'},
+    'segmented_radix_sort':      {'mode': 'library', 'struct_mode': 'inline'},
+    'segmented_reduce':          {'mode': 'library', 'struct_mode': 'inline'},
+    'segmented_scan':            {'mode': 'library', 'struct_mode': 'inline'},
+    'segmented_sort':            {'mode': 'library', 'struct_mode': 'inline'},
+    'select_if':                 {'mode': 'library', 'struct_mode': 'inline'},
+    'three_way_partition':       {'mode': 'library', 'struct_mode': 'inline'},
+    'transform_tile':            {'mode': 'library', 'struct_mode': 'inline'},
+    'unique_by_key':             {'mode': 'library', 'struct_mode': 'inline'},
+}
+
+
+
 def extract_hardcoded_values(filepath):
     """Fallback: extract key values from policy_selector return statements.
     
