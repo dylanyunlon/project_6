@@ -34,8 +34,8 @@ struct hardware_capability {
       .max_shared_memory_per_block = 49152, // 48 KiB, TBD
       .max_registers_per_thread = 255,
       .l2_cache_size_bytes = 6 * 1024 * 1024, // 6 MiB, TBD
-      .memory_bandwidth_gbps = 900,         // TBD
-      .sm_count = 50,                       // 50c in the spec
+      .memory_bandwidth_gbps = 900,  // Confirmed: 1200MHz mem clock         // TBD
+      .sm_count = 16,  // CONFIRMED: ixsmi shows 16 SMs per BI-V100                       // 50c in the spec
       .vendor = vendor_t::iluvatar,
       .arch_version = 100,
     };

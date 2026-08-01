@@ -49,9 +49,9 @@ BI_V100 = {
     "max_registers_per_thread": 255,
     "l2_cache_size_bytes": 6 * 1024 * 1024,  # 6 MiB
     "memory_bandwidth_gbps": 900,
-    "sm_count": 50,
+    "sm_count": 16  # CONFIRMED 2026-08-01,
     # Derived
-    "bandwidth_per_sm_gbps": 900 / 50,  # 18 GB/s ≈ A100 level
+    "bandwidth_per_sm_gbps": 900 / 16  # 56.25 GB/s per SM,  # 18 GB/s ≈ A100 level
 }
 
 SM100 = {
