@@ -709,8 +709,28 @@ if triton.__version__ >= "2.1.0":
                               alibi_slopes=None,
                               sliding_window=None):
 
-        BLOCK = 128 if current_platform.has_device_capability(80) else 64
-        NUM_WARPS = 8
+        # CCCL-informed block size selection for BI-V100 (SM=16, 48KB SMEM)
+        #
+        # SMEM budget per Triton block (approximate):
+        #   Q tile: BLOCK_M * head_dim * element_size
+        #   K tile: head_dim * BLOCK_N * element_size (transposed)
+        #   V tile: BLOCK_N * head_dim * element_size
+        # Triton uses fp32 accumulators but loads in native dtype.
+        #
+        # For BI-V100: BLOCK=64, NUM_WARPS=4 keeps SMEM usage conservative
+        # and matches CCCL scan tuning pattern (fewer CTAs but larger tiles).
+        # SM=16 means only 32 concurrent CTAs, so moderate parallelism is fine.
+        #
+        # Reference: muh/tuning/tuning_scan.cuh bi100_lookback_4B_o4
+        #   threads=384, items=22 → effective tile = 384*22 = 8448 elements
+        #   Triton equivalent: BLOCK=64, warps=4 (128 threads, larger tile per warp)
+        _is_bi_v100 = not current_platform.has_device_capability(80)
+        if _is_bi_v100:
+            BLOCK = 64
+            NUM_WARPS = 4
+        else:
+            BLOCK = 128
+            NUM_WARPS = 8
 
         # need to reduce num. blocks when using fp32
         # due to increased use of GPU shared memory
