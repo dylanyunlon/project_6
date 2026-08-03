@@ -79,17 +79,22 @@ struct policy_selector {
     int threads, items;
 
     if (has_flags) {
-      // Flagged path: fewer items due to flag SMEM
-      if (elem_size <= 2)      { threads = 384; items = 18; }
-      else if (elem_size <= 4) { threads = 320; items = 14; }
-      else if (elem_size <= 8) { threads = 256; items = 10; }
-      else                     { threads = 192; items = 7;  }
+      // Flagged path: fewer items due to flag SMEM overhead
+      // SM=16 fix: increase tiles from sm80 baseline to fill more SMEM
+      // select SMEM ≈ threads * items * (elem_size + 1) for flagged
+      if (elem_size <= 1)      { threads = 384; items = 32; } // tile=384*32*2=24576 (50%)
+      else if (elem_size <= 2) { threads = 384; items = 24; } // tile=384*24*3=27648 (56%)
+      else if (elem_size <= 4) { threads = 320; items = 18; } // tile=320*18*5=28800 (59%)
+      else if (elem_size <= 8) { threads = 256; items = 12; } // tile=256*12*9=27648 (56%)
+      else                     { threads = 192; items = 8;  } // tile=192*8*17=26112 (53%)
     } else {
-      // No flags: more items available
-      if (elem_size <= 2)      { threads = 384; items = 22; }
-      else if (elem_size <= 4) { threads = 384; items = 18; }
-      else if (elem_size <= 8) { threads = 256; items = 14; }
-      else                     { threads = 192; items = 9;  }
+      // No flags: more SMEM available for items
+      // SM=16 fix: increase tiles to compensate for fewer CTAs
+      if (elem_size <= 1)      { threads = 384; items = 48; } // tile=384*48*1=18432 (37%)
+      else if (elem_size <= 2) { threads = 384; items = 32; } // tile=384*32*2=24576 (50%)
+      else if (elem_size <= 4) { threads = 384; items = 24; } // tile=384*24*4=36864 (75%)
+      else if (elem_size <= 8) { threads = 256; items = 16; } // tile=256*16*8=32768 (67%)
+      else                     { threads = 192; items = 10; } // tile=192*10*16=30720 (62%)
     }
 
     // SMEM check: input_tile + output_scatter + scan_temp
