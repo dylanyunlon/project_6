@@ -61,7 +61,8 @@ enum class determinism_t {
 struct bi100_float32_plus_o4 {
   // accum_size=4, tile = 512*16*4 = 32768 ≤ 49152 ✓
   // SM100 ref: ipt_16.tpb_512.ipv_2 1.061 1.000 1.065 1.167
-  // Derivation: SMEM OK, threads=512 for occupancy on 50 SMs. Keep.
+  // Derivation: SMEM OK, threads=512. SM=16 (not 50 from spec sheet).
+  // At 16 SMs, fewer concurrent CTAs → consider larger tiles. Pending benchmark.
   static constexpr int items              = 16;
   static constexpr int threads            = 512;
   static constexpr int items_per_vec_load = 2;

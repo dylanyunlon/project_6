@@ -92,10 +92,13 @@ struct policy_selector {
     if (items_for_vec < 1) items_for_vec = 1;
 
     // items_for_latency: enough items to hide memory latency
-    // CCCL cc_to_min_bytes_in_flight: B200=64KB, H100=48KB, A100=16KB, V100=12KB
-    // BI-V100 per-SM BW = 900/50 = 18 GB/s ≈ A100 (2000/108 = 18.5 GB/s)
-    // → Use 16KB (A100-level), not 48-64KB
-    int bytes_in_flight = 16 * 1024;
+    // CCCL cc_to_min_bytes_in_flight: B200=64KB(54GB/s/SM), H100=48KB(25GB/s/SM),
+    //   A100=16KB(18.5GB/s/SM), V100=12KB(14GB/s/SM)
+    // BI-V100: SM=16 (confirmed), per-SM BW = 900/16 = 56 GB/s
+    // bytes_in_flight = BW_per_SM × HBM_latency. BI-V100 HBM latency unknown.
+    // 56 GB/s per SM is B200-level BW, but latency likely differs (not NVIDIA arch).
+    // Estimate 32KB pending benchmark: %RANGE% bytes_in_flight 12288:65536:4096
+    int bytes_in_flight = 32 * 1024;
     int items_for_latency = bytes_in_flight / (256 * min_elem_size);
     if (items_for_latency < 1) items_for_latency = 1;
 

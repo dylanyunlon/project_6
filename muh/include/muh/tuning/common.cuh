@@ -146,8 +146,11 @@ struct scaling_result {
 ///   b) Upper clamp was nominal*1 — should be nominal*2
 ///   c) No SMEM cap on threads — CCCL caps threads to prevent SMEM overflow
 constexpr scaling_result scale_mem_bound(
-    int nominal_4B_threads, int nominal_4B_items, int target_type_size) {
-  constexpr int max_smem = 48 * 1024; // 49152 bytes
+    int nominal_4B_threads, int nominal_4B_items, int target_type_size,
+    int max_smem = 48 * 1024) {
+  // max_smem default 48KB matches CCCL (util_arch.cuh:116).
+  // Pass hw.max_shared_memory_per_block from policy_selector to override
+  // if BI-V100 actual SMEM differs (_custom_ops.py claims 32KB).
 
   // Step 1+2: scale items, clamp to [1, nominal*2]
   int items = nominal_4B_items * 4 / target_type_size;

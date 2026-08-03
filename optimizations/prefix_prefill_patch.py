@@ -8,7 +8,7 @@ BI-V100 hardware:
   SMEM per block: 48 KB
   Warp size: 32 (assumed)
   Max threads/block: 1024
-  SM count: 50
+  SM count: 16 (confirmed via ixsmi, not 50 from spec sheet)
   HBM bandwidth: 900 GB/s
   
 Qwen3.6-35B-A3B attention:
@@ -30,11 +30,14 @@ BLOCK_M analysis:
   More work per thread = better instruction-level parallelism (ILP).
   Fewer warps = more blocks can run concurrently per SM = better occupancy.
   
-  BI-V100 has 50 SMs. With batch_size=1, num_heads~24-28:
+  BI-V100 has 16 SMs (confirmed, not 50 from spec sheet).
+  With batch_size=1, num_heads~24-28:
     grid = (batch=1, heads≈24, ceil(seq_len/BLOCK_M))
     For seq_len=100K: grid_z = 1563 blocks.
     Total blocks = 1 × 24 × 1563 = 37,512 blocks.
-    Blocks per SM = 37512/50 = 750 — plenty of parallelism.
+    Blocks per SM = 37512/16 = 2344 — plenty of parallelism.
+  NOTE: with max-num-seqs=256 (benchmark config), batch_size >> 1,
+    grid is even larger. Parallelism is never the bottleneck.
     
   Reducing NUM_WARPS from 8→4:
     - Each SM can run more blocks concurrently (limited by registers/SMEM)

@@ -18,6 +18,15 @@ RUN python3 /workspace/qwen3_6_scripts/patch_ixformer_native.py
 
 # 1. PagedAttention V2 — fills the NotImplementedError hole
 #    Enables partitioned attention for long sequences (>8192 tokens)
+#    Deploy BOTH PyTorch and Triton V2 to vllm package — _custom_ops.py
+#    tries Triton first, falls back to PyTorch if import/runtime fails.
+#    Triton V2 risk: SMEM=32KB zero margin at head_dim=256 BLOCK_N=32.
+#    If Triton V2 crashes, PyTorch V2 (batched bmm, no intermediate tensor
+#    savings but correct) takes over automatically via try/except.
+RUN cp /workspace/paged_attention_v2_triton.py \
+       /usr/local/corex/lib/python3/dist-packages/vllm/paged_attention_v2_triton.py 2>/dev/null || \
+    cp /workspace/paged_attention_v2_triton.py \
+       /usr/local/corex/lib64/python3/dist-packages/vllm/paged_attention_v2_triton.py 2>/dev/null || true
 RUN python3 /workspace/qwen3_6_scripts/patch_paged_attention_v2.py
 
 # 2. Triton kernel tuning: BLOCK=64, NUM_WARPS=4

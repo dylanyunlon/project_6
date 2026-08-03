@@ -16,7 +16,7 @@ Hardware derivation:
     8 warps = 256 threads → each thread handles 32 elements from Q tile.
     4 warps = 128 threads → each thread handles 64 elements.
     
-    With 50 SMs and typical grid of 37K+ blocks:
+    With 16 SMs (confirmed) and typical grid of 37K+ blocks:
       At 8 warps + 32KB SMEM: 1 block per SM (SMEM-limited)
       At 4 warps + 32KB SMEM: potentially 2 blocks per SM
     
