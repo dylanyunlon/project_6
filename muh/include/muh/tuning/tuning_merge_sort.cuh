@@ -1,10 +1,15 @@
 // muh/include/muh/tuning/tuning_merge_sort.cuh — BI-V100
 //
 // Mirrors: cccl_upstream/cub/cub/device/dispatch/tuning/tuning_merge_sort.cuh
-// CCCL: block sort + merge phases with scale_mem_bound
+// CCCL source: 193 lines. Single MergeSortPolicy with block-level merge sort.
+// Three generations: SM50 {256, 11}, SM52 {512, 15}, SM60+ {256, 17}.
 //
-// vllm relevance: large-scale token logits sorting
-// SMEM risk: scale_mem_bound handles block sort; merge phase uses separate SMEM
+// vllm relevance: DeviceMergeSort is the fallback when radix sort is not applicable
+// (custom comparators, non-integral keys). Used in beam search reordering.
+//
+// SMEM for block sort: threads * items * (key_size + value_size) * 2 (double buffer)
+// SMEM for merge: threads * items * (key_size + value_size)
+// Both must fit in 48KB on BI-V100.
 
 #pragma once
 
@@ -13,30 +18,65 @@
 
 namespace muh::tuning::merge_sort {
 
+// ============================================================================
+// Policy struct — matches CCCL MergeSortPolicy exactly
+// ============================================================================
+
 struct MergeSortPolicy {
-  int block_sort_threads;
-  int block_sort_items;
-  BlockLoadAlgorithm block_sort_load;
-  int merge_threads;
-  int merge_items;
-  CacheLoadModifier merge_load_modifier;
+  int threads_per_block;
+  int items_per_thread;
+  BlockLoadAlgorithm load_algorithm;
+  CacheLoadModifier load_modifier;
+  BlockStoreAlgorithm store_algorithm;
+  bool unroll;
 };
+
+// ============================================================================
+// Helper: nominal_4B_items_to_items (from CCCL common.cuh)
+// Scales items_per_thread from a 4-byte nominal to actual key_size
+// ============================================================================
+
+constexpr int nominal_4b_items(int nominal, int key_size) {
+  int result = nominal * 4 / key_size;
+  return result > 0 ? result : 1;
+}
+
+// ============================================================================
+// CCCL policy_hub generations (from CCCL lines 107-145):
+//
+// SM50: {256, N4B(11), WARP_TRANSPOSE, LOAD_LDG, WARP_TRANSPOSE}
+// SM52: {512, N4B(15), WARP_TRANSPOSE, LOAD_LDG, WARP_TRANSPOSE}
+// SM60: {256, N4B(17), WARP_TRANSPOSE, LOAD_DEFAULT, WARP_TRANSPOSE}
+//
+// policy_selector (CCCL lines 155-167):
+//   Always returns SM60 policy: {256, N4B(17), WARP_TRANSPOSE, LOAD_DEFAULT, WARP_TRANSPOSE}
+//   (SM60 is the "MaxPolicy" in the new tuning API)
+// ============================================================================
 
 struct policy_selector {
   int key_size;
-  int value_size;
 
-  constexpr MergeSortPolicy operator()(const hardware_capability& /*hw*/) const {
-    int pair_size = key_size + (value_size > 0 ? value_size : 0);
-    
-    // Block sort phase
-    auto [bs_items, bs_threads] = scale_mem_bound(256, 11, pair_size);
-    
-    // Merge phase: fewer threads, more items
-    auto [mg_items, mg_threads] = scale_mem_bound(256, 15, pair_size);
+  constexpr MergeSortPolicy operator()(const hardware_capability& hw) const {
+    // SM60+ policy from CCCL (used for all compute capabilities in new API)
+    int items = nominal_4b_items(17, key_size);
 
-    return {bs_threads, bs_items, BLOCK_LOAD_WARP_TRANSPOSE,
-            mg_threads, mg_items, LOAD_DEFAULT};
+    // BI-V100 SMEM check: block sort uses double-buffered tile
+    // tile_smem = threads * items * key_size * 2 (keys double-buffered)
+    // For key-value: also need values, but they share the same tile layout
+    int threads = 256;
+    int tile_smem = threads * items * key_size * 2;
+    while (tile_smem > hw.max_shared_memory_per_block - 2048 && items > 1) {
+      items--;
+      tile_smem = threads * items * key_size * 2;
+    }
+
+    return MergeSortPolicy{
+      threads, items,
+      BLOCK_LOAD_WARP_TRANSPOSE,
+      LOAD_DEFAULT,
+      BLOCK_STORE_WARP_TRANSPOSE,
+      true  // unroll (default in CCCL unless CCCL_AVOID_SORT_UNROLL)
+    };
   }
 };
 
