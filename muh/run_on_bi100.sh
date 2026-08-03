@@ -112,7 +112,7 @@ echo "(Each BLOCK×WARPS combo triggers Triton recompilation into different PTX)
 echo ""
 
 python3 muh/bench_triton_prefill.py \
-    --block 16 32 64 128 \
+    --block 16 32 64 --block-n 16 32 64 \
     --warps 1 2 4 8 \
     --ctx-lens 128 512 2048 8192 \
     --batch 1 --seq-len 1 \

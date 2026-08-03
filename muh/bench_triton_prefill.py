@@ -116,7 +116,8 @@ def dtype_size(dtype):
     return torch.tensor([], dtype=dtype).element_size()
 
 
-def bench_one_config(torch, triton, _fwd_kernel, block: int, num_warps: int,
+def bench_one_config(torch, triton, _fwd_kernel, block_m: int, block_n: int,
+                     num_warps: int,
                      q, k, v, o, k_cache, v_cache, b_loc, b_start_loc,
                      b_seq_len, b_ctx_len, max_input_len: int,
                      warmup: int = 3, repeats: int = 10) -> Optional[float]:
@@ -135,44 +136,10 @@ def bench_one_config(torch, triton, _fwd_kernel, block: int, num_warps: int,
     head = q.shape[1]
     num_queries_per_kv = q.shape[1] // k.shape[1]
     
-    grid = (batch, head, triton.cdiv(max_input_len, block))
+    grid = (batch, head, triton.cdiv(max_input_len, block_m))
     
-    # Attempt compilation + warmup
-    try:
-        for _ in range(warmup):
-            _fwd_kernel[grid](
-                q, k, v, k_cache, v_cache, b_loc,
-                sm_scale, 1.0, 1.0,  # k_scale, v_scale
-                b_start_loc, b_seq_len, b_ctx_len,
-                v_cache.shape[3], k_cache.shape[4],
-                o,
-                b_loc.stride(0), b_loc.stride(1),
-                q.stride(0), q.stride(1), q.stride(2),
-                k.stride(0), k.stride(1), k.stride(2),
-                v.stride(0), v.stride(1), v.stride(2),
-                o.stride(0), o.stride(1), o.stride(2),
-                k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
-                k_cache.stride(3), k_cache.stride(4),
-                v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
-                v_cache.stride(3),
-                num_queries_per_kv=num_queries_per_kv,
-                BLOCK_M=block,
-                BLOCK_DMODEL=Lk,
-                BLOCK_DMODEL_PADDED=Lk_padded,
-                BLOCK_N=block,
-                SLIDING_WINDOW=0,
-                num_warps=num_warps,
-                num_stages=1,
-            )
-        torch.cuda.synchronize()
-    except Exception as e:
-        return None  # Compilation failed (likely SMEM overflow)
-    
-    # Timed runs
-    times = []
-    for _ in range(repeats):
-        torch.cuda.synchronize()
-        start = time.perf_counter()
+    # Build kernel call args (reused for warmup and timed runs)
+    def call_kernel():
         _fwd_kernel[grid](
             q, k, v, k_cache, v_cache, b_loc,
             sm_scale, 1.0, 1.0,
@@ -189,14 +156,29 @@ def bench_one_config(torch, triton, _fwd_kernel, block: int, num_warps: int,
             v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
             v_cache.stride(3),
             num_queries_per_kv=num_queries_per_kv,
-            BLOCK_M=block,
+            BLOCK_M=block_m,
             BLOCK_DMODEL=Lk,
             BLOCK_DMODEL_PADDED=Lk_padded,
-            BLOCK_N=block,
+            BLOCK_N=block_n,
             SLIDING_WINDOW=0,
             num_warps=num_warps,
             num_stages=1,
         )
+    
+    # Attempt compilation + warmup
+    try:
+        for _ in range(warmup):
+            call_kernel()
+        torch.cuda.synchronize()
+    except Exception as e:
+        return None  # Compilation failed (likely SMEM overflow)
+    
+    # Timed runs
+    times = []
+    for _ in range(repeats):
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        call_kernel()
         torch.cuda.synchronize()
         times.append((time.perf_counter() - start) * 1000)  # ms
     
@@ -208,7 +190,9 @@ def main():
     p = argparse.ArgumentParser(
         description="Triton prefill kernel benchmark with compile-time param injection")
     p.add_argument("--block", type=int, nargs="+", default=[16, 32, 64, 128],
-                   help="BLOCK sizes to test (each triggers Triton recompilation)")
+                   help="BLOCK_M sizes to test (each triggers Triton recompilation)")
+    p.add_argument("--block-n", type=int, nargs="+", default=None,
+                   help="BLOCK_N sizes (default: same as --block). Use different values for asymmetric search.")
     p.add_argument("--warps", type=int, nargs="+", default=[1, 2, 4, 8],
                    help="NUM_WARPS values to test")
     p.add_argument("--ctx-lens", type=int, nargs="+", default=[128, 512, 2048, 8192],
@@ -242,7 +226,8 @@ def main():
     print(f"  Kernel: prefix_prefill._fwd_kernel (Triton JIT)")
     print(f"  Mechanism: each (BLOCK, NUM_WARPS) pair → Triton recompilation → different PTX")
     print(f"  Model: Qwen3.6 (head_dim={args.head_dim}, heads={args.num_heads}, kv_heads={args.num_kv_heads})")
-    print(f"  Search: BLOCK={args.block} × WARPS={args.warps} = {len(args.block)*len(args.warps)} variants")
+    block_n_vals = args.block_n if args.block_n else args.block
+    print(f"  Search: BLOCK_M={args.block} × BLOCK_N={block_n_vals} × WARPS={args.warps} = {len(args.block)*len(block_n_vals)*len(args.warps)} variants")
     print(f"  Problem sizes: ctx_len={args.ctx_lens}")
     print()
     
@@ -259,37 +244,37 @@ def main():
                             args.block_size, dtype)
         max_input_len = args.seq_len
         
-        for block in args.block:
-            for warps in args.warps:
-                label = f"block_{block}.warps_{warps}"
-                
-                t = bench_one_config(
-                    torch, triton, _fwd_kernel, block, warps,
-                    q, k, v, o, k_cache, v_cache, b_loc, b_start_loc,
-                    b_seq_len, b_ctx_len, max_input_len,
-                    warmup=args.warmup, repeats=args.repeats,
-                )
-                
-                if t is None:
-                    print(f"  {label:30s} COMPILE FAIL (SMEM overflow)")
-                    all_results.append({
-                        "block": block, "warps": warps, "ctx_len": ctx_len,
-                        "time_ms": None, "status": "compile_fail",
-                    })
-                else:
-                    # Record baseline
-                    if block == 64 and warps == 4:
-                        baseline_times[ctx_len] = t
+        for block_m in args.block:
+            for block_n in block_n_vals:
+                for warps in args.warps:
+                    label = f"bm_{block_m}.bn_{block_n}.w_{warps}"
                     
-                    speedup = baseline_times.get(ctx_len, t) / t if t > 0 else 0
-                    marker = " ★" if speedup > 1.05 else " ✗" if speedup < 0.9 else ""
-                    print(f"  {label:30s} {t:8.3f} ms  {speedup:6.3f}x{marker}")
+                    t = bench_one_config(
+                        torch, triton, _fwd_kernel, block_m, block_n, warps,
+                        q, k, v, o, k_cache, v_cache, b_loc, b_start_loc,
+                        b_seq_len, b_ctx_len, max_input_len,
+                        warmup=args.warmup, repeats=args.repeats,
+                    )
                     
-                    all_results.append({
-                        "block": block, "warps": warps, "ctx_len": ctx_len,
-                        "time_ms": round(t, 4), "speedup": round(speedup, 4),
-                        "status": "ok",
-                    })
+                    if t is None:
+                        print(f"  {label:35s} COMPILE FAIL (SMEM overflow)")
+                        all_results.append({
+                            "block_m": block_m, "block_n": block_n, "warps": warps,
+                            "ctx_len": ctx_len, "time_ms": None, "status": "compile_fail",
+                        })
+                    else:
+                        if block_m == 64 and block_n == 64 and warps == 4:
+                            baseline_times[ctx_len] = t
+                        
+                        speedup = baseline_times.get(ctx_len, t) / t if t > 0 else 0
+                        marker = " ★" if speedup > 1.05 else " ✗" if speedup < 0.9 else ""
+                        print(f"  {label:35s} {t:8.3f} ms  {speedup:6.3f}x{marker}")
+                        
+                        all_results.append({
+                            "block_m": block_m, "block_n": block_n, "warps": warps,
+                            "ctx_len": ctx_len, "time_ms": round(t, 4),
+                            "speedup": round(speedup, 4), "status": "ok",
+                        })
         
         # Free tensors
         del q, k, v, o, k_cache, v_cache, b_loc, b_start_loc, b_seq_len, b_ctx_len
@@ -302,24 +287,27 @@ def main():
         ctx_results = [r for r in all_results if r["ctx_len"] == ctx_len and r["status"] == "ok"]
         if ctx_results:
             best = min(ctx_results, key=lambda r: r["time_ms"])
-            print(f"  ctx={ctx_len:>5d}: block={best['block']}, warps={best['warps']}, "
-                  f"time={best['time_ms']:.3f}ms, speedup={best.get('speedup', 1):.3f}x")
+            print(f"  ctx={ctx_len:>5d}: bm={best['block_m']}, bn={best['block_n']}, "
+                  f"warps={best['warps']}, time={best['time_ms']:.3f}ms, "
+                  f"speedup={best.get('speedup', 1):.3f}x")
     
     # CCCL-format output
     print(f"\nCCCL-format output:")
-    for block in args.block:
-        for warps in args.warps:
-            label = f"block_{block}.warps_{warps}"
-            speedups = []
-            for ctx_len in args.ctx_lens:
-                r = next((r for r in all_results
-                         if r["block"] == block and r["warps"] == warps
-                         and r["ctx_len"] == ctx_len and r["status"] == "ok"), None)
-                if r and "speedup" in r:
-                    speedups.append(f"{r['speedup']:.6f}")
-                else:
-                    speedups.append("N/A")
-            print(f"  {label} {' '.join(speedups)}")
+    for block_m in args.block:
+        for block_n in block_n_vals:
+            for warps in args.warps:
+                label = f"bm_{block_m}.bn_{block_n}.w_{warps}"
+                speedups = []
+                for ctx_len in args.ctx_lens:
+                    r = next((r for r in all_results
+                             if r["block_m"] == block_m and r["block_n"] == block_n
+                             and r["warps"] == warps
+                             and r["ctx_len"] == ctx_len and r["status"] == "ok"), None)
+                    if r and "speedup" in r:
+                        speedups.append(f"{r['speedup']:.6f}")
+                    else:
+                        speedups.append("N/A")
+                print(f"  {label} {' '.join(speedups)}")
     
     if args.output:
         os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)

@@ -302,6 +302,39 @@ def _attn_fwd_inner(
             num_stages=1,
             num_warps=4,
         ),
+        # BI-V100 (SM=16, SMEM≤48KB): smaller BLOCK_M maintains occupancy,
+        # asymmetric M/N trades Q-tile for longer K/V sweeps per CTA.
+        # Autotune will discard these if they're slower — zero risk.
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 32,
+                "waves_per_eu": 2,
+                "PRE_LOAD_V": False,
+            },
+            num_stages=1,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 32,
+                "BLOCK_N": 64,
+                "waves_per_eu": 2,
+                "PRE_LOAD_V": False,
+            },
+            num_stages=1,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 64,
+                "waves_per_eu": 2,
+                "PRE_LOAD_V": False,
+            },
+            num_stages=1,
+            num_warps=4,
+        ),
     ],
     key=['IS_CAUSAL', 'dropout_p', 'BLOCK_DMODEL'],
 )
