@@ -25,6 +25,8 @@ Deploy: cp muh_dispatch.py /usr/local/corex/.../vllm/muh_dispatch.py
         Then patch paged_attn.py to import and use it.
 """
 
+import os
+import sys
 import torch
 from dataclasses import dataclass
 from typing import Optional
@@ -38,7 +40,7 @@ class HardwareCapability:
     warp_size: int = 32
     max_threads_per_block: int = 1024
     max_shared_memory_per_block: int = 49152  # 48KB
-    sm_count: int = 50
+    sm_count: int = 16           # CONFIRMED: ixsmi shows 16 SMs per BI-V100 (NOT 50 from spec)
     memory_bandwidth_gbps: int = 900
     l2_cache_size_bytes: int = 6 * 1024 * 1024  # 6MB
 
@@ -97,12 +99,14 @@ def _read_reduce_config(accum_size: int) -> dict:
             from gen_patch import extract_bi100_structs
             structs = extract_bi100_structs(header_path)
             
-            # Select struct by accum_size
+            # Select struct by accum_size — names match tuning_reduce.cuh
             target_struct = None
-            if accum_size <= 4:
-                target_struct = "bi100_float32_plus_o4"
+            if accum_size <= 2:
+                target_struct = "bi100_plus_accum2_o4"
+            elif accum_size <= 4:
+                target_struct = "bi100_plus_float32_o4"
             else:
-                target_struct = "bi100_float64_plus_o4"
+                target_struct = "bi100_plus_float64_o4"
             
             for name, fields in structs:
                 if name == target_struct:
