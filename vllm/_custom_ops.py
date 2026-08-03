@@ -889,6 +889,9 @@ def get_device_attribute(attribute: int, device: int) -> int:
 
 
 def get_max_shared_memory_per_block_device_attribute(device: int) -> int:
+    # muh: CONSERVATIVE — keeping 32KB until confirmed on real BI-V100
+    # hardware.cuh says 48KB, _custom_ops.py says 32KB. One is wrong.
+    # Test: launch a kernel requesting 33KB SMEM. If it works → 48KB.
     return 32 * 1024
 
 

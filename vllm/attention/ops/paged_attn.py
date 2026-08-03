@@ -123,9 +123,18 @@ class PagedAttention:
         # to parallelize.
         # TODO(woosuk): Tune this heuristic.
         # For context len > 8192, use V2 kernel to avoid shared memory shortage.
-        use_v1 = (max_seq_len <= 8192
-                  and (max_num_partitions == 1 or num_seqs * num_heads > 512))
-        use_v1 = True
+        # muh: BI-V100 (SM=16) V1/V2 heuristic
+        # V1: one CTA per (seq, head) — great for short seq, few SMs
+        # V2: partitioned — needed for long seq (>8192) to avoid SMEM overflow
+        # SM=16 means V1 has less parallelism to exploit, but V2's reduce
+        # overhead is proportionally higher. Keep V1 for longer than default.
+        # Original threshold: 8192. BI-V100: raise to 16384 (16K).
+        # If paged_attention_v2 is NotImplementedError on BI-V100, always V1.
+        try:
+            use_v1 = (max_seq_len <= 16384
+                      and (max_num_partitions == 1 or num_seqs * num_heads > 256))
+        except Exception:
+            use_v1 = True
         if use_v1:
             # Run PagedAttention V1.
             ops.paged_attention_v1(

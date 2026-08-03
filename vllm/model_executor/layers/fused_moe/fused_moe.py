@@ -338,17 +338,23 @@ def get_default_config(
     dtype: Optional[str],
     is_marlin: bool,
 ) -> Dict[str, int]:
+    # muh: BI-V100 (SM=16, 48KB SMEM) aware defaults
+    # Qwen3.6 MoE: E≈128, topk=8, K≈2048, N≈5504
+    # SM=16 → fewer CTAs → each CTA should do more work → larger K tile
+    # SMEM check: M=64 * K=64 * 2B(fp16) * 2(A+B) = 16KB < 48KB ✓
     config = {
         'BLOCK_SIZE_M': 64,
         'BLOCK_SIZE_N': 64,
-        'BLOCK_SIZE_K': 32,
+        'BLOCK_SIZE_K': 64,   # muh: 32→64, better memory coalescing on BI-V100
         'GROUP_SIZE_M': 8
     }
     # A heuristic: fused marlin works faster with this config for small M
     if M <= E or (is_marlin and M <= 32):
+        # muh: decode path (M=1 for single-token, M=8 for topk=8)
+        # BI-V100: K=64 good for memory BW, N=64 for output tile
         config = {
             'BLOCK_SIZE_M': 16,
-            'BLOCK_SIZE_N': 32,
+            'BLOCK_SIZE_N': 64,   # muh: 32→64, wider output tile
             'BLOCK_SIZE_K': 64,
             'GROUP_SIZE_M': 1
         }

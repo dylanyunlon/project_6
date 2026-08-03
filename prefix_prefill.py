@@ -726,8 +726,12 @@ if triton.__version__ >= "2.1.0":
         #   Triton equivalent: BLOCK=64, warps=4 (128 threads, larger tile per warp)
         _is_bi_v100 = not current_platform.has_device_capability(80)
         if _is_bi_v100:
+            # muh: CCCL-informed block selection for BI-V100 (SM=16, SMEM≤48KB)
+            # SMEM = BLOCK_M*Hd*elem + BLOCK_N*Hd*elem*2(K+V)
+            # head_dim=128, fp16(2B): BLOCK=64,N=64 → 48KB (100% SMEM, risky)
+            # Conservative: BLOCK=64,N=32 → 32KB (65% SMEM, safe for 32KB limit)
             BLOCK = 64
-            NUM_WARPS = 4
+            NUM_WARPS = 4   # 4 warps × 32 = 128 threads; BW-limited at 56 GB/s/SM
         else:
             BLOCK = 128
             NUM_WARPS = 8
