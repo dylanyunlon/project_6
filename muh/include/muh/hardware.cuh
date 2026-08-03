@@ -31,7 +31,7 @@ struct hardware_capability {
     return {
       .warp_size = 32,                     // TBD: confirm on actual hardware
       .max_threads_per_block = 1024,
-      .max_shared_memory_per_block = 49152, // 48 KiB, TBD
+      .max_shared_memory_per_block = 49152, // 48 KiB — TBD vs _custom_ops.py's 32KB claim
       .max_registers_per_thread = 255,
       .l2_cache_size_bytes = 6 * 1024 * 1024, // 6 MiB, TBD
       .memory_bandwidth_gbps = 900,  // Confirmed: 1200MHz mem clock         // TBD

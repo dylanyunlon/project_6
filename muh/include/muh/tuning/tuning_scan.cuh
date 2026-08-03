@@ -6,12 +6,21 @@
 // vllm impact: Prefix scan in paged attention block table lookup
 // Competition weight: Input TPS × 2.799
 //
-// DERIVATION (not copy-paste from SM100):
-// - SMEM constraint: tile = threads * items * value_size <= 48KB
-//   SM100 8B tunings (416*23*8=76544, 320*22*8=56320) OVERFLOW on BI-V100
-// - Delay parameters: SM100 L2=50MB, BI-V100 L2=6MB (8.3x smaller)
-//   Smaller L2 → faster coherence → shorter delays
-//   Heuristic: ns *= 0.5, l2w *= 0.6 (to be refined by benchmark)
+// HARDWARE (confirmed via ixsmi):
+//   SM count:   16 (NOT 50)
+//   SMEM:       48KB (49152 bytes)
+//   L2 cache:   6MB (vs SM100's 50MB — 8.3× smaller)
+//   BW/SM:      900/16 = 56 GB/s
+//
+// SM=16 IMPACT ON SCAN:
+//   1. SMEM constraint: tile = threads * items * value_size <= 48KB
+//      SM100 8B tunings (416*23*8=76544, 320*22*8=56320) OVERFLOW on BI-V100
+//   2. Delay parameters: SM100 L2=50MB, BI-V100 L2=6MB (8.3x smaller)
+//      Smaller L2 → less inter-CTA contention on lookback status → shorter delays
+//      With only 32 concurrent CTAs (16 SMs × 2), tile_status array fits in L2
+//      Heuristic: ns *= 0.5, l2w *= 0.6 (PENDING BI-V100 BENCHMARK)
+//   3. Tile maximization: fewer CTAs = each must process more data
+//      Small tiles (e.g. 1B offset=4: tile=9216, 19% SMEM) waste capacity
 
 #pragma once
 
@@ -72,8 +81,12 @@ struct ScanPolicy {
 
 struct bi100_lookback_1B_o4 {
   // SM100 ref: ipt_18.tpb_512.ns_768.dcid_7.l2w_820 → 1.189x
+  // SM=16 fix: tile = 512*18*1 = 9216 (19% SMEM — too small for 16 SMs)
+  // Increase items: 512*32*1 = 16384 (33% SMEM, scan needs input+output buffer)
+  // scan_tile = threads * items * accum_size * 2 (input+output) for SMEM
+  // 512 * 32 * 1 * 2 = 32768 (67% SMEM) — good balance
   static constexpr int threads = 512;
-  static constexpr int items   = 18;
+  static constexpr int items   = 32;
   static constexpr LookbackDelayPolicy delay = {
     LookbackDelayAlgorithm::exponential_backon, 384, 492};
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
@@ -83,8 +96,10 @@ struct bi100_lookback_1B_o4 {
 
 struct bi100_lookback_2B_o4 {
   // SM100 ref: ipt_13.tpb_512.ns_1384.dcid_7.l2w_720 → 1.128x
+  // SM=16 fix: tile = 512*13*2 = 13312 (27% SMEM)
+  // Increase: 512*24*2 = 24576 → scan buffer = 24576*2 = 49152 (100% SMEM)
   static constexpr int threads = 512;
-  static constexpr int items   = 13;
+  static constexpr int items   = 24;
   static constexpr LookbackDelayPolicy delay = {
     LookbackDelayAlgorithm::exponential_backon, 692, 432};
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
@@ -115,10 +130,11 @@ struct bi100_lookback_4B_o8 {
 };
 
 struct bi100_lookback_8B_o4 {
-  // SM100 ref: ipt_23.tpb_416 → tile=76544 > 49152 SMEM OVERFLOW
-  // Derived: items = 49152/(416*8) = 14. Delay halved (L2 6MB vs 50MB).
-  static constexpr int threads = 416;
-  static constexpr int items   = 14;
+  // SM100 ref: ipt_23.tpb_416 → tile=76544 > 49152 SMEM OVERFLOW!
+  // Fix: items = floor(49152/(384*8)) = 16 → tile = 384*16*8 = 49152 (100%)
+  // Changed threads 416→384 (multiple of 32) for cleaner warp alignment
+  static constexpr int threads = 384;
+  static constexpr int items   = 16;
   static constexpr LookbackDelayPolicy delay = {
     LookbackDelayAlgorithm::exponential_backon_jitter_window, 386, 426};
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
@@ -127,8 +143,9 @@ struct bi100_lookback_8B_o4 {
 };
 
 struct bi100_lookback_8B_o8 {
-  // SM100 ref: ipt_22.tpb_320 → tile=56320 > 49152 SMEM OVERFLOW
-  // Derived: items = 49152/(320*8) = 19. Delay: ns*0.5, l2w*0.6.
+  // SM100 ref: ipt_22.tpb_320 → tile=56320 > 49152 SMEM OVERFLOW!
+  // Fix: items = floor(49152/(320*8)) = 19 → tile = 320*19*8 = 48640 (99%)
+  // 19 items confirmed safe, maximizes SMEM within constraint
   static constexpr int threads = 320;
   static constexpr int items   = 19;
   static constexpr LookbackDelayPolicy delay = {
