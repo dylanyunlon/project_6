@@ -1,0 +1,303 @@
+{
+  "flash_attn": [
+    {
+      "BLOCK_M": 128,
+      "BLOCK_N": 32,
+      "waves_per_eu": 2,
+      "PRE_LOAD_V": false,
+      "num_warps": 4,
+      "num_stages": 1,
+      "smem_est": 41984,
+      "smem_pct": 85
+    },
+    {
+      "BLOCK_M": 32,
+      "BLOCK_N": 128,
+      "waves_per_eu": 2,
+      "PRE_LOAD_V": false,
+      "num_warps": 4,
+      "num_stages": 1,
+      "smem_est": 41216,
+      "smem_pct": 84
+    },
+    {
+      "BLOCK_M": 128,
+      "BLOCK_N": 16,
+      "waves_per_eu": 4,
+      "PRE_LOAD_V": false,
+      "num_warps": 4,
+      "num_stages": 1,
+      "smem_est": 37888,
+      "smem_pct": 77
+    },
+    {
+      "BLOCK_M": 16,
+      "BLOCK_N": 128,
+      "waves_per_eu": 4,
+      "PRE_LOAD_V": false,
+      "num_warps": 4,
+      "num_stages": 1,
+      "smem_est": 36992,
+      "smem_pct": 75
+    },
+    {
+      "BLOCK_M": 64,
+      "BLOCK_N": 64,
+      "waves_per_eu": 2,
+      "PRE_LOAD_V": false,
+      "num_warps": 4,
+      "num_stages": 1,
+      "smem_est": 33280,
+      "smem_pct": 68
+    },
+    {
+      "BLOCK_M": 32,
+      "BLOCK_N": 64,
+      "waves_per_eu": 4,
+      "PRE_LOAD_V": false,
+      "num_warps": 4,
+      "num_stages": 1,
+      "smem_est": 24832,
+      "smem_pct": 51
+    },
+    {
+      "BLOCK_M": 64,
+      "BLOCK_N": 32,
+      "waves_per_eu": 4,
+      "PRE_LOAD_V": false,
+      "num_warps": 4,
+      "num_stages": 1,
+      "smem_est": 25088,
+      "smem_pct": 51
+    },
+    {
+      "BLOCK_M": 64,
+      "BLOCK_N": 16,
+      "waves_per_eu": 4,
+      "PRE_LOAD_V": false,
+      "num_warps": 4,
+      "num_stages": 1,
+      "smem_est": 20992,
+      "smem_pct": 43
+    },
+    {
+      "BLOCK_M": 16,
+      "BLOCK_N": 64,
+      "waves_per_eu": 4,
+      "PRE_LOAD_V": false,
+      "num_warps": 4,
+      "num_stages": 1,
+      "smem_est": 20608,
+      "smem_pct": 42
+    },
+    {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "waves_per_eu": 4,
+      "PRE_LOAD_V": false,
+      "num_warps": 4,
+      "num_stages": 1,
+      "smem_est": 16640,
+      "smem_pct": 34
+    },
+    {
+      "BLOCK_M": 32,
+      "BLOCK_N": 16,
+      "waves_per_eu": 4,
+      "PRE_LOAD_V": false,
+      "num_warps": 4,
+      "num_stages": 1,
+      "smem_est": 12544,
+      "smem_pct": 26
+    },
+    {
+      "BLOCK_M": 16,
+      "BLOCK_N": 32,
+      "waves_per_eu": 4,
+      "PRE_LOAD_V": false,
+      "num_warps": 4,
+      "num_stages": 1,
+      "smem_est": 12416,
+      "smem_pct": 25
+    },
+    {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "waves_per_eu": 4,
+      "PRE_LOAD_V": false,
+      "num_warps": 4,
+      "num_stages": 1,
+      "smem_est": 8320,
+      "smem_pct": 17
+    },
+    {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "waves_per_eu": 4,
+      "PRE_LOAD_V": true,
+      "num_warps": 4,
+      "num_stages": 1,
+      "smem_est": 8320,
+      "smem_pct": 17
+    },
+    {
+      "BLOCK_M": 16,
+      "BLOCK_N": 32,
+      "waves_per_eu": 4,
+      "PRE_LOAD_V": true,
+      "num_warps": 4,
+      "num_stages": 1,
+      "smem_est": 12416,
+      "smem_pct": 25
+    },
+    {
+      "BLOCK_M": 16,
+      "BLOCK_N": 64,
+      "waves_per_eu": 4,
+      "PRE_LOAD_V": true,
+      "num_warps": 4,
+      "num_stages": 1,
+      "smem_est": 20608,
+      "smem_pct": 42
+    },
+    {
+      "BLOCK_M": 32,
+      "BLOCK_N": 16,
+      "waves_per_eu": 4,
+      "PRE_LOAD_V": true,
+      "num_warps": 4,
+      "num_stages": 1,
+      "smem_est": 12544,
+      "smem_pct": 26
+    },
+    {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "waves_per_eu": 4,
+      "PRE_LOAD_V": true,
+      "num_warps": 4,
+      "num_stages": 1,
+      "smem_est": 16640,
+      "smem_pct": 34
+    },
+    {
+      "BLOCK_M": 32,
+      "BLOCK_N": 64,
+      "waves_per_eu": 4,
+      "PRE_LOAD_V": true,
+      "num_warps": 4,
+      "num_stages": 1,
+      "smem_est": 24832,
+      "smem_pct": 51
+    },
+    {
+      "BLOCK_M": 64,
+      "BLOCK_N": 16,
+      "waves_per_eu": 4,
+      "PRE_LOAD_V": true,
+      "num_warps": 4,
+      "num_stages": 1,
+      "smem_est": 20992,
+      "smem_pct": 43
+    },
+    {
+      "BLOCK_M": 64,
+      "BLOCK_N": 32,
+      "waves_per_eu": 4,
+      "PRE_LOAD_V": true,
+      "num_warps": 4,
+      "num_stages": 1,
+      "smem_est": 25088,
+      "smem_pct": 51
+    },
+    {
+      "BLOCK_M": 64,
+      "BLOCK_N": 64,
+      "waves_per_eu": 2,
+      "PRE_LOAD_V": true,
+      "num_warps": 4,
+      "num_stages": 1,
+      "smem_est": 33280,
+      "smem_pct": 68
+    }
+  ],
+  "prefill": [
+    {
+      "BLOCK": 16,
+      "NUM_WARPS": 2,
+      "smem_est": 8320,
+      "smem_pct": 17
+    },
+    {
+      "BLOCK": 16,
+      "NUM_WARPS": 4,
+      "smem_est": 8320,
+      "smem_pct": 17
+    },
+    {
+      "BLOCK": 16,
+      "NUM_WARPS": 8,
+      "smem_est": 8320,
+      "smem_pct": 17
+    },
+    {
+      "BLOCK": 32,
+      "NUM_WARPS": 2,
+      "smem_est": 16640,
+      "smem_pct": 34
+    },
+    {
+      "BLOCK": 32,
+      "NUM_WARPS": 4,
+      "smem_est": 16640,
+      "smem_pct": 34
+    },
+    {
+      "BLOCK": 32,
+      "NUM_WARPS": 8,
+      "smem_est": 16640,
+      "smem_pct": 34
+    },
+    {
+      "BLOCK": 64,
+      "NUM_WARPS": 2,
+      "smem_est": 33280,
+      "smem_pct": 68
+    },
+    {
+      "BLOCK": 64,
+      "NUM_WARPS": 4,
+      "smem_est": 33280,
+      "smem_pct": 68
+    },
+    {
+      "BLOCK": 64,
+      "NUM_WARPS": 8,
+      "smem_est": 33280,
+      "smem_pct": 68
+    }
+  ],
+  "moe": [
+    {
+      "BLOCK_SIZE_M": 16
+    },
+    {
+      "BLOCK_SIZE_M": 32
+    },
+    {
+      "BLOCK_SIZE_M": 64
+    },
+    {
+      "BLOCK_SIZE_M": 128
+    },
+    {
+      "BLOCK_SIZE_M": 256
+    }
+  ],
+  "hardware": {
+    "sm_count": 16,
+    "smem_limit": 49152,
+    "head_dim": 128
+  },
+  "note": "SMEM formula: Q_resident + K_per_iter + softmax_state. V reuses K slot."
+}
