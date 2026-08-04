@@ -25,8 +25,8 @@ struct policy_selector {
   bool key_is_primitive;
 
   static constexpr LookbackDelayPolicy nd(int l2w) { return {LookbackDelayAlgorithm::no_delay, 0, l2w}; }
-  static constexpr LookbackDelayPolicy sd(LookbackDelayAlgorithm a, int ns, int l2w) {
-    return {a, (int)(ns*0.5), (int)(l2w*0.6)};
+  static constexpr LookbackDelayPolicy nd(int l2w) {
+    return {LookbackDelayAlgorithm::no_delay, 0, l2w};
   }
 
   constexpr RleNonTrivialRunsLookbackPolicy p(int tpb, int ipt, BlockLoadAlgorithm la,
@@ -38,26 +38,26 @@ struct policy_selector {
     if (!key_is_primitive) {
       // int128: SM90 entry
       if (key_size==16) return p(288, 9, BLOCK_LOAD_WARP_TRANSPOSE, LOAD_DEFAULT,
-                                  {LookbackDelayAlgorithm::fixed_delay, 484, 1150});
+                                  nd(1150));
       // Default
       int ipt = 15 * 4 / key_size; if (ipt<1) ipt=1; if (ipt>15) ipt=15;
-      return p(96, ipt, BLOCK_LOAD_WARP_TRANSPOSE, LOAD_DEFAULT, {LookbackDelayAlgorithm::fixed_delay, 350, 450});
+      return p(96, ipt, BLOCK_LOAD_WARP_TRANSPOSE, LOAD_DEFAULT, nd(450));
     }
 
     // SM100 (delay scaled)
     if (key_size==1) return p(224, 20, BLOCK_LOAD_WARP_TRANSPOSE, LOAD_CA,
-                              sd(LookbackDelayAlgorithm::exponential_backoff, 64, 315));
+                              nd(315));
     if (key_size==2) return p(224, 20, BLOCK_LOAD_WARP_TRANSPOSE, LOAD_DEFAULT,
-                              sd(LookbackDelayAlgorithm::exponential_backon, 116, 340));
+                              nd(340));
     if (key_size==4) return p(224, 13, BLOCK_LOAD_DIRECT, LOAD_DEFAULT,
-                              sd(LookbackDelayAlgorithm::exponential_backoff, 252, 470));
+                              nd(470));
     if (key_size==8) return p(256, 15, BLOCK_LOAD_WARP_TRANSPOSE, LOAD_DEFAULT,
-                              sd(LookbackDelayAlgorithm::exponential_backoff, 28, 520));
+                              nd(520));
 
     // SM90 fallback
     // (SM100 already covers 1/2/4/8, this handles edge cases)
     int ipt = 15 * 4 / key_size; if (ipt<1) ipt=1; if (ipt>15) ipt=15;
-    return p(96, ipt, BLOCK_LOAD_WARP_TRANSPOSE, LOAD_DEFAULT, {LookbackDelayAlgorithm::fixed_delay, 350, 450});
+    return p(96, ipt, BLOCK_LOAD_WARP_TRANSPOSE, LOAD_DEFAULT, nd(450));
   }
 
   constexpr RleNonTrivialRunsPolicy operator()(const hardware_capability& hw) const {

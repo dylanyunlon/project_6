@@ -49,7 +49,7 @@ struct policy_selector {
     return {tpb, ipt, la, lm, BLOCK_SCAN_WARP_SCANS, d};
   }
 
-  static constexpr LookbackDelayPolicy sd(LookbackDelayAlgorithm a, int ns, int l2w) {
+  static constexpr LookbackDelayPolicy nd(int l2w) {
     return {a, (int)(ns * 0.5), (int)(l2w * 0.6)};
   }
 
@@ -57,96 +57,96 @@ struct policy_selector {
     int items = 11 * 4 / key_size;
     if (items < 1) items = 1; if (items > 11) items = 11;
     return {64, items, BLOCK_LOAD_WARP_TRANSPOSE, LOAD_LDG, BLOCK_SCAN_WARP_SCANS,
-            {LookbackDelayAlgorithm::fixed_delay, 350, 450}};
+            nd(450)};
   }
 
   // SM100 tuning — 15 benchmark entries, delay scaled for BI-V100
   constexpr UniqueByKeyPolicy get_sm100() const {
-    constexpr UniqueByKeyPolicy NONE = {0,0,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,BLOCK_SCAN_WARP_SCANS,{LookbackDelayAlgorithm::fixed_delay,0,0}};
+    constexpr UniqueByKeyPolicy NONE = {0,0,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,BLOCK_SCAN_WARP_SCANS,nd(0)};
     if (!primitive_key) return NONE;
     if (!primitive_value) return NONE;
 
     // key=1B
-    if (key_size==1 && value_size==1) return safe(512,12,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,sd(LookbackDelayAlgorithm::exponential_backon_jitter_window,948,955));
-    if (key_size==1 && value_size==2) return safe(512,14,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,sd(LookbackDelayAlgorithm::exponential_backon,1228,320));
-    if (key_size==1 && value_size==4) return safe(512,14,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,sd(LookbackDelayAlgorithm::exponential_backon,2016,620));
-    if (key_size==1 && value_size==8) return safe(384,10,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,sd(LookbackDelayAlgorithm::exponential_backon_jitter_window,1728,980));
+    if (key_size==1 && value_size==1) return safe(512,12,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(955));
+    if (key_size==1 && value_size==2) return safe(512,14,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(320));
+    if (key_size==1 && value_size==4) return safe(512,14,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(620));
+    if (key_size==1 && value_size==8) return safe(384,10,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(980));
     // key=2B
-    if (key_size==2 && value_size==1) return safe(512,14,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,sd(LookbackDelayAlgorithm::exponential_backon,508,1020));
-    if (key_size==2 && value_size==2) return safe(384,12,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,sd(LookbackDelayAlgorithm::exponential_backon,928,605));
-    if (key_size==2 && value_size==4) return safe(384,11,BLOCK_LOAD_DIRECT,LOAD_CA,sd(LookbackDelayAlgorithm::exponential_backon,1620,810));
-    if (key_size==2 && value_size==8) return safe(384,10,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,sd(LookbackDelayAlgorithm::exponential_backon_jitter_window,1984,935));
+    if (key_size==2 && value_size==1) return safe(512,14,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(1020));
+    if (key_size==2 && value_size==2) return safe(384,12,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(605));
+    if (key_size==2 && value_size==4) return safe(384,11,BLOCK_LOAD_DIRECT,LOAD_CA,nd(810));
+    if (key_size==2 && value_size==8) return safe(384,10,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(935));
     // key=4B
-    if (key_size==4 && value_size==1) return safe(512,14,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,sd(LookbackDelayAlgorithm::exponential_backon,1136,605));
-    if (key_size==4 && value_size==2) return safe(384,11,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,sd(LookbackDelayAlgorithm::exponential_backon,656,825));
-    if (key_size==4 && value_size==8) return safe(384,10,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,sd(LookbackDelayAlgorithm::exponential_backon_jitter_window,1012,800));
+    if (key_size==4 && value_size==1) return safe(512,14,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(605));
+    if (key_size==4 && value_size==2) return safe(384,11,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(825));
+    if (key_size==4 && value_size==8) return safe(384,10,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(800));
     // key=8B
-    if (key_size==8 && value_size==2) return safe(384,10,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,sd(LookbackDelayAlgorithm::exponential_backon_jitter_window,864,1130));
-    if (key_size==8 && value_size==4) return safe(384,10,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,sd(LookbackDelayAlgorithm::exponential_backon_jitter_window,772,665));
+    if (key_size==8 && value_size==2) return safe(384,10,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(1130));
+    if (key_size==8 && value_size==4) return safe(384,10,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(665));
 
     return NONE;
   }
 
   // SM90 tuning — 24 entries (20 primitive + 4 val_size=16)
   constexpr UniqueByKeyPolicy get_sm90() const {
-    constexpr UniqueByKeyPolicy NONE = {0,0,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,BLOCK_SCAN_WARP_SCANS,{LookbackDelayAlgorithm::fixed_delay,0,0}};
+    constexpr UniqueByKeyPolicy NONE = {0,0,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,BLOCK_SCAN_WARP_SCANS,nd(0)};
     if (!primitive_key) return NONE;
 
     if (primitive_value) {
-      if (key_size==1 && value_size==1) return safe(256,12,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,550});
-      if (key_size==1 && value_size==2) return safe(448,14,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,725});
-      if (key_size==1 && value_size==4) return safe(256,12,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,1130});
-      if (key_size==1 && value_size==8) return safe(512,10,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,1100});
-      if (key_size==2 && value_size==1) return safe(256,12,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,640});
-      if (key_size==2 && value_size==2) return safe(288,14,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::fixed_delay,404,710});
-      if (key_size==2 && value_size==4) return safe(512,12,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,525});
-      if (key_size==2 && value_size==8) return safe(256,23,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,1200});
-      if (key_size==4 && value_size==1) return safe(448,12,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::fixed_delay,348,580});
-      if (key_size==4 && value_size==2) return safe(384,9,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,1060});
-      if (key_size==4 && value_size==4) return safe(512,14,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,1045});
-      if (key_size==4 && value_size==8) return safe(512,11,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,1120});
-      if (key_size==8 && value_size==1) return safe(384,9,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,1060});
-      if (key_size==8 && value_size==2) return safe(384,9,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::fixed_delay,964,1125});
-      if (key_size==8 && value_size==4) return safe(640,7,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,1070});
-      if (key_size==8 && value_size==8) return safe(448,11,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,1190});
+      if (key_size==1 && value_size==1) return safe(256,12,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(550));
+      if (key_size==1 && value_size==2) return safe(448,14,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(725));
+      if (key_size==1 && value_size==4) return safe(256,12,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(1130));
+      if (key_size==1 && value_size==8) return safe(512,10,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(1100));
+      if (key_size==2 && value_size==1) return safe(256,12,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(640));
+      if (key_size==2 && value_size==2) return safe(288,14,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(710));
+      if (key_size==2 && value_size==4) return safe(512,12,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(525));
+      if (key_size==2 && value_size==8) return safe(256,23,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,nd(1200));
+      if (key_size==4 && value_size==1) return safe(448,12,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(580));
+      if (key_size==4 && value_size==2) return safe(384,9,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(1060));
+      if (key_size==4 && value_size==4) return safe(512,14,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,nd(1045));
+      if (key_size==4 && value_size==8) return safe(512,11,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,nd(1120));
+      if (key_size==8 && value_size==1) return safe(384,9,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(1060));
+      if (key_size==8 && value_size==2) return safe(384,9,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(1125));
+      if (key_size==8 && value_size==4) return safe(640,7,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(1070));
+      if (key_size==8 && value_size==8) return safe(448,11,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,nd(1190));
     }
     // non-primitive value, size=16
     if (value_size == 16) {
-      if (key_size==1) return safe(288,7,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,{LookbackDelayAlgorithm::fixed_delay,344,1165});
-      if (key_size==2) return safe(224,9,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,{LookbackDelayAlgorithm::fixed_delay,424,1055});
-      if (key_size==4) return safe(384,7,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,1025});
-      if (key_size==8) return safe(256,9,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,1155});
+      if (key_size==1) return safe(288,7,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,nd(1165));
+      if (key_size==2) return safe(224,9,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,nd(1055));
+      if (key_size==4) return safe(384,7,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,nd(1025));
+      if (key_size==8) return safe(256,9,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,nd(1155));
     }
     return NONE;
   }
 
   // SM80 tuning — 32 entries
   constexpr UniqueByKeyPolicy get_sm80() const {
-    constexpr UniqueByKeyPolicy NONE = {0,0,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,BLOCK_SCAN_WARP_SCANS,{LookbackDelayAlgorithm::fixed_delay,0,0}};
+    constexpr UniqueByKeyPolicy NONE = {0,0,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,BLOCK_SCAN_WARP_SCANS,nd(0)};
     if (!primitive_key) return NONE;
 
     if (primitive_value) {
-      if (key_size==1 && value_size==1) return safe(256,12,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,835});
-      if (key_size==1 && value_size==2) return safe(256,12,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,765});
-      if (key_size==1 && value_size==4) return safe(256,12,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,1155});
-      if (key_size==1 && value_size==8) return safe(224,10,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,1065});
-      if (key_size==2 && value_size==1) return safe(320,20,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,1020});
-      if (key_size==2 && value_size==2) return safe(192,22,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,{LookbackDelayAlgorithm::fixed_delay,328,1080});
-      if (key_size==2 && value_size==4) return safe(256,14,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,535});
-      if (key_size==2 && value_size==8) return safe(256,10,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,1055});
-      if (key_size==4 && value_size==1) return safe(256,12,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,1120});
-      if (key_size==4 && value_size==2) return safe(256,14,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,1185});
-      if (key_size==4 && value_size==4) return safe(256,11,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::no_delay,0,1115});
-      if (key_size==4 && value_size==8) return safe(256,7,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::fixed_delay,320,1115});
-      if (key_size==8 && value_size==1) return safe(256,7,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::fixed_delay,24,555});
-      if (key_size==8 && value_size==2) return safe(256,7,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::fixed_delay,324,1105});
-      if (key_size==8 && value_size==4) return safe(256,7,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::fixed_delay,740,1105});
-      if (key_size==8 && value_size==8) return safe(192,7,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,{LookbackDelayAlgorithm::fixed_delay,764,1155});
+      if (key_size==1 && value_size==1) return safe(256,12,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(835));
+      if (key_size==1 && value_size==2) return safe(256,12,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(765));
+      if (key_size==1 && value_size==4) return safe(256,12,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(1155));
+      if (key_size==1 && value_size==8) return safe(224,10,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(1065));
+      if (key_size==2 && value_size==1) return safe(320,20,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(1020));
+      if (key_size==2 && value_size==2) return safe(192,22,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,nd(1080));
+      if (key_size==2 && value_size==4) return safe(256,14,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,nd(535));
+      if (key_size==2 && value_size==8) return safe(256,10,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,nd(1055));
+      if (key_size==4 && value_size==1) return safe(256,12,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(1120));
+      if (key_size==4 && value_size==2) return safe(256,14,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,nd(1185));
+      if (key_size==4 && value_size==4) return safe(256,11,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(1115));
+      if (key_size==4 && value_size==8) return safe(256,7,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(1115));
+      if (key_size==8 && value_size==1) return safe(256,7,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(555));
+      if (key_size==8 && value_size==2) return safe(256,7,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(1105));
+      if (key_size==8 && value_size==4) return safe(256,7,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(1105));
+      if (key_size==8 && value_size==8) return safe(192,7,BLOCK_LOAD_DIRECT,LOAD_DEFAULT,nd(1155));
     }
     // non-primitive val, size=16
     if (value_size == 16) {
-      if (key_size==1) return safe(128,15,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,{LookbackDelayAlgorithm::fixed_delay,248,1200});
-      if (key_size==8) return safe(128,7,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,{LookbackDelayAlgorithm::fixed_delay,992,1135});
+      if (key_size==1) return safe(128,15,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,nd(1200));
+      if (key_size==8) return safe(128,7,BLOCK_LOAD_WARP_TRANSPOSE,LOAD_DEFAULT,nd(1135));
     }
     return NONE;
   }

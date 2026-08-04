@@ -95,7 +95,7 @@ struct bi100_lookback_1B_o4 {
   static constexpr int threads = 512;
   static constexpr int items   = 32;
   static constexpr LookbackDelayPolicy delay = {
-    LookbackDelayAlgorithm::exponential_backon, 384, 492};
+    LookbackDelayAlgorithm::no_delay, 0, 492};
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
   static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
   static constexpr CacheLoadModifier load_mod      = LOAD_DEFAULT;
@@ -108,7 +108,7 @@ struct bi100_lookback_2B_o4 {
   static constexpr int threads = 512;
   static constexpr int items   = 24;
   static constexpr LookbackDelayPolicy delay = {
-    LookbackDelayAlgorithm::exponential_backon, 692, 432};
+    LookbackDelayAlgorithm::no_delay, 0, 432};
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
   static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
   static constexpr CacheLoadModifier load_mod      = LOAD_DEFAULT;
@@ -138,7 +138,7 @@ struct bi100_lookback_4B_o8 {
   static constexpr int threads = 416;
   static constexpr int items   = 19;
   static constexpr LookbackDelayPolicy delay = {
-    LookbackDelayAlgorithm::exponential_backon, 478, 330};
+    LookbackDelayAlgorithm::no_delay, 0, 330};
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
   static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
   static constexpr CacheLoadModifier load_mod      = LOAD_CA;
@@ -151,7 +151,7 @@ struct bi100_lookback_8B_o4 {
   static constexpr int threads = 384;
   static constexpr int items   = 16;
   static constexpr LookbackDelayPolicy delay = {
-    LookbackDelayAlgorithm::exponential_backon_jitter_window, 386, 426};
+    LookbackDelayAlgorithm::no_delay, 0, 426};
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
   static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
   static constexpr CacheLoadModifier load_mod      = LOAD_DEFAULT;
@@ -164,7 +164,7 @@ struct bi100_lookback_8B_o8 {
   static constexpr int threads = 320;
   static constexpr int items   = 19;
   static constexpr LookbackDelayPolicy delay = {
-    LookbackDelayAlgorithm::exponential_backoff, 164, 579};
+    LookbackDelayAlgorithm::no_delay, 0, 579};
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
   static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
   static constexpr CacheLoadModifier load_mod      = LOAD_DEFAULT;
@@ -177,7 +177,7 @@ struct bi100_lookback_1B_o8 {
   static constexpr int threads = 384;
   static constexpr int items   = 14;
   static constexpr LookbackDelayPolicy delay = {
-    LookbackDelayAlgorithm::exponential_backon, 114, 465};
+    LookbackDelayAlgorithm::no_delay, 0, 465};
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
   static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
   static constexpr CacheLoadModifier load_mod      = LOAD_CA;
@@ -234,7 +234,7 @@ struct bi100_lookback_default {
   static constexpr int threads = 128;
   static constexpr int items   = 15;
   static constexpr LookbackDelayPolicy delay = {
-    LookbackDelayAlgorithm::fixed_delay, 350, 450};
+    LookbackDelayAlgorithm::no_delay, 0, 450};
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
   static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
   static constexpr CacheLoadModifier load_mod      = LOAD_DEFAULT;
