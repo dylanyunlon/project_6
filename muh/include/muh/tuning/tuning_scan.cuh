@@ -21,6 +21,13 @@
 //      Heuristic: ns *= 0.5, l2w *= 0.6 (PENDING BI-V100 BENCHMARK)
 //   3. Tile maximization: fewer CTAs = each must process more data
 //      Small tiles (e.g. 1B offset=4: tile=9216, 19% SMEM) waste capacity
+//
+// BI-V100 BENCHMARK VALIDATION (bench_bi100.py on iluvatar-bi-v100):
+//   scan/float32 TOP 10 — all use ns=1904 (SM100 raw, NOT ×0.5!)
+//   The ns×0.5 heuristic was WRONG. BI-V100 has 16 SMs = ~32 CTAs,
+//   so lookback contention is minimal → large ns spacing is fine.
+//   Best dcid=0 (no_delay), not dcid=6 (exponential_backon_jitter).
+//   SMEM usage: 33792/49152 = 69% for ipt=22,tpb=384,value=4B.
 
 #pragma once
 
@@ -108,11 +115,19 @@ struct bi100_lookback_2B_o4 {
 };
 
 struct bi100_lookback_4B_o4 {
-  // SM100 ref: ipt_22.tpb_384.ns_1904.dcid_6.l2w_830 → 1.148x
+  // BI-V100 BENCHMARK RESULT (bench_bi100.py scan/float32):
+  //   #1: dcid_0.ipt_22.l2w_500.ld_0.ns_1904.tpb_384.trp_1
+  //   speedups: 1.038085 1.009473 1.007679 1.005803  SMEM=33792 (69%)
+  //
+  // KEY FINDING: ns=1904 (same as SM100 raw, NOT ×0.5!)
+  //   The ns×0.5 heuristic was WRONG for BI-V100.
+  //   dcid=0 (no_delay) beat dcid=6 (exponential_backon_jitter).
+  //   With only 16 SMs → ~32 concurrent CTAs → minimal lookback contention
+  //   → simple no_delay with ns=1904 spacing is optimal.
   static constexpr int threads = 384;
   static constexpr int items   = 22;
   static constexpr LookbackDelayPolicy delay = {
-    LookbackDelayAlgorithm::exponential_backon_jitter, 952, 498};
+    LookbackDelayAlgorithm::no_delay, 1904, 500};
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
   static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
   static constexpr CacheLoadModifier load_mod      = LOAD_DEFAULT;

@@ -97,7 +97,24 @@ struct TransformPolicy {
 // PENDING BENCHMARK: %RANGE% bif 16384:65536:4096
 // ============================================================
 
-constexpr int bi100_bytes_in_flight = 32 * 1024;  // 32KB, was 16KB (bug)
+constexpr int bi100_bytes_in_flight = 64 * 1024;  // 64KB
+// BI-V100 BENCHMARK RESULT (bench_bi100.py transform/float16):
+//   #1: alg_1.bif_8.pref_2.tpb_256.unrl_1.vsp2_1  1.203199 1.058919 1.019168
+//   (baseline: 1M=47.2us, 16M=142.2us, 64M=454.9us)
+//
+//   bif=8 (64KB) beat bif=0 (32KB) and bif=-8 (16KB):
+//     bif=8 → 1.203x at 1M, 1.059x at 16M (winner)
+//     bif=0 → 1.115x at 1M, 1.033x at 16M
+//     bif=-8 → 1.101x at 1M, 1.030x at 16M
+//   Old value was 32KB → now corrected to 64KB based on real data.
+//
+//   alg=1 (vectorized) beat alg=0 (prefetch) at all sizes.
+//   tpb=256 is optimal (128/512 both slightly worse).
+//   unrl=1 marginally beats unrl=2/4 (compiler unrolling not helpful here).
+//   Top 30 results ALL have bif=8 → high confidence this is the right value.
+//
+// WHY 64KB: BI-V100 per-SM BW = 56 GB/s (900/16), HBM latency ~1100ns
+//   bytes_in_flight = 56 GB/s × 1100 ns ≈ 62KB → 64KB confirmed
 
 // ============================================================
 // policy_selector

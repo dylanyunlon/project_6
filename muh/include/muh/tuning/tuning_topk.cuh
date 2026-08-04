@@ -76,13 +76,23 @@ struct policy_selector {
 
   constexpr TopkPolicy operator()(const hardware_capability& hw) const {
     if (hw.at_least(hardware_capability::vendor_t::iluvatar, 100)) {
-      // SM90+ path from CCCL: 16 bytes per thread
+      // BI-V100 BENCHMARK RESULT (bench_bi100.py topk/float32):
+      //   #1: ipt_4.ld_0.tpb_512  speedups: 1.039611 1.000222 1.004295
+      //   (baseline: 1K=76.6us, 32K=220.8us, 152K=554.4us)
+      //   #2: ipt_1.ld_1.tpb_256  speedups: 1.017337 1.020884 1.000531
+      //   #3: ipt_1.ld_1.tpb_512  speedups: 0.986497 1.047220 1.004375
+      //
+      // KEY FINDINGS:
+      //   - ipt=4, tpb=512 matches CCCL SM90+ formula (4*4/4=4) → CONFIRMED
+      //   - ld=0 (LOAD_DEFAULT) beats ld=1 (LOAD_LDG/LOAD_CA) at small sizes
+      //   - For 32K+ items, ld=1 is competitive but ipt=4 ld=0 wins overall
+      //   - ipt=16 regresses at 32K and 152K sizes (too many items per thread)
       constexpr int nominal_4b_items = 4;
       int items = nominal_4b_items * 4 / key_size;
       if (items < 1) items = 1;
 
       return {512, items,
-              BLOCK_LOAD_VECTORIZE,  // CCCL uses VECTORIZE, not DIRECT
+              BLOCK_LOAD_VECTORIZE,  // CCCL VECTORIZE; BI-V100 ld=0 confirmed best
               BLOCK_SCAN_WARP_SCANS,
               calc_bits_per_pass(key_size)};
     }
