@@ -889,7 +889,10 @@ def get_device_attribute(attribute: int, device: int) -> int:
 
 
 def get_max_shared_memory_per_block_device_attribute(device: int) -> int:
-    return 32 * 1024
+    # BI-V100 SMEM = 49152 bytes (48KB), confirmed via ixsmi
+    # Was incorrectly hardcoded to 32KB (32768), limiting Triton tile sizes
+    # and potentially constraining ixformer internal SMEM allocation.
+    return 49152
 
 
 # custom ar

@@ -432,7 +432,14 @@ if triton.__version__ >= "2.1.0":
             l_i = l_i_new
             m_i = m_i_new
 
-        # acc /= l_i[:, None]
+        # BUG FIX: v2 kernel accumulates unnormalized softmax weights.
+        # Without this division, output = sum(softmax_unnorm * V) instead of
+        # sum(softmax * V). This was commented out in the original code.
+        # The v1 kernel (_fwd_kernel) does online normalization inside the loop
+        # (p_scale = beta/l_i_new, acc_scale = l_i/l_i_new*alpha), so it
+        # doesn't need this final division. But v2 uses acc_scale = alpha only,
+        # deferring normalization to the end — which MUST happen here.
+        acc = acc / l_i[:, None]
         # initialize pointers to output
         off_o = (
             (cur_batch_in_all_start_index + offs_m[:, None]) * stride_obs +
@@ -709,8 +716,18 @@ if triton.__version__ >= "2.1.0":
                               alibi_slopes=None,
                               sliding_window=None):
 
-        BLOCK = 128 if current_platform.has_device_capability(80) else 64
-        NUM_WARPS = 8
+        # BI-V100: 16 SMs, 48KB SMEM, not SM80+
+        # BLOCK=64 is correct for non-SM80 devices (SMEM: 64*128*2*2 = 32KB ≤ 48KB)
+        # NUM_WARPS: 4 (not 8) for BLOCK=64 — with 64 query rows, 256 threads
+        # (8 warps) means only 64/256 = 0.25 rows per thread in the M dimension,
+        # wasting occupancy. 4 warps (128 threads) = 0.5 rows/thread is better.
+        # SM80+ gets BLOCK=128 with 8 warps (128/256 = 0.5 rows/thread).
+        if current_platform.has_device_capability(80):
+            BLOCK = 128
+            NUM_WARPS = 8
+        else:
+            BLOCK = 64
+            NUM_WARPS = 4
 
         # need to reduce num. blocks when using fp32
         # due to increased use of GPU shared memory
