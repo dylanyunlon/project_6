@@ -187,9 +187,38 @@ VLLM_KERNEL_MAP = {
         },
         "tuning_dimensions": {
             "NUM_THREADS": {"cccl_field": "threads_per_block"},
-            "PARTITION_SIZE": {"cccl_field": "threads_per_block * items_per_thread"},
+            "PARTITION_SIZE": {"cccl_field": "threads_per_block * items_per_thread",
+                              "note": "hardcoded 512 in paged_attn.py, should be tunable"},
         },
-        "cccl_pattern": "reduce pass 1 (per-partition) + reduce pass 2 (cross-partition merge)",
+        "cccl_pattern": "compound reduce: summary_statistics.cu Welford parallel merge pattern",
+        "cccl_parallel": {
+            "source": "thrust/examples/summary_statistics.cu",
+            "mapping": {
+                "summary_stats_data<T>": "(max_logits, exp_sums, output) per partition",
+                "summary_stats_unary_op": "per-KV-block attention: Q@K^T → softmax → V weighted sum",
+                "summary_stats_binary_op": "cross-partition online softmax merge",
+                "thrust::transform_reduce": "DeviceReduce pass 2 merging partition results",
+            },
+            "insight": "V2 reduce pass is structurally identical to CCCL compound reduce. "
+                      "The accumulator is a 3-field struct (max, exp_sum, output_partial). "
+                      "The binary op is the online softmax merge: "
+                      "new_max = max(A.max, B.max), rescale exp_sums by exp(old_max - new_max), "
+                      "merge weighted outputs. This is exactly the Welford parallel "
+                      "variance pattern with different field semantics. "
+                      "CCCL's AgentReduce handles compound structs natively — "
+                      "the same tuning_reduce.cuh parameters apply, with accum_size = "
+                      "sizeof(float32)*3 = 12 bytes (the compound accumulator).",
+        },
+        "v2_dispatch_bug": {
+            "file": "paged_attn.py",
+            "line": 99,
+            "issue": "use_v1 = True hardcodes V1 for all seq_lens, disabling V2 entirely",
+            "impact": "For 100K token sequences, V1 makes one CTA iterate ALL KV blocks. "
+                     "V2 would partition into PARTITION_SIZE chunks and reduce across partitions, "
+                     "matching CCCL's two-pass GridEvenShare pattern.",
+            "fix": "Remove use_v1=True override. Use original heuristic: "
+                  "V2 when max_seq_len > 8192 AND max_num_partitions > 1 AND num_seqs*num_heads <= 512",
+        },
     },
     
     "context_attention_fwd": {

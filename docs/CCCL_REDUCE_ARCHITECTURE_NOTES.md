@@ -230,3 +230,68 @@ This means:
 - tuning_reduce.cuh: consider increasing items beyond scale_mem_bound cap
   for better ILP, especially for small types (fp16, int8)
 - tuning_scan.cuh: current values are correctly SMEM-bounded, don't increase
+
+---
+
+## CCCL Lookback Delay Protocol (single_pass_scan_operators.cuh)
+
+> Added: 2026-08-04
+
+### delay() has a GridThreshold gate — renders delay_ns IRRELEVANT on BI-V100
+
+```cpp
+template <int Delay, unsigned int GridThreshold = 500>
+void delay() {
+    if (Delay > 0) {
+        if (gridDim.x < GridThreshold)  // <-- THIS IS THE KEY
+            __threadfence_block();       // small grid: just fence
+        else
+            __nanosleep(Delay);          // large grid: actual sleep
+    }
+}
+```
+
+GridThreshold defaults to 500. BI-V100 scan with 100K fp32 elements:
+  tile_size = 384 * 22 = 8448
+  num_tiles = ceil(100000/8448) = 12 blocks
+  12 << 500 → ALL delay calls reduce to __threadfence_block()
+
+This means: on BI-V100, the entire delay infrastructure (ns, dcid, l2w)
+is a no-op. no_delay, fixed_delay(1904), exponential_backon_jitter(1904,830)
+ALL execute the same __threadfence_block(). 
+
+### Why our benchmark showed no_delay as "best"
+
+Not because no_delay is a better strategy, but because ALL strategies
+produce identical machine code on a 12-block grid. The ~3% speedup
+difference between dcid=0 and dcid=6 in bench_bi100.py is noise.
+
+### Impact on tuning_scan.cuh
+
+All scan delay parameters (delay_ns, delay_l2w, delay algorithm) can be
+simplified to no_delay for BI-V100. The heuristic scaling (ns×0.5, l2w×0.6)
+was both wrong AND irrelevant — the values don't matter because they're
+never used as nanosleep arguments.
+
+The only scan tuning parameters that matter on BI-V100 are:
+  - threads_per_block (affects SMEM usage and occupancy)
+  - items_per_thread (affects SMEM usage and ILP)
+  - load_algorithm (WARP_TRANSPOSE vs DIRECT)
+  - scan_algorithm (RAKING vs WARP_SCANS)
+  - load_modifier (DEFAULT vs LDG)
+
+### summary_statistics.cu → paged_attention V2 compound reduce
+
+The Welford parallel merge in summary_statistics.cu is structurally 
+identical to paged_attention V2's cross-partition reduce:
+
+| summary_statistics | paged_attention V2 |
+|---|---|
+| summary_stats_data{n,min,max,mean,M2,M3,M4} | partition_result{max_logit, exp_sum, output_partial} |
+| unary_op: x → {n=1, mean=x, M2=0, ...} | per-partition attention: Q@K^T → softmax → V·weights |
+| binary_op: Welford parallel merge | online softmax merge: rescale by exp(old_max - new_max) |
+| thrust::transform_reduce | DeviceReduce pass 2 |
+
+The compound accumulator size for V2 is sizeof(float)*3 = 12 bytes.
+This affects tuning: scale_mem_bound(512, 16, 12) → different items/threads
+than a simple float32 reduce.
