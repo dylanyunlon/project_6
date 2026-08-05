@@ -224,8 +224,12 @@ def paged_attention_v2_pytorch(
         global_max = pm.max(dim=-1).values               # [H]
         rescale = torch.exp(pm - global_max.unsqueeze(-1)) * ps  # [H, P]
         total = rescale.sum(dim=-1, keepdim=True)         # [H, 1]
-        weights = rescale / total                          # [H, P]
 
+        # CCCL norm.cu principle: fuse transform with reduce to minimize traversals.
+        # Instead of: weights = rescale/total; final = bmm(weights, po)
+        # Do: final = bmm(rescale, po) / total
+        # Saves one element-wise division kernel launch (rescale/total → H*P elements).
+        # The division moves to the output (H*d elements, typically smaller than H*P).
         # [H, 1, P] @ [H, P, d] → [H, 1, d] → [H, d]
-        final = torch.bmm(weights.unsqueeze(1), po.float()).squeeze(1)  # [H, d]
+        final = torch.bmm(rescale.unsqueeze(1), po.float()).squeeze(1) / total  # [H, d]
         output[seq_idx] = final.to(output.dtype)
