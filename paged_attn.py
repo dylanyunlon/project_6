@@ -139,29 +139,36 @@ class PagedAttention:
         output = torch.empty_like(query)
 
         # ================================================================
-        # CCCL GridEvenShare adaptive tile sizing for decode
+        # CCCL spread_out_items_per_thread adaptive tile sizing for decode
         #
-        # dispatch_reduce.cuh:
-        #   max_blocks = sm_occupancy × sm_count × subscription_factor
-        #   tile_size  = threads_per_block × items_per_thread
+        # Ported from dispatch_transform.cuh::spread_out_items_per_thread
+        # and dispatch_reduce.cuh::InvokePasses GridEvenShare.
         #
-        # For PyTorch decode, "tile" = number of KV cache blocks processed
-        # per matmul call. More blocks per tile = fewer Python loop iterations
-        # = less launch overhead. Constraint: score tensor
-        # [kv_h, gqa, 1, tile_tokens] × 4 bytes must be reasonable.
+        # CCCL formula (dispatch_transform.cuh line 183):
+        #   items = min(max_items,
+        #               ceil_div(num_items, sm_count * threads * max_occupancy))
+        #   items = clamp(items, min_items, max_items)
         #
-        # For decode (q_len=1), score tensor is tiny:
-        #   kv_h × gqa × 1 × tile_tokens × 4 = 1 × 6 × 1 × 4096 × 4 = 96 KB
-        # So we can use large tiles: process ALL blocks in one matmul when
-        # possible, falling back to tiling only for very long sequences.
+        # Our translation for PyTorch decode:
+        #   "items" = KV blocks per tile (how much work per matmul call)
+        #   "num_items" = total KV blocks in the sequence
+        #   "sm_count * max_occupancy" = target number of tiles (~4-8)
+        #   Fewer tiles = fewer Python loop iterations = less launch overhead
         #
-        # CCCL subscription_factor = 5, sm_count = 16:
-        #   max_concurrent_tiles ≈ 80
-        # But Python overhead dominates, so FEWER tiles is better.
-        # Strategy: tile_blocks = min(all_blocks, 1024) — process up to 1024
-        # cache blocks (= 16384 tokens at block_size=16) per matmul.
+        # For decode (q_len=1), score tensor per tile is tiny:
+        #   kv_h × gqa × 1 × (tile_blocks × block_size) × 4 bytes
+        #   = 4 × 6 × 1 × 16384 × 4 = 1.5 MB  (even at kv_h=4, safe)
+        # So the constraint is NOT memory — it's minimizing loop iterations.
+        #
+        # CCCL grid_even_share.cuh DispatchInit logic:
+        #   total_tiles = ceil_div(num_items, tile_size)
+        #   grid_size = min(total_tiles, max_grid_size)
+        #   big_shares = total_tiles - (avg_tiles * grid_size)
+        # Our target: ~4 tiles max (Python overhead >> kernel launch overhead)
         # ================================================================
-        _MAX_TILE_BLOCKS = 1024  # ~16K tokens per tile at block_size=16
+        _BI100_TARGET_TILES = 4   # minimize Python loop iterations
+        _MIN_TILE_BLOCKS = 64     # floor: avoid tiny matmuls
+        _MAX_TILE_BLOCKS = 4096   # ceiling: avoid single huge allocation
 
         try:
             for i in range(num_seqs):
@@ -187,10 +194,15 @@ class PagedAttention:
                 o = torch.zeros((num_kv_heads, gqa_ratio, 1, head_dim),
                                 dtype=torch.float32, device=dev)
 
-                # Tile over KV blocks — GridEvenShare RAKE pattern
-                # Each tile = consecutive sequence of cache blocks
-                for tile_start in range(0, num_blocks_i, _MAX_TILE_BLOCKS):
-                    tile_end = min(tile_start + _MAX_TILE_BLOCKS, num_blocks_i)
+                # Tile over KV blocks — CCCL spread_out_items_per_thread pattern
+                # Adaptive: tile_blocks = ceil(num_blocks / target_tiles)
+                # clamped to [_MIN_TILE_BLOCKS, _MAX_TILE_BLOCKS]
+                tile_blocks = max(_MIN_TILE_BLOCKS,
+                                  min(_MAX_TILE_BLOCKS,
+                                      (num_blocks_i + _BI100_TARGET_TILES - 1)
+                                      // _BI100_TARGET_TILES))
+                for tile_start in range(0, num_blocks_i, tile_blocks):
+                    tile_end = min(tile_start + tile_blocks, num_blocks_i)
                     tile_blk_ids = blk_ids[tile_start:tile_end]
 
                     # Valid tokens in this tile
@@ -560,18 +572,35 @@ class PagedAttention:
                 k_i = key  [q_start:q_end]   # [q_len, kv_h, d]
                 v_i = value[q_start:q_end]
 
-                # CCCL-style adaptive tile sizing per sequence.
-                # Score tensor = [kv_h, gqa, q_len, tile_sz] × 4 bytes
-                # Solve: kv_h × gqa × q_len × tile_sz × 4 ≤ budget
+                # CCCL spread_out_items_per_thread adaptive tile sizing.
+                #
+                # Two constraints compete:
+                # 1. Memory: score tensor [kv_h, gqa, q_len, tile_sz] × 4 ≤ budget
+                # 2. Iteration count: want ~4-8 tiles to minimize Python overhead
+                #
+                # CCCL dispatch_transform.cuh::spread_out_items_per_thread:
+                #   items = ceil_div(num_items, sm_count * threads * occupancy)
+                #   items = clamp(items, min_items, max_items)
+                #
+                # Our translation: tile_sz = max context tokens / target_tiles,
+                # then clamp by memory budget.
                 score_row_bytes = num_kv_heads * gqa_ratio * q_len * 4
                 if score_row_bytes > 0:
-                    max_tile_tokens = _SMEM_BUDGET_BYTES // score_row_bytes
-                    # Round down to block_size boundary
-                    max_tile_tokens = (max_tile_tokens // block_size) * block_size
-                    # Clamp: at least 1 block, at most what context needs
-                    tile_sz = max(block_size, min(max_tile_tokens, 2048))
+                    mem_max_tokens = _SMEM_BUDGET_BYTES // score_row_bytes
+                    mem_max_tokens = (mem_max_tokens // block_size) * block_size
                 else:
-                    tile_sz = block_size * 32  # fallback
+                    mem_max_tokens = block_size * 256
+
+                total_kv_tokens = ctx_len + q_len
+                # spread_out: target 4 tiles for context, 4 for current chunk
+                spread_tile = max(block_size,
+                                  (total_kv_tokens + 3) // 4)
+                # Round to block_size
+                spread_tile = (spread_tile // block_size) * block_size
+                spread_tile = max(spread_tile, block_size)
+                # Clamp by memory budget
+                tile_sz = min(spread_tile, mem_max_tokens)
+                tile_sz = max(tile_sz, block_size)  # floor
 
                 # Q reshaped and scaled once; held for all K-tiles.
                 # [kv_h, gqa, q_len, d] fp32  —  24 MB for q_len=4096, d=256
