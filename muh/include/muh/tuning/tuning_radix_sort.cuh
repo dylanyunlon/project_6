@@ -114,11 +114,22 @@ struct reg_scaled {
   int items_per_thread;
 };
 
+// Matches CCCL util_arch.cuh scale_reg_bound exactly:
+//   items = max(1, nominal * 4 / max(4, type_size))  [no expand beyond nominal]
+//   threads = min(nominal, round_up(48KB / (type_size * items), 32))  [SMEM spill cap]
 constexpr reg_scaled scale_reg(int nominal_threads, int nominal_4b_items, int type_size) {
-  int items = nominal_4b_items * 4 / (type_size > 4 ? type_size : 4);
+  int ts = type_size > 4 ? type_size : 4;
+  int items = nominal_4b_items * 4 / ts;
   if (items < 1) items = 1;
   if (items > nominal_4b_items) items = nominal_4b_items;
-  return {nominal_threads, items};
+  // CCCL caps threads by SMEM spill prevention (48KB / (type_size * items))
+  int smem_per_thread = type_size * items;
+  int max_threads = smem_per_thread > 0
+    ? ((49152 / smem_per_thread + 31) / 32) * 32  // round_up to warp multiple
+    : nominal_threads;
+  int threads = nominal_threads < max_threads ? nominal_threads : max_threads;
+  if (threads < 32) threads = 32;
+  return {threads, items};
 }
 
 // Scale histogram private_partitions: more partitions for small types
