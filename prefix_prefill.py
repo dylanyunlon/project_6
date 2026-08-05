@@ -711,25 +711,39 @@ if triton.__version__ >= "2.1.0":
 
         # CCCL-informed block size selection for BI-V100 (SM=16, 48KB SMEM)
         #
-        # SMEM budget per Triton block (approximate):
-        #   Q tile: BLOCK_M * head_dim * element_size
-        #   K tile: head_dim * BLOCK_N * element_size (transposed)
-        #   V tile: BLOCK_N * head_dim * element_size
-        # Triton uses fp32 accumulators but loads in native dtype.
+        # Key insight from CCCL AgentReduce (agent_reduce.cuh):
+        #   - Q tile stays resident in registers/SMEM across the K/V loop
+        #   - K/V tiles stream through: each iteration loads a new BLOCK_N chunk
+        #   - Therefore BLOCK_N can be larger than BLOCK_M (asymmetric tiling)
+        #   - Larger BLOCK_N = fewer loop iterations = fewer kernel barriers
         #
-        # For BI-V100: BLOCK=64, NUM_WARPS=4 keeps SMEM usage conservative
-        # and matches CCCL scan tuning pattern (fewer CTAs but larger tiles).
-        # SM=16 means only 32 concurrent CTAs, so moderate parallelism is fine.
+        # SMEM budget (peak, not simultaneous - Triton pipelines K/V loads):
+        #   Q resident: BLOCK_M * head_dim * elem_size  (stays across all iters)
+        #   K per iter: head_dim * BLOCK_N * elem_size   (loaded, consumed, freed)
+        #   softmax:    BLOCK_M * 4 * 2                  (m_i + l_i, fp32)
+        #   Total peak: Q + K + softmax_state
         #
-        # Reference: muh/tuning/tuning_scan.cuh bi100_lookback_4B_o4
-        #   threads=384, items=22 → effective tile = 384*22 = 8448 elements
-        #   Triton equivalent: BLOCK=64, warps=4 (128 threads, larger tile per warp)
+        # For BI-V100 with head_dim=128, fp16 (2B):
+        #   BLOCK_M=32, BLOCK_N=64: Q=8KB + K=16KB + ss=256B = 24.25KB (49%)
+        #   BLOCK_M=64, BLOCK_N=64: Q=16KB + K=16KB + ss=512B = 32.5KB (66%)
+        #   BLOCK_M=32, BLOCK_N=128: Q=8KB + K=32KB + ss=256B = 40.25KB (82%)
+        #
+        # CCCL scan tuning reference (tuning_scan.cuh):
+        #   SM100 best: ipt=22, tpb=384 → tile = 8448 elements
+        #   BI-V100 bench best: ipt=22, tpb=384, no_delay → 1.038x
+        #   Maps to: moderate tile, no inter-CTA delay (16 SMs = low contention)
+        #
+        # Strategy: BLOCK_M=32 (small Q tile, high occupancy) +
+        #           BLOCK_N=64 (moderate K sweep, fits SMEM easily)
+        #           This gives 2 CTAs per SM occupancy with 16 SMs = 32 CTAs
         _is_bi_v100 = not current_platform.has_device_capability(80)
         if _is_bi_v100:
-            BLOCK = 64
+            BLOCK = 64       # BLOCK_M for Q tile
+            BLOCK_N = 64     # BLOCK_N for K/V sweep (can differ from BLOCK_M)
             NUM_WARPS = 4
         else:
             BLOCK = 128
+            BLOCK_N = BLOCK  # symmetric for NVIDIA GPUs
             NUM_WARPS = 8
 
         # need to reduce num. blocks when using fp32
@@ -822,14 +836,12 @@ if triton.__version__ >= "2.1.0":
                 BLOCK_M=BLOCK,
                 BLOCK_DMODEL=Lk,
                 BLOCK_DMODEL_PADDED=Lk_padded,
-                BLOCK_N=BLOCK,
+                BLOCK_N=BLOCK_N,
                 num_warps=NUM_WARPS,
                 num_stages=1,
             )
             return
 
-        import time
-        ts_beg = time.time()
         _fwd_kernel[grid](
             q,
             k,
@@ -875,11 +887,9 @@ if triton.__version__ >= "2.1.0":
             BLOCK_M=BLOCK,
             BLOCK_DMODEL=Lk,
             BLOCK_DMODEL_PADDED=Lk_padded,
-            BLOCK_N=BLOCK,
+            BLOCK_N=BLOCK_N,
             SLIDING_WINDOW=sliding_window,
             num_warps=NUM_WARPS,
             num_stages=1,
         )
-        elapsed = time.time() - ts_beg
-        #print(f'{elapsed}: {BLOCK=}, {Lk=}, {Lk_padded=}, {BLOCK=}, {sliding_window=}, {NUM_WARPS=}')
         return
