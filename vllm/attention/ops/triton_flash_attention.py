@@ -335,6 +335,49 @@ def _attn_fwd_inner(
             num_stages=1,
             num_warps=4,
         ),
+        # BI-V100 num_stages=2 variants:
+        # CCCL transform benchmark (babelstream.cu) found bif=8 (64KB prefetch)
+        # dominates bif=0 (32KB) on BI-V100. Physical explanation:
+        #   BW_per_SM × memory_latency = 56 GB/s × 1100ns ≈ 62KB
+        # Triton's num_stages controls software pipelining depth, which is
+        # the same concept as CCCL's bytes_in_flight. num_stages=2 doubles
+        # the prefetch window, matching the 64KB sweet spot.
+        # Source: cccl_upstream/cub/benchmarks/bench/transform/babelstream.cu
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 64,
+                "waves_per_eu": 2,
+                "PRE_LOAD_V": False,
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 32,
+                "BLOCK_N": 64,
+                "waves_per_eu": 2,
+                "PRE_LOAD_V": True,
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+        # BI-V100 minimal tile: highest occupancy for short sequences.
+        # CCCL scan benchmark found no_delay optimal (dcid=0) because
+        # 16 SMs → ~32 CTAs → tile_status fits in 6MB L2 → no contention.
+        # Same logic: small tiles + many CTAs maximize SM utilization.
+        # Source: cccl_upstream/cub/benchmarks/bench/scan/exclusive/sum.cu
+        triton.Config(
+            {
+                "BLOCK_M": 32,
+                "BLOCK_N": 32,
+                "waves_per_eu": 4,
+                "PRE_LOAD_V": False,
+            },
+            num_stages=2,
+            num_warps=2,
+        ),
     ],
     key=['IS_CAUSAL', 'dropout_p', 'BLOCK_DMODEL'],
 )
