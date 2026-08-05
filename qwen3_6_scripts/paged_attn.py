@@ -480,6 +480,25 @@ class PagedAttention:
                 # Convert token-based tile_sz to block count for iteration
                 blocks_per_tile = tile_sz // block_size
 
+                # ============================================================
+                # CCCL CachingDeviceAllocator pattern (util_allocator.cuh):
+                # Pre-allocate buffers once, reuse across all tile iterations.
+                # CCCL's allocator uses geometric bin sizing to avoid repeated
+                # cudaMalloc/cudaFree. PyTorch equivalent: allocate the max-size
+                # tensors once outside the loop, reuse with slicing.
+                #
+                # Tensors that are the SAME size every iteration:
+                #   m_blk, m_new, corr: [kv_h, gqa, q_len] — from softmax update
+                # Tensors that vary by last dim (valid tokens per tile):
+                #   s: [kv_h, gqa, q_len, valid] — score matrix
+                #   But torch.matmul with out= requires exact shape match,
+                #   so we pre-alloc at max tile_sz and slice.
+                # ============================================================
+                _m_blk = torch.empty((num_kv_heads, gqa_ratio, q_len),
+                                     dtype=torch.float32, device=dev)
+                _m_new = torch.empty_like(_m_blk)
+                _corr = torch.empty_like(_m_blk)
+
                 if ctx_len > 0:
                     num_ctx_blocks = (ctx_len + block_size - 1) // block_size
                     if num_ctx_blocks > block_tables.shape[1]:
@@ -529,19 +548,19 @@ class PagedAttention:
                         # No causal mask: all context keys precede all queries.
 
                         # Online softmax update — Flash-Attention Algorithm 1.
-                        # exp_s = s - new_max  (in-place exp after del s)
-                        m_blk = s.amax(dim=-1)
-                        m_new = torch.maximum(m, m_blk)
-                        exp_s = s - m_new.unsqueeze(-1)
+                        # CCCL CachingDeviceAllocator: reuse pre-allocated buffers
+                        # instead of allocating m_blk, m_new, corr each iteration.
+                        torch.amax(s, dim=-1, out=_m_blk)
+                        torch.maximum(m, _m_blk, out=_m_new)
+                        exp_s = s - _m_new.unsqueeze(-1)
                         del s
                         exp_s.exp_()
-                        corr  = torch.exp(m - m_new)
-                        m.copy_(m_new)
-                        del m_blk, m_new
-                        l.mul_(corr).add_(exp_s.sum(dim=-1))
-                        o.mul_(corr.unsqueeze(-1)).add_(
+                        torch.exp(m - _m_new, out=_corr)
+                        m.copy_(_m_new)
+                        l.mul_(_corr).add_(exp_s.sum(dim=-1))
+                        o.mul_(_corr.unsqueeze(-1)).add_(
                             torch.matmul(exp_s, v_t))
-                        del exp_s, v_t, corr
+                        del exp_s, v_t
 
                 # --------------------------------------------------------------
                 # Phase 2 — current-chunk tokens (positions ctx_len … ctx_len+q_len-1).
@@ -574,19 +593,19 @@ class PagedAttention:
                     s.masked_fill_(mask.unsqueeze(0).unsqueeze(0), float('-inf'))
                     del mask, k_rel, q_rel
 
-                    # Online softmax update (identical to context phase).
-                    m_blk = s.amax(dim=-1)
-                    m_new = torch.maximum(m, m_blk)
-                    exp_s = s - m_new.unsqueeze(-1)
+                    # Online softmax update — reuse pre-allocated buffers.
+                    # CCCL CachingDeviceAllocator: same buffers as Phase 1.
+                    torch.amax(s, dim=-1, out=_m_blk)
+                    torch.maximum(m, _m_blk, out=_m_new)
+                    exp_s = s - _m_new.unsqueeze(-1)
                     del s
                     exp_s.exp_()
-                    corr  = torch.exp(m - m_new)
-                    m.copy_(m_new)
-                    del m_blk, m_new
-                    l.mul_(corr).add_(exp_s.sum(dim=-1))
-                    o.mul_(corr.unsqueeze(-1)).add_(
+                    torch.exp(m - _m_new, out=_corr)
+                    m.copy_(_m_new)
+                    l.mul_(_corr).add_(exp_s.sum(dim=-1))
+                    o.mul_(_corr.unsqueeze(-1)).add_(
                         torch.matmul(exp_s, v_t))
-                    del exp_s, v_t, corr
+                    del exp_s, v_t
 
                 # --------------------------------------------------------------
                 # Finalize: normalize running output by normalization factor.
