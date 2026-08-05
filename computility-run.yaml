@@ -15,7 +15,7 @@ command:
     - -tp
     - '4'
     - --max-num-seqs
-    - '8'
+    - '1'
     - --disable-log-requests
     - --disable-frontend-multiprocessing
     - --max-num-batched-tokens
@@ -29,36 +29,6 @@ command:
     - --reasoning-parser
     - qwen3
     - --enable-prefix-caching
-    # CCCL-derived optimizations:
-    # Multi-step scheduling reduces Python dispatch overhead per decode iteration.
-    # With max-num-seqs=8 and 4 GPUs, each step processes 8 tokens across 4 devices.
-    #
-    # CCCL single_pass_scan_operators.cuh reveals: for gridDim.x < 500 (our case:
-    # 16 SMs → ~32 CTAs), all delay strategies collapse to __threadfence_block().
-    # This means inter-CTA synchronization cost is near-zero on BI-V100.
-    # The dominant per-step overhead is Python scheduler dispatch (~100μs/step).
-    # num-scheduler-steps=16 batches 16 decode iterations per Python call,
-    # cutting scheduler overhead by ~16x vs default. Pure win for Output TPS (83%).
-    #
-    # Source: cccl_upstream/cub/cub/agent/single_pass_scan_operators.cuh line 180
-    #   if (gridDim.x < GridThreshold) __threadfence_block(); // no real delay
-    - --num-scheduler-steps
-    - '16'
-    # Recompute is cheaper than swap on BI-V100 (limited HBM bandwidth for swap).
-    # When a sequence is preempted, recomputing the prefix is faster than
-    # swapping KV blocks to/from CPU memory over PCIe.
-    - --preemption-mode
-    - recompute
 env:
     - name: VLLM_ENGINE_ITERATION_TIMEOUT_S
       value: 3600
-    # Cache Triton JIT compilations across restarts.
-    # Competition platform rebuilds the container each run — prewarmed cache
-    # saves 30-60s of first-request latency.
-    - name: TRITON_CACHE_DIR
-      value: /tmp/triton_cache
-    # Disable Triton autotuning at runtime (use hardcoded CCCL-derived configs).
-    # Autotuning wastes 5-10s per kernel on first call and the BI-V100 optimal
-    # configs are already baked into prefix_prefill.py and paged_attention_v2_triton.py.
-    - name: TRITON_PRINT_AUTOTUNING
-      value: '0'
