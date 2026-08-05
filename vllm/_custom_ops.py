@@ -144,7 +144,22 @@ def paged_attention_v2(
     blocksparse_block_size: int = 64,
     blocksparse_head_sliding_step: int = 0,
 ) -> None:
-    raise NotImplementedError()
+    # CCCL two-pass dispatch pattern (dispatch_reduce.cuh):
+    #   Pass 1: N CTAs each reduce their tile → d_block_reductions[N]
+    #   Pass 2: 1 CTA reduces d_block_reductions[N] → d_out
+    # Our PyTorch V2 implementation follows the same pattern:
+    #   Phase 1: partition attention (each partition = one tile)
+    #   Phase 2: cross-partition log-sum-exp reduction (summary_statistics binary_op)
+    from paged_attention_v2_pytorch import paged_attention_v2_pytorch
+    paged_attention_v2_pytorch(
+        out, exp_sum, max_logits, tmp_out,
+        query, key_cache, value_cache,
+        num_kv_heads, scale, block_tables, seq_lens,
+        block_size, max_seq_len, alibi_slopes,
+        kv_cache_dtype, k_scale, v_scale, tp_rank,
+        blocksparse_local_blocks, blocksparse_vert_stride,
+        blocksparse_block_size, blocksparse_head_sliding_step,
+    )
 
 
 def paged_attention_rocm(
