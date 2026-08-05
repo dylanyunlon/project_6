@@ -188,6 +188,28 @@ class PagedAttention:
 
         return output
 
+    # ================================================================
+    # CCCL Design Pattern: summary_statistics.cu transform_reduce
+    #
+    # CCCL packs {n, min, max, mean, M2, M3, M4} into one struct and
+    # computes ALL statistics in a single pass via transform_reduce.
+    # The binary_op merges two partial results (Welford parallel algo).
+    #
+    # Our online softmax is the same pattern:
+    #   accumulator = {m (running max), l (running sum_exp), o (running output)}
+    #   unary_op: score_tile → {max(tile), sum(exp(tile-max)), exp(tile-max) @ V}
+    #   binary_op: merge two accumulators with correction factor
+    #
+    # Key insight: kv_heads are INDEPENDENT — no cross-head dependency.
+    # Current code already batches via [kv_h, gqa, q_len, tile_sz] tensor ops.
+    # The CCCL pattern validates this is optimal: one matmul per tile across
+    # all heads simultaneously, not per-head iteration.
+    #
+    # Future optimization: if we ever get Triton/CUDA access, the binary_op
+    # merge step ({m,l,o} update) could be fused with the matmul via a
+    # custom epilogue — this is what FlashAttention-2/3 does at the CUDA level.
+    # ================================================================
+
     # paged_attention_v1 on BI-V100 fails for long contexts.
     # Route on actual sequence length (seq_lens.max()), not the max_seq_len
     # parameter which is inflated to max_model_len in CUDA graph mode.
