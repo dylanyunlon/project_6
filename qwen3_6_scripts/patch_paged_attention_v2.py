@@ -144,17 +144,17 @@ def patch_paged_attn(vllm_root):
 
 def deploy_v2_module(vllm_root):
     """Copy the V2 PyTorch module into the vllm package."""
-    src = os.path.join(os.path.dirname(__file__), "..", V2_MODULE)
+    src = os.path.join(os.path.dirname(__file__), "..", V2_MODULE_PYTORCH)
     if not os.path.exists(src):
-        src = os.path.join("/workspace", V2_MODULE)
+        src = os.path.join("/workspace", V2_MODULE_PYTORCH)
     if not os.path.exists(src):
         # Try relative to this script
-        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", V2_MODULE)
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", V2_MODULE_PYTORCH)
     
-    dst = os.path.join(vllm_root, V2_MODULE)
+    dst = os.path.join(vllm_root, V2_MODULE_PYTORCH)
     
     if os.path.exists(dst):
-        print(f"  [skip] {dst} already exists")
+        print(f"  [skip] V2 module {dst} already exists")
         return True
     
     if not os.path.exists(src):
@@ -162,7 +162,7 @@ def deploy_v2_module(vllm_root):
         return False
     
     shutil.copy2(src, dst)
-    print(f"  [ok] Copied {V2_MODULE} → {dst}")
+    print(f"  [ok] Copied {V2_MODULE_PYTORCH} → {dst}")
     return True
 
 
