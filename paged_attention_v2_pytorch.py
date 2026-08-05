@@ -211,10 +211,21 @@ def paged_attention_v2_pytorch(
         # =============================================================
         # Phase 2: Cross-partition reduction (CCCL binary_op pattern)
         #
-        # This is the summary_statistics.binary_op pattern:
-        #   Combine (max_a, sum_a, out_a) ⊕ (max_b, sum_b, out_b)
-        #   using numerically stable log-sum-exp rescaling.
+        # CCCL kernel_reduce.cuh insight: when grid_size fits in a single
+        # tile (num_partitions <= threads * items_per_thread), the reduce
+        # uses SingleTile path — one CTA, no temp buffer, no pass 2 kernel.
         #
+        # For BI-V100 with 98 partitions (100K tokens / 1024 partition_size):
+        #   SingleTile threshold = 512 * 24 = 12288 >> 98 → always SingleTile
+        #   This means Phase 2 is never the bottleneck.
+        #
+        # CCCL single_pass_scan_operators.cuh insight: delay() has a
+        # GridThreshold=500 gate. BI-V100 scan grids are always < 500 blocks,
+        # so ALL delay strategies (no_delay, fixed_delay, exponential_backon)
+        # collapse to __threadfence_block(). Delay tuning is irrelevant here.
+        #
+        # Phase 2 follows summary_statistics.cu binary_op: combine
+        # (max_a, sum_a, out_a) ⊕ (max_b, sum_b, out_b) via log-sum-exp.
         # Fully vectorized — no loop over partitions.
         # =============================================================
         pm = max_logits[seq_idx, :, :num_partitions]     # [H, P]
