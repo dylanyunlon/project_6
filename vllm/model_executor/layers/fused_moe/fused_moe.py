@@ -15,6 +15,25 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
+# Module-level cache for MoE intermediate tensors.
+# Eliminates 192 torch.empty (CUDA malloc) calls per decode step by reusing
+# buffers across the 64 MoE layer invocations within a single forward pass.
+# Key insight from CCCL dispatch_reduce.cuh: NVIDIA pre-allocates temp_storage
+# once and reuses it across kernel invocations rather than re-allocating.
+_moe_intermediate_cache = {}
+
+
+def _get_or_alloc(name, shape, dtype, device):
+    """Get a cached tensor or allocate a new one. Reuses if shape fits."""
+    key = (name, dtype, device)
+    cached = _moe_intermediate_cache.get(key)
+    if cached is not None and cached.shape == shape:
+        return cached
+    # Shape changed (different M, different topk) — reallocate
+    t = torch.empty(shape, dtype=dtype, device=device)
+    _moe_intermediate_cache[key] = t
+    return t
+
 
 @triton.jit
 def fused_moe_kernel(
@@ -534,15 +553,15 @@ def fused_experts(hidden_states: torch.Tensor,
 
     config = get_config_func(M)
 
-    intermediate_cache1 = torch.empty((M, topk_ids.shape[1], N),
-                                      device=hidden_states.device,
-                                      dtype=hidden_states.dtype)
-    intermediate_cache2 = torch.empty((M * topk_ids.shape[1], N // 2),
-                                      device=hidden_states.device,
-                                      dtype=hidden_states.dtype)
-    intermediate_cache3 = torch.empty((M, topk_ids.shape[1], w2.shape[1]),
-                                      device=hidden_states.device,
-                                      dtype=hidden_states.dtype)
+    intermediate_cache1 = _get_or_alloc(
+        'moe_c1', (M, topk_ids.shape[1], N),
+        hidden_states.dtype, hidden_states.device)
+    intermediate_cache2 = _get_or_alloc(
+        'moe_c2', (M * topk_ids.shape[1], N // 2),
+        hidden_states.dtype, hidden_states.device)
+    intermediate_cache3 = _get_or_alloc(
+        'moe_c3', (M, topk_ids.shape[1], w2.shape[1]),
+        hidden_states.dtype, hidden_states.device)
 
     compute_type = (tl.bfloat16
                     if hidden_states.dtype == torch.bfloat16 else tl.float16)
