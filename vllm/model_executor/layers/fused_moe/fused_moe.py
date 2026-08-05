@@ -233,21 +233,38 @@ def moe_align_block_size(
         by block_size for proper block matrix operations.
     """
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
-    sorted_ids = torch.empty((max_num_tokens_padded, ),
-                             dtype=torch.int32,
-                             device=topk_ids.device)
-    sorted_ids.fill_(topk_ids.numel())
     # max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
     max_num_m_blocks = topk_ids.numel() + num_experts
-    expert_ids = torch.empty((max_num_m_blocks, ),
-                             dtype=torch.int32,
-                             device=topk_ids.device)
-    num_tokens_post_pad = torch.empty((1),
-                                      dtype=torch.int32,
-                                      device=topk_ids.device)
+
+    # Pre-allocate sort buffers. During decode, topk_ids shape is stable across
+    # all 64 MoE layers and across decode steps (same num_seqs × topk).
+    # Reusing these tensors eliminates 192 CUDA mallocs per decode step
+    # (3 tensors × 64 layers). Pattern from CCCL dispatch_reduce.cuh:
+    # alias_temporaries pre-allocates once, reuses across invocations.
+    _align_key = ("moe_align", max_num_tokens_padded, max_num_m_blocks,
+                  topk_ids.device)
+    cached_align = _moe_intermediate_cache.get(_align_key)
+    if (cached_align is not None
+            and cached_align[0].shape[0] >= max_num_tokens_padded
+            and cached_align[1].shape[0] >= max_num_m_blocks):
+        sorted_ids, expert_ids_buf, num_tokens_post_pad = cached_align
+    else:
+        sorted_ids = torch.empty((max_num_tokens_padded, ),
+                                 dtype=torch.int32,
+                                 device=topk_ids.device)
+        expert_ids_buf = torch.empty((max_num_m_blocks, ),
+                                     dtype=torch.int32,
+                                     device=topk_ids.device)
+        num_tokens_post_pad = torch.empty((1),
+                                          dtype=torch.int32,
+                                          device=topk_ids.device)
+        _moe_intermediate_cache[_align_key] = (sorted_ids, expert_ids_buf,
+                                               num_tokens_post_pad)
+
+    sorted_ids.fill_(topk_ids.numel())
     ops.moe_align_block_size(topk_ids, num_experts, block_size, sorted_ids,
-                             expert_ids, num_tokens_post_pad)
-    return sorted_ids, expert_ids, num_tokens_post_pad
+                             expert_ids_buf, num_tokens_post_pad)
+    return sorted_ids, expert_ids_buf, num_tokens_post_pad
 
 
 def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
