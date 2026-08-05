@@ -4,9 +4,14 @@
 // CCCL has SM80 (20 specializations) + SM90 (20) + SM100 (42 + may_alias + distinct_partitions)
 // = 82 active benchmark-tuned entries.
 //
-// Strategy: BI-V100 starts from SM90 tunings (closest architecture match),
+// Strategy: BI-V100 starts from SM100 tunings (best benchmark data),
 // applies SMEM cap (48KB) and SM-count compensation (16 SMs → larger tiles).
-// SM100 tunings used where they don't overflow, with delay scaled (ns*0.5, l2w*0.6).
+// SM90/SM80 used as fallback. All delays are no_delay (delay v2).
+//
+// CCCL dispatch_select_if.cuh has vsmem (virtual shared memory) fallback:
+//   When AgentSelectIf needs >48KB SMEM, CCCL uses global memory to emulate.
+//   Our SMEM overflow protection (while-loop reducing items) is still correct
+//   because vsmem has 10-100x latency penalty on BI-V100 — staying in SMEM is optimal.
 //
 // Hardware constraints:
 //   max_shared_memory_per_block = 49152 (48KB)
