@@ -31,7 +31,12 @@ using the numerically stable log-sum-exp rescaling.
 import torch
 from typing import Optional
 
-_PARTITION_SIZE = 512
+_PARTITION_SIZE = 1024  # CCCL dispatch_scan.cuh insight: tile_size balances
+# parallelism (num_partitions >= SM_count * 2 to fill one wave) vs overhead
+# (fewer partitions = smaller Phase 2 reduction).
+# BI-V100: 16 SMs, max ~32 concurrent CTAs.
+# For 100K tokens: 1024 → 98 partitions (3 waves), 512 → 195 (6 waves).
+# 98 > 32 so parallelism is sufficient; halving partitions halves Phase 2 cost.
 
 
 def paged_attention_v2_pytorch(
