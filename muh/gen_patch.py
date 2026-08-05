@@ -84,34 +84,44 @@ def algo_from_filename(filepath):
 # For now, these are the known injection points from enginex-vllm-bi100-qwen36.
 
 VLLM_INJECTION_POINTS = {
-    ('reduce', 'threads'): [
-        ('csrc/attention/attention_kernels.cu', 'NUM_THREADS'),
-        ('csrc/attention/paged_attention_v2.cu', 'NUM_THREADS'),
+    # ═══════════════════════════════════════════════════════════════════
+    # WARNING: ALL csrc/*.cu targets are DEAD — files do not exist.
+    # enginex-vllm-bi100-qwen36 ships: Python + precompiled .so + Triton.
+    # No .cu source files. gen_patch patches have zero effect.
+    # (Confirmed: commit 41ecb8c, enginex zip analysis)
+    # ═══════════════════════════════════════════════════════════════════
+    #
+    # DEAD injection points (kept for documentation):
+    # ('reduce', 'threads'): [('csrc/attention/attention_kernels.cu', 'NUM_THREADS')],
+    # ('topk', 'threads'): [('csrc/sampling/sampling_kernels.cu', 'SAMPLING_BLOCK_SIZE')],
+    # ('scan', 'threads'): [('csrc/attention/paged_attention_v1.cu', 'SCAN_BLOCK_SIZE')],
+    # ('transform', 'threads'): [('csrc/activation_kernels.cu', 'ACTIVATION_BLOCK_SIZE')],
+    # ('batch_memcpy', 'threads'): [('csrc/cache_kernels.cu', 'COPY_BLOCK_SIZE')],
+    # ('for', 'threads'): [('csrc/pos_encoding_kernels.cu', 'ROPE_BLOCK_SIZE')],
+    #
+    # ═══════════════════════════════════════════════════════════════════
+    # REAL injection points (confirmed working):
+    # ═══════════════════════════════════════════════════════════════════
+    ('prefill', 'BLOCK_M'): [
+        ('prefix_prefill.py', 'BLOCK'),           # Triton JIT tl.constexpr
     ],
-    ('reduce', 'items'): [
-        ('csrc/attention/attention_kernels.cu', 'NUM_ITEMS_PER_THREAD'),
+    ('prefill', 'NUM_WARPS'): [
+        ('prefix_prefill.py', 'NUM_WARPS'),       # Triton JIT
     ],
-    ('reduce', 'items_per_vec_load'): [
-        ('csrc/attention/attention_kernels.cu', 'VEC_SIZE'),
+    ('flash_attn', 'BLOCK_M'): [
+        ('vllm/attention/ops/triton_flash_attention.py', 'BLOCK_M'),  # Triton autotune
     ],
-    ('topk', 'threads'): [
-        ('csrc/sampling/sampling_kernels.cu', 'SAMPLING_BLOCK_SIZE'),
+    ('flash_attn', 'BLOCK_N'): [
+        ('vllm/attention/ops/triton_flash_attention.py', 'BLOCK_N'),  # Triton autotune
     ],
-    ('topk', 'bits_per_pass'): [
-        ('csrc/sampling/sampling_kernels.cu', 'RADIX_BITS'),
+    ('moe', 'BLOCK_SIZE_M'): [
+        ('vllm/model_executor/layers/fused_moe/fused_moe.py', 'BLOCK_SIZE_M'),  # → ixformer
     ],
-    ('scan', 'threads'): [
-        ('csrc/attention/paged_attention_v1.cu', 'SCAN_BLOCK_SIZE'),
+    ('runtime', 'SMEM'): [
+        ('vllm/_custom_ops.py', 'get_max_shared_memory'),  # 32KB→48KB fix
     ],
-    ('transform', 'threads'): [
-        ('csrc/activation_kernels.cu', 'ACTIVATION_BLOCK_SIZE'),
-        ('csrc/layernorm_kernels.cu', 'LAYERNORM_BLOCK_SIZE'),
-    ],
-    ('batch_memcpy', 'threads'): [
-        ('csrc/cache_kernels.cu', 'COPY_BLOCK_SIZE'),
-    ],
-    ('for', 'threads'): [
-        ('csrc/pos_encoding_kernels.cu', 'ROPE_BLOCK_SIZE'),
+    ('scheduler', 'num_steps'): [
+        ('computility-run.yaml', 'num-scheduler-steps'),  # Python dispatch overhead
     ],
 }
 
