@@ -123,7 +123,10 @@ class PagedAttention:
         # For context len > 8192, use V2 kernel to avoid shared memory shortage.
         use_v1 = (max_seq_len <= 8192
                   and (max_num_partitions == 1 or num_seqs * num_heads > 512))
-        use_v1 = True
+        # V2 is now implemented via paged_attention_v2_pytorch.py (CCCL two-pass pattern).
+        # For short sequences (<=8192), V1 (ixformer pre-compiled) is faster.
+        # For long sequences (>8192), V2 partitions work across CTAs.
+        # On BI-V100 (16 SMs), V2's partition reduction fits in L2 (6MB).
         if use_v1:
             # Run PagedAttention V1.
             ops.paged_attention_v1(
