@@ -353,7 +353,16 @@ def get_default_config(
             'GROUP_SIZE_M': 1
         }
     numel = M * topk
-    if numel <= 64:
+    # CCCL principle from saxpy.cu: fused ops should minimize wasted padding.
+    # For BI-V100 decode: M=8 seqs × topk=8 experts = 64 active tokens.
+    # BLOCK_SIZE_M=32 → 50% padding waste (32-token tiles for 64 tokens = 2 tiles, ok)
+    # BLOCK_SIZE_M=16 → 0% waste for numel≤16, minimal waste for 16<numel≤64
+    # ixformer only reads BLOCK_SIZE_M from config — N/K/GROUP are ignored.
+    # Smaller BLOCK_SIZE_M = more tiles but less wasted computation per tile.
+    # On BI-V100 (16 SMs), more smaller tiles better saturate the SMs.
+    if numel <= 16:
+        config['BLOCK_SIZE_M'] = 16
+    elif numel <= 64:
         config['BLOCK_SIZE_M'] = 32
     elif numel <= 1024:
         config['BLOCK_SIZE_M'] = 64
