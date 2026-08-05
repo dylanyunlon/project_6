@@ -136,22 +136,15 @@ class PagedAttention:
         # For context len > 8192, use V2 kernel to avoid shared memory shortage.
         use_v1 = (max_seq_len <= 8192
                   and (max_num_partitions == 1 or num_seqs * num_heads > 512))
-        # V1/V2 adaptive dispatch (restored from original vllm logic):
+        # FORCE V1: _custom_ops.py V2 falls through to paged_attention_v2_pytorch
+        # which is pure PyTorch (for-loop over seqs + multiple kernel launches).
+        # V1 (ixf_F.vllm_single_query_cached_kv_attention) is a single fused C++ kernel.
+        # Until a C++ or Triton V2 implementation exists, V1 is always faster.
         #
-        # V1: single fused C++ kernel, iterates ALL KV blocks in one CTA.
-        #   Best when: short sequences (≤8192), or enough seqs×heads for parallelism.
-        #
-        # V2: partitioned attention with cross-partition reduce.
-        #   ops.paged_attention_v2 IS a C++ kernel (not pure PyTorch).
-        #   Best when: long sequences where V1's single CTA cannot saturate 16 SMs.
-        #
-        # CCCL parallel: V2 reduce pass = DeviceReduce over compound accumulator
-        # (max_logits, exp_sums, partial_output). The accumulator merge uses the
-        # same online softmax pattern as thrust/examples/summary_statistics.cu.
-        #
-        # With PARTITION_SIZE=1024 and 16 SMs, V2 is beneficial for sequences
-        # longer than 1024 * 16 * 2 = 32768 tokens (where V1 would have a single
-        # CTA iterating for too long while other SMs sit idle).
+        # The V2 tensor pre-allocation below is kept for when C++ V2 becomes available.
+        # CCCL parallel: V2 reduce = DeviceReduce over compound (max, exp_sum, output)
+        # using thrust/examples/summary_statistics.cu Welford merge pattern.
+        use_v1 = True
         if use_v1:
             # Run PagedAttention V1.
             ops.paged_attention_v1(
