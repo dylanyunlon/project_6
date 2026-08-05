@@ -295,3 +295,60 @@ identical to paged_attention V2's cross-partition reduce:
 The compound accumulator size for V2 is sizeof(float)*3 = 12 bytes.
 This affects tuning: scale_mem_bound(512, 16, 12) → different items/threads
 than a simple float32 reduce.
+
+---
+
+## CCCL Transform Architecture (tuning_transform.cuh)
+
+> Added: 2026-08-04
+
+### 4 algorithms, only 2 available on BI-V100
+
+| Algorithm | Requirement | BI-V100 |
+|---|---|---|
+| prefetch | universal | ✓ available |
+| vectorized | contiguous + trivially_relocatable + power-of-2 size | ✓ available |
+| ldgsts | SM80+ cp.async (NVIDIA-specific PTX) | ✗ |
+| ublkcp | SM90+ bulk copy (NVIDIA-specific PTX) | ✗ |
+
+### cc_to_min_bytes_in_flight — the correct value for BI-V100
+
+CCCL's hardcoded mapping:
+  B200  (SM100, 54 GB/s/SM): 64KB
+  H200  (SM90,  25 GB/s/SM): 48KB
+  A100  (SM80,  19 GB/s/SM): 16KB
+  V100  (SM70,  11 GB/s/SM): 12KB
+
+BI-V100 (56 GB/s/SM) is closest to B200. Our 64KB is aggressive but
+bench_bi100 confirms bif=8 (64KB) dominates bif=0 (32KB). So 64KB stands.
+
+However: bytes_in_flight only affects the PREFETCH algorithm path.
+For vllm's RMSNorm/SiLU/RoPE (contiguous fp16 arrays), the VECTORIZED
+path is selected instead, where bytes_in_flight is ignored and
+items_per_thread is set directly.
+
+### vectorized policy selection for BI-V100
+
+CCCL's tuned_vectorized_policy for fallback (cc < 8.0):
+  TransformVectorizedPolicy{256, 8, 4}  // 256 threads, 8 items, vec=4
+
+For RMSNorm with fp16 (store_size=2):
+  items_per_thread=8, vec_size=4 → 8 elements/thread, 4 per vector load
+  tile = 256 * 8 = 2048 elements per CTA
+  With 16 SMs × 2 occupancy = 32 CTAs → 65536 elements/wave
+
+Qwen3.6 hidden_size=3584 → RMSNorm processes 3584 elements.
+3584 / 2048 = 2 tiles → fits in one wave on BI-V100. Good.
+
+### Impact on our tuning_transform.cuh
+
+Our bi100_bytes_in_flight=64KB is correct for prefetch but irrelevant
+for vectorized. We should also set vectorized policy parameters directly:
+  threads=256, items=8, vec=4 (CCCL default for older arch)
+  OR test threads=128 with items=16 (A100 triad tuning) for higher ILP.
+
+Benchmark result (bif=8, alg=1, pref=2, tpb=256, unrl=1, vsp2=1):
+  alg=1 = vectorized (confirmed — prefetch would be alg=0)
+  tpb=256 = matches CCCL default
+  vsp2=1 → vec_size parameter (powers of 2, so vsp2=1 means vec_size=2)
+  speedups: 1.203199 1.058919 1.019168 (fp16, 1M/16M/64M)
