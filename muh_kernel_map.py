@@ -49,9 +49,13 @@ BI_V100 = {
     "max_registers_per_thread": 255,
     "l2_cache_size_bytes": 6 * 1024 * 1024,  # 6 MiB
     "memory_bandwidth_gbps": 900,
-    "sm_count": 16  # CONFIRMED 2026-08-01,
+    "sm_count": 16,  # CONFIRMED 2026-08-01
     # Derived
-    "bandwidth_per_sm_gbps": 900 / 16  # 56.25 GB/s per SM,  # 18 GB/s ≈ A100 level
+    "bandwidth_per_sm_gbps": 900 / 16,  # 56.25 GB/s per SM ≈ B200 level
+    # bytes_in_flight: BW/SM × HBM_latency = 56 GB/s × 1100ns ≈ 62KB → 64KB
+    # Confirmed by bench_bi100.py transform/float16: bif=8 (64KB) wins at all sizes
+    # CCCL ref: B200=64KB, H100=48KB, A100=16KB, V100=12KB
+    "bytes_in_flight": 64 * 1024,
 }
 
 SM100 = {
