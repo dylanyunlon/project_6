@@ -389,20 +389,35 @@ def get_default_config(
             'GROUP_SIZE_M': 1
         }
     numel = M * topk
-    # CCCL principle from saxpy.cu: fused ops should minimize wasted padding.
-    # For BI-V100 decode: M=8 seqs × topk=8 experts = 64 active tokens.
-    # BLOCK_SIZE_M=32 → 50% padding waste (32-token tiles for 64 tokens = 2 tiles, ok)
-    # BLOCK_SIZE_M=16 → 0% waste for numel≤16, minimal waste for 16<numel≤64
-    # ixformer only reads BLOCK_SIZE_M from config — N/K/GROUP are ignored.
-    # Smaller BLOCK_SIZE_M = more tiles but less wasted computation per tile.
-    # On BI-V100 (16 SMs), more smaller tiles better saturate the SMs.
+    # CCCL kernel_transform_tile.cuh principle: assume_divisible<16> enables
+    # LDG.E.128 vectorized loads by guaranteeing num_items % 16 == 0.
+    # Applied here: BLOCK_SIZE_M must always be a multiple of 16 so that
+    # moe_align_block_size produces token counts divisible by 16.
+    #
+    # CCCL partition_view from kernel_transform_tile.cuh:
+    #   partition_view{span, shape<TileSize>} auto-partitions 1D data into tiles.
+    # Our equivalent: moe_align_block_size pads token counts to BLOCK_SIZE_M.
+    # Smaller BLOCK_SIZE_M = more tiles but less wasted padding per tile.
+    #
+    # GridEvenShare (grid_even_share.cuh) for BI-V100:
+    #   max_blocks = sm_count × subscription_factor = 16 × 5 = 80
+    #   For numel=8 (decode), we want exactly 1 tile per expert-group.
+    #   For numel=4096 (prefill), we want ~80 tiles to saturate 16 SMs.
+    #
+    # ixformer only reads BLOCK_SIZE_M — N/K/GROUP are internal.
     if numel <= 16:
         config['BLOCK_SIZE_M'] = 16
     elif numel <= 64:
         config['BLOCK_SIZE_M'] = 32
+    elif numel <= 256:
+        config['BLOCK_SIZE_M'] = 64
     elif numel <= 1024:
+        # CCCL spread_out_items: items = ceil_div(num_items, sm*threads*occ)
+        # Target ~80 tiles: numel/BLOCK_M ≈ 80 → BLOCK_M ≈ numel/80
+        # For numel=1024: BLOCK_M = 1024/80 ≈ 16, but 64 is minimum for matmul
         config['BLOCK_SIZE_M'] = 64
     else:
+        # Large prefill: 256 to amortize launch overhead
         config['BLOCK_SIZE_M'] = 256
     return config
 
