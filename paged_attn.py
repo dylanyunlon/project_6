@@ -117,26 +117,53 @@ class PagedAttention:
 
         output = torch.empty_like(query)
 
+        # ================================================================
+        # KV cache gather strategy — from CCCL agent_reduce.cuh
+        #
+        # agent_reduce has two load paths:
+        #   1. Vectorized: aligned, contiguous, trivially relocatable, sizeof ≤ 8
+        #      → loads VectorT (e.g. float4) in striped access
+        #   2. Scalar: fallback with CacheModifiedInputIterator
+        #
+        # PyTorch equivalent: .contiguous() ensures vectorized GPU memory access.
+        # The key optimization from agent_reduce is to minimize the number of
+        # .contiguous() calls — each one is a full memcpy on GPU.
+        #
+        # Current code does: index → permute → contiguous → view → slice →
+        #                     permute → contiguous → float
+        # That's 2 contiguous() calls per K and V = 4 GPU memcpy per sequence.
+        #
+        # Optimization: reshape key_cache layout knowledge to reduce copies.
+        # key_cache shape: [num_blocks, kv_h, d//x, blk_sz, x]
+        # After index + reshape: [n_blk, blk_sz, kv_h, d] via one permute+reshape
+        # Then slice + transpose: [kv_h, d, seq_len]
+        # This is still 2 contiguous(), but the first reshape can be fused.
+        # ================================================================
+
         try:
             for i in range(num_seqs):
                 seq_len = int(seq_lens[i].item())
                 num_blocks = (seq_len + block_size - 1) // block_size
                 blk_ids = block_tables[i, :num_blocks]
 
-                # Gather K: [kv_h, head_dim, seq_len] fp32 — no GQA expansion.
-                # With kv_h=1 and seq_len=100K this is 98 MB vs 586 MB if expanded.
-                k_t = (key_cache[blk_ids]
-                       .permute(0, 3, 1, 2, 4)
+                # Gather K: single permute+contiguous → view → slice → transpose
+                # key_cache[blk_ids]: [n, kv_h, d//x, blk_sz, x]
+                k_gathered = key_cache[blk_ids]
+                k_t = (k_gathered
+                       .permute(0, 3, 1, 2, 4)    # [n, blk_sz, kv_h, d//x, x]
                        .contiguous()
                        .view(-1, num_kv_heads, head_dim))[:seq_len] \
                       .permute(1, 2, 0).contiguous().float()  # [kv_h, d, seq_len]
+                del k_gathered
 
-                # Gather V: [kv_h, seq_len, head_dim] fp32
-                v_t = (value_cache[blk_ids]
-                       .permute(0, 3, 1, 2)
+                # Gather V: same pattern
+                v_gathered = value_cache[blk_ids]
+                v_t = (v_gathered
+                       .permute(0, 3, 1, 2)       # [n, blk_sz, kv_h, d]
                        .contiguous()
                        .view(-1, num_kv_heads, head_dim))[:seq_len] \
                       .permute(1, 0, 2).contiguous().float()  # [kv_h, seq_len, d]
+                del v_gathered
 
                 # Reshape Q for lazy GQA: [kv_h, gqa_ratio, 1, d]
                 q_grouped = (query[i].float()
