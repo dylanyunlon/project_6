@@ -718,10 +718,16 @@ class Qwen3_5MLP(nn.Module):
 class Qwen3_5MoeSparseBlock(nn.Module):
     """Replaces Qwen3_5MLP for qwen3_5_moe_text layers.
 
-    FusedMoE is used ONLY for weight storage and loading (create_weights /
-    weight_loader are pure PyTorch).  Its forward kernel is bypassed because
-    ixformer on BI-V100 lacks vllm_moe_topk_softmax / vllm_invoke_fused_moe_kernel.
-    Routing and expert computation use a pure-PyTorch loop instead.
+    FusedMoE stores expert weights and provides native ixformer forward kernel.
+    Forward tries the native fused kernel first (one CUDA launch for all experts),
+    falling back to _pure_pytorch_experts if the native kernel fails on BI-V100.
+
+    CCCL architecture insight (dispatch_reduce_by_key.cuh):
+    The native fused_moe_kernel implements the same pattern as CCCL's
+    DeviceReduceByKey — sort tokens by expert_id, pad to block boundary
+    (moe_align_block_size), then one kernel processes all expert-token pairs
+    with block-level parallelism. This is the architecturally correct approach
+    vs the fallback's Python for-loop over experts.
 
     Shared expert uses RowParallelLinear(reduce_results=False) so both paths
     produce partial (pre-all-reduce) outputs that are combined before a single
@@ -881,7 +887,36 @@ class Qwen3_5MoeSparseBlock(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         router_logits, _ = self.gate(hidden_states)
-        routed_out = self._pure_pytorch_experts(hidden_states, router_logits)
+
+        # Try native FusedMoE path first (ixformer kernel).
+        # CCCL dispatch_reduce_by_key.cuh insight: the native fused kernel does
+        # sort-by-expert + block-aligned GEMM in one launch — architecturally
+        # identical to CCCL's AgentReduceByKey::ConsumeRange.
+        # One fused kernel vs our _pure_pytorch_experts' 256× F.linear calls.
+        #
+        # _custom_ops.py confirms ixformer HAS these ops:
+        #   ixf_F.vllm_moe_topk_softmax
+        #   ixf_F.vllm_moe_align_block_size
+        #   ixf_F.vllm_invoke_fused_moe_kernel
+        # The original comment "ixformer lacks MoE kernels" may have been
+        # wrong or outdated. Try native first, catch and fallback if it fails.
+        if not hasattr(self, '_use_native_moe'):
+            self._use_native_moe = True  # optimistic: try native first
+
+        if self._use_native_moe:
+            try:
+                routed_out = self.experts(hidden_states, router_logits)
+            except Exception as e:
+                # Native kernel failed — disable permanently for this instance
+                # and fallback to pure PyTorch for all subsequent calls.
+                logger.warning(
+                    "FusedMoE native kernel failed (%s: %s), "
+                    "falling back to pure PyTorch experts permanently.",
+                    type(e).__name__, e)
+                self._use_native_moe = False
+                routed_out = self._pure_pytorch_experts(hidden_states, router_logits)
+        else:
+            routed_out = self._pure_pytorch_experts(hidden_states, router_logits)
 
         gate_up, _ = self.shared_expert_gate_up(hidden_states)
         shared_out = self.act_fn(gate_up)
