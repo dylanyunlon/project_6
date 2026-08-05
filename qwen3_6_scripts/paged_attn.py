@@ -11,18 +11,6 @@ from vllm import _custom_ops as ops
 # permanently.  Chunked-prefill / prefix-caching attention is handled by
 # _forward_prefix_pytorch below (pure PyTorch, no Triton dependency).
 
-# Import the CCCL-derived Triton V2 kernel for decode attention.
-# This replaces the pure-PyTorch fallback for long contexts and also
-# replaces the broken ixf_F paged_attention_v2 (which raises NotImplementedError).
-try:
-    from paged_attention_v2_triton import paged_attention_v2_triton
-    _HAS_TRITON_V2 = True
-except ImportError:
-    _HAS_TRITON_V2 = False
-    print("[paged_attn] WARNING: paged_attention_v2_triton not available, "
-          "falling back to PyTorch decode for long contexts",
-          file=sys.stderr, flush=True)
-
 # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
 _PARTITION_SIZE = 512
 
@@ -178,25 +166,6 @@ class PagedAttention:
     # parameter which is inflated to max_model_len in CUDA graph mode.
     _PYTORCH_DECODE_THRESHOLD = 32768
 
-    # ================================================================
-    # Decode dispatch thresholds (CCCL-informed)
-    #
-    # Tier 1: V1 (ixf_F hardware kernel) — seq_len ≤ 8192
-    #   Fast, single-pass, no partition overhead. Works reliably on BI-V100
-    #   for short contexts. SMEM = block_size * head_dim * 2 < 48KB.
-    #
-    # Tier 2: Triton V2 (CCCL two-phase) — 8192 < seq_len ≤ 100K
-    #   Partition-based: Phase 1 computes per-partition (max, sum, weighted_v),
-    #   Phase 2 reduces across partitions. GQA broadcast reduces KV reads 6x.
-    #   SMEM per partition tile: 32*256*2*2 = 32KB (within 48KB budget).
-    #   This is the CCCL summary_statistics.cu compound-reduce pattern.
-    #
-    # Tier 3: PyTorch fallback — only if Triton V2 unavailable
-    #   Pure Python, no kernel optimization. ~10x slower than Triton.
-    #   Should never hit in competition (Triton V2 import always succeeds).
-    # ================================================================
-    _V1_THRESHOLD = 8192
-
     @staticmethod
     def forward_decode(
         query: torch.Tensor,
@@ -218,8 +187,12 @@ class PagedAttention:
         blocksparse_head_sliding_step: int = 0,
     ) -> torch.Tensor:
         actual_max = int(seq_lens.max().item()) if seq_lens.numel() > 0 else max_seq_len
+        if actual_max > PagedAttention._PYTORCH_DECODE_THRESHOLD:
+            return PagedAttention._forward_decode_pytorch(
+                query, key_cache, value_cache, block_tables, seq_lens, scale)
 
         if blocksparse_vert_stride is not None and blocksparse_vert_stride > 1:
+            # use blocksparse paged attention
             block_size = value_cache.size(-1)
             assert (blocksparse_block_size > 0 and
                     blocksparse_block_size % block_size == 0), \
@@ -231,9 +204,18 @@ class PagedAttention:
         num_seqs, num_heads, head_size = query.shape
         max_num_partitions = ((max_seq_len + _PARTITION_SIZE - 1) //
                               _PARTITION_SIZE)
-
-        # --- Tier 1: V1 for short contexts ---
-        if actual_max <= PagedAttention._V1_THRESHOLD:
+        # NOTE(woosuk): We use a simple heuristic to decide whether to use
+        # PagedAttention V1 or V2. If the number of partitions is 1, we use
+        # V1 to avoid the overhead of reduction. Also, if the number of
+        # sequences or heads is large, we use V1 since there is enough work
+        # to parallelize.
+        # TODO(woosuk): Tune this heuristic.
+        # For context len > 8192, use V2 kernel to avoid shared memory shortage.
+        use_v1 = (max_seq_len <= 8192
+                  and (max_num_partitions == 1 or num_seqs * num_heads > 512))
+        use_v1 = True
+        if use_v1:
+            # Run PagedAttention V1.
             ops.paged_attention_v1(
                 output,
                 query,
@@ -247,10 +229,8 @@ class PagedAttention:
                 max_seq_len,
                 alibi_slopes,
             )
-            return output
-
-        # --- Tier 2: Triton V2 for long contexts (CCCL two-phase) ---
-        if _HAS_TRITON_V2 and alibi_slopes is None:
+        else:
+            # Run PagedAttention V2.
             assert _PARTITION_SIZE % block_size == 0
             tmp_output = torch.empty(
                 size=(num_seqs, num_heads, max_num_partitions, head_size),
@@ -263,34 +243,31 @@ class PagedAttention:
                 device=output.device,
             )
             max_logits = torch.empty_like(exp_sums)
-            try:
-                paged_attention_v2_triton(
-                    output,
-                    exp_sums,
-                    max_logits,
-                    tmp_output,
-                    query,
-                    key_cache,
-                    value_cache,
-                    num_kv_heads,
-                    scale,
-                    block_tables,
-                    seq_lens,
-                    block_size,
-                    max_seq_len,
-                    alibi_slopes,
-                    kv_cache_dtype,
-                    k_scale,
-                    v_scale,
-                )
-                return output
-            except Exception as e:
-                print(f"[paged_attn] Triton V2 failed ({type(e).__name__}: {e}), "
-                      f"falling back to PyTorch decode", file=sys.stderr, flush=True)
-
-        # --- Tier 3: PyTorch fallback (last resort) ---
-        return PagedAttention._forward_decode_pytorch(
-            query, key_cache, value_cache, block_tables, seq_lens, scale)
+            ops.paged_attention_v2(
+                output,
+                exp_sums,
+                max_logits,
+                tmp_output,
+                query,
+                key_cache,
+                value_cache,
+                num_kv_heads,
+                scale,
+                block_tables,
+                seq_lens,
+                block_size,
+                max_seq_len,
+                alibi_slopes,
+                kv_cache_dtype,
+                k_scale,
+                v_scale,
+                tp_rank,
+                blocksparse_local_blocks,
+                blocksparse_vert_stride,
+                blocksparse_block_size,
+                blocksparse_head_sliding_step,
+            )
+        return output
 
     @staticmethod
     def forward_prefix(
