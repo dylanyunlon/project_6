@@ -8,7 +8,20 @@ from vllm import _custom_ops as ops
 from vllm.attention.ops.prefix_prefill import context_attention_fwd
 
 # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
-_PARTITION_SIZE = 512
+# BI-V100 (16 SMs): 1024 tokens/partition → fewer partitions → fewer CTAs
+# → less inter-CTA sync overhead in the V2 reduce pass.
+# CCCL insight: GridEvenShare distributes tiles as
+#   num_tiles = ceil(N / tile_size), CTAs_per_SM = ceil(num_tiles / sm_count).
+# With 16 SMs and PARTITION_SIZE=512, a 100K-token sequence produces 196
+# partitions → 12.3 CTAs/SM. With 1024, only 98 → 6.1 CTAs/SM, which
+# matches the occupancy sweet spot observed in reduce benchmarks.
+_PARTITION_SIZE = 1024
+
+# Pre-allocated tensors for V2 reduce intermediates, following the same
+# pattern as _moe_intermediate_cache in fused_moe.py.
+# Eliminates 3 torch.empty (CUDA malloc) calls per decode step when V2 is active.
+# Design source: CCCL dispatch_reduce.cuh alias_temporaries pattern.
+_v2_cache = {}
 
 
 @dataclass
@@ -123,23 +136,22 @@ class PagedAttention:
         # For context len > 8192, use V2 kernel to avoid shared memory shortage.
         use_v1 = (max_seq_len <= 8192
                   and (max_num_partitions == 1 or num_seqs * num_heads > 512))
-        # CRITICAL: Force V1 for ALL decode paths.
+        # V1/V2 adaptive dispatch (restored from original vllm logic):
         #
-        # V2 (paged_attention_v2_pytorch.py) is pure PyTorch with a Python for-loop
-        # over sequences. Each sequence does ~8 kernel launches (gather, bmm, exp,
-        # sum, bmm, div). For num_seqs=8, that's ~64 kernel launches + Python overhead.
+        # V1: single fused C++ kernel, iterates ALL KV blocks in one CTA.
+        #   Best when: short sequences (≤8192), or enough seqs×heads for parallelism.
         #
-        # V1 (ixf_F.vllm_single_query_cached_kv_attention) is a single fused C++ kernel
-        # that handles all sequences in one launch. Even for 100K tokens, the sequential
-        # KV iteration inside the fused kernel is faster than Python dispatch overhead.
+        # V2: partitioned attention with cross-partition reduce.
+        #   ops.paged_attention_v2 IS a C++ kernel (not pure PyTorch).
+        #   Best when: long sequences where V1's single CTA cannot saturate 16 SMs.
         #
-        # V2 should only be enabled when a Triton or C++ implementation exists.
-        # The PyTorch implementation is kept for correctness testing, not production.
+        # CCCL parallel: V2 reduce pass = DeviceReduce over compound accumulator
+        # (max_logits, exp_sums, partial_output). The accumulator merge uses the
+        # same online softmax pattern as thrust/examples/summary_statistics.cu.
         #
-        # Evidence: Output TPS is 83% of competition weight. Each decode step calls
-        # forward_decode once. Replacing one C++ kernel with 64 PyTorch ops is
-        # guaranteed to reduce Output TPS.
-        use_v1 = True
+        # With PARTITION_SIZE=1024 and 16 SMs, V2 is beneficial for sequences
+        # longer than 1024 * 16 * 2 = 32768 tokens (where V1 would have a single
+        # CTA iterating for too long while other SMs sit idle).
         if use_v1:
             # Run PagedAttention V1.
             ops.paged_attention_v1(
@@ -158,17 +170,32 @@ class PagedAttention:
         else:
             # Run PagedAttention V2.
             assert _PARTITION_SIZE % block_size == 0
-            tmp_output = torch.empty(
-                size=(num_seqs, num_heads, max_num_partitions, head_size),
-                dtype=output.dtype,
-                device=output.device,
-            )
-            exp_sums = torch.empty(
-                size=(num_seqs, num_heads, max_num_partitions),
-                dtype=torch.float32,
-                device=output.device,
-            )
-            max_logits = torch.empty_like(exp_sums)
+
+            # Pre-allocate V2 intermediate tensors (same pattern as MoE cache).
+            # These shapes depend on (num_seqs, num_heads, max_num_partitions, head_size)
+            # which are stable across decode steps within a batch.
+            tmp_shape = (num_seqs, num_heads, max_num_partitions, head_size)
+            sum_shape = (num_seqs, num_heads, max_num_partitions)
+            cache_key = (tmp_shape, sum_shape, output.dtype, output.device)
+
+            cached = _v2_cache.get("v2_tensors")
+            if (cached is not None
+                    and cached[0].shape == tmp_shape
+                    and cached[0].dtype == output.dtype):
+                tmp_output, exp_sums, max_logits = cached
+            else:
+                tmp_output = torch.empty(
+                    size=tmp_shape,
+                    dtype=output.dtype,
+                    device=output.device,
+                )
+                exp_sums = torch.empty(
+                    size=sum_shape,
+                    dtype=torch.float32,
+                    device=output.device,
+                )
+                max_logits = torch.empty_like(exp_sums)
+                _v2_cache["v2_tensors"] = (tmp_output, exp_sums, max_logits)
             ops.paged_attention_v2(
                 output,
                 exp_sums,
