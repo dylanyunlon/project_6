@@ -150,6 +150,11 @@ def paged_attention_v2(
     # Our PyTorch V2 implementation follows the same pattern:
     #   Phase 1: partition attention (each partition = one tile)
     #   Phase 2: cross-partition log-sum-exp reduction (summary_statistics binary_op)
+    import sys, os
+    # paged_attention_v2_pytorch.py is in the repo root, not inside vllm package
+    _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
     from paged_attention_v2_pytorch import paged_attention_v2_pytorch
     paged_attention_v2_pytorch(
         out, exp_sum, max_logits, tmp_out,
