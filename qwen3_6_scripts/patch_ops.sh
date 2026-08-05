@@ -22,6 +22,17 @@ fi
 
 echo "[patch_ops] vllm path: $V"
 
+# --- _custom_ops.py: SMEM 48KB fix + hardware ops bindings -------------------
+# Base image returns 32KB (32768) for get_max_shared_memory_per_block, but
+# BI-V100 actually has 48KB (49152) confirmed via ixsmi. This limits Triton
+# tile sizes and ixformer internal allocations if not corrected.
+# CCCL GridEvenShare test (catch2_test_grid_even_share.cu) validates that
+# work distribution depends on correct hardware parameters — wrong SMEM
+# means wrong tile_size means wrong grid_size.
+# FULL FILE REPLACEMENT.
+cp ./_custom_ops.py $V/_custom_ops.py
+echo "[patch_ops] _custom_ops.py → / (SMEM 32KB→48KB fix)"
+
 # --- paged_attn.py: pure-PyTorch attention fallback --------------------------
 # Bypasses Triton context_attention_fwd (hangs BI-V100 permanently).
 # Uses K-tiling Flash Attention online softmax for prefix attention.
