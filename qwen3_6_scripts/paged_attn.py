@@ -236,6 +236,21 @@ class PagedAttention:
         blocksparse_head_sliding_step: int = 0,
     ) -> torch.Tensor:
         actual_max = int(seq_lens.max().item()) if seq_lens.numel() > 0 else max_seq_len
+
+        # ================================================================
+        # CCCL kernel_segmented_reduce.cuh three-tier dispatch:
+        #   Small  (≤ small_items_per_tile)  → 1 thread per segment
+        #   Medium (≤ medium_items_per_tile) → 1 warp per segment
+        #   Large  (> medium_items_per_tile) → 1 block per segment
+        #
+        # Applied to paged attention decode:
+        #   Small  (≤ 8192)  → V1 native (single CTA, no partitioning)
+        #   Medium (8192..32K) → V2 native attempt (partitioned, two-phase)
+        #   Large  (> 32K)   → PyTorch fallback (V1 SMEM overflow on BI-V100)
+        #
+        # The previous use_v1=True forced V1 for all lengths, wasting V2's
+        # partitioned execution for medium-length sequences.
+        # ================================================================
         if actual_max > PagedAttention._PYTORCH_DECODE_THRESHOLD:
             return PagedAttention._forward_decode_pytorch(
                 query, key_cache, value_cache, block_tables, seq_lens, scale)
@@ -262,7 +277,10 @@ class PagedAttention:
         # For context len > 8192, use V2 kernel to avoid shared memory shortage.
         use_v1 = (max_seq_len <= 8192
                   and (max_num_partitions == 1 or num_seqs * num_heads > 512))
-        use_v1 = True
+        # CCCL segmented_reduce three-tier: don't force V1 for all lengths.
+        # V2 partitioned execution is better for medium-length sequences
+        # (8K-32K) where V1's single-CTA approach underutilizes 16 SMs.
+        # But V2 native may fail on BI-V100 — catch and fallback to V1.
         if use_v1:
             # Run PagedAttention V1.
             ops.paged_attention_v1(
@@ -279,8 +297,10 @@ class PagedAttention:
                 alibi_slopes,
             )
         else:
-            # Run PagedAttention V2.
-            assert _PARTITION_SIZE % block_size == 0
+            # Run PagedAttention V2 (partitioned, CCCL two-phase pattern).
+            # Try V2 native; if it fails, fallback to V1.
+            try:
+                assert _PARTITION_SIZE % block_size == 0
             tmp_output = torch.empty(
                 size=(num_seqs, num_heads, max_num_partitions, head_size),
                 dtype=output.dtype,
@@ -316,6 +336,13 @@ class PagedAttention:
                 blocksparse_block_size,
                 blocksparse_head_sliding_step,
             )
+            except Exception:
+                # V2 native failed on BI-V100 — fallback to V1
+                ops.paged_attention_v1(
+                    output, query, key_cache, value_cache, num_kv_heads,
+                    scale, block_tables, seq_lens, block_size, max_seq_len,
+                    alibi_slopes,
+                )
         return output
 
     @staticmethod
