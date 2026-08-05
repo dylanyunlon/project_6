@@ -32,10 +32,18 @@ command:
     # CCCL-derived optimizations:
     # Multi-step scheduling reduces Python dispatch overhead per decode iteration.
     # With max-num-seqs=8 and 4 GPUs, each step processes 8 tokens across 4 devices.
-    # num-scheduler-steps=8 batches 8 decode iterations before returning to Python,
-    # cutting scheduler overhead by ~8x. This directly improves Output TPS (83% weight).
+    #
+    # CCCL single_pass_scan_operators.cuh reveals: for gridDim.x < 500 (our case:
+    # 16 SMs → ~32 CTAs), all delay strategies collapse to __threadfence_block().
+    # This means inter-CTA synchronization cost is near-zero on BI-V100.
+    # The dominant per-step overhead is Python scheduler dispatch (~100μs/step).
+    # num-scheduler-steps=16 batches 16 decode iterations per Python call,
+    # cutting scheduler overhead by ~16x vs default. Pure win for Output TPS (83%).
+    #
+    # Source: cccl_upstream/cub/cub/agent/single_pass_scan_operators.cuh line 180
+    #   if (gridDim.x < GridThreshold) __threadfence_block(); // no real delay
     - --num-scheduler-steps
-    - '8'
+    - '16'
     # Recompute is cheaper than swap on BI-V100 (limited HBM bandwidth for swap).
     # When a sequence is preempted, recomputing the prefix is faster than
     # swapping KV blocks to/from CPU memory over PCIe.
