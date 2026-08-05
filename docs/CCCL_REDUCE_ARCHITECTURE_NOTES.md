@@ -105,3 +105,55 @@ is exactly CCCL's two-pass pattern.
 Not controlled by muh. Should be tunable: larger partition = fewer blocks =
 less overhead but more work per block. Optimal value depends on SM count.
 For 16 SMs: partition_size=1024 may be better (fewer partitions to reduce).
+
+---
+
+## CCCL Scan Architecture (dispatch_scan.cuh)
+
+> Added: 2026-08-04
+
+### Two algorithm paths
+
+**Lookback** (all GPUs including BI-V100):
+- Each CTA processes one tile, uses `ScanTileState` in global memory for inter-CTA communication
+- Lookback delay policy controls how aggressively CTAs poll predecessors
+- SMEM: static only (`__shared__`), passed as `0` dynamic SMEM
+- BI-V100 optimal: `no_delay` (dcid=0) because 16 SMs → ~32 CTAs → tile_status fits in 6MB L2
+
+**Lookahead** (SM100+ only, PTX ISA >= 860):
+- Pipeline-based with `__pipeline_memcpy_async` and bulk copy
+- Uses dynamic SMEM with auto-selected `num_stages`
+- **Not available on BI-V100** — requires NVIDIA PTX ISA 860+ instructions
+- All lookahead structs in our tuning_scan.cuh can remain empty shells
+
+### ScanTileState allocation
+
+Scan requires `d_temp_storage` for tile status descriptors:
+```
+tile_size = threads * items
+num_tiles = ceil(num_items / tile_size)
+temp_bytes = tile_state.AllocationSize(num_tiles)
+```
+
+For BI-V100 with 100K tokens and tile_size=384*22=8448:
+num_tiles = ceil(100000/8448) = 12 tiles → negligible temp storage.
+
+### Grid size for scan
+
+Lookback scan launches `num_tiles` blocks (one per tile), NOT `sm_count * subscription_factor`.
+This is different from reduce, which uses `GridEvenShare`.
+For scan, every CTA processes exactly one tile and communicates with neighbors.
+
+With 12 tiles on 16 SMs: all tiles fit in one wave, zero lookback contention.
+This is why `no_delay` works on BI-V100 — the entire scan completes in a single wave.
+
+### Lookahead num_stages optimization (SM100 only)
+
+CCCL dynamically selects pipeline depth:
+```cpp
+max_stages = ceil(num_items / (sm_count * tile_size)) + 1
+while (smem_for_stages(num_stages+1) <= max_dynamic_smem) num_stages++
+```
+
+For BI-V100 this is irrelevant (no pipeline support), but the formula shows
+NVIDIA's strategy: match pipeline depth to problem size / SM count ratio.
