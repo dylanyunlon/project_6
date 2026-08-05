@@ -1,5 +1,23 @@
 // muh/include/muh/tuning/tuning_scan.cuh — BI-V100 scan tuning
 //
+// CRITICAL INSIGHT FROM single_pass_scan_operators.cuh delay():
+//   The CCCL delay function has a runtime branch:
+//     if (gridDim.x < GridThreshold)     // GridThreshold = 500
+//       __threadfence_block();            // lightweight, no nanosleep
+//     else
+//       __nanosleep(Delay);              // heavyweight
+//
+//   BI-V100: 16 SMs × subscription_factor(5) = max gridDim.x ≈ 80.
+//   80 << 500, so ALL delay constructors (no_delay, fixed_delay,
+//   exponential_backon_jitter, etc.) collapse to __threadfence_block().
+//   This is why bench_bi100.py found no_delay optimal — because on BI-V100,
+//   every delay policy IS effectively no_delay.
+//
+//   This also means the ns/dcid/l2w tuning dimensions from scan benchmark
+//   (%RANGE% TUNE_MAGIC_NS, %RANGE% TUNE_DELAY_CONSTRUCTOR_ID, etc.)
+//   are IRRELEVANT on BI-V100. The entire delay parameter space collapses
+//   to a single point. Benchmarking should focus on ipt/tpb/trp/ld only.
+//
 // Mirrors: cccl_upstream/cub/cub/device/dispatch/tuning/tuning_scan.cuh
 // This is the most complex tuning file in CCCL (900+ lines for NVIDIA).
 //
