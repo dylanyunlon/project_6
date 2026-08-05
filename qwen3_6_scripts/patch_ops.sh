@@ -58,6 +58,14 @@ echo "[patch_ops] arg_utils.py → engine/"
 cp ./logits_processor.py $V/model_executor/layers/logits_processor.py
 echo "[patch_ops] logits_processor.py → model_executor/layers/"
 
+# --- sampler.py: CCCL-ported top-k fast path for sampling --------------------
+# When all sequences use top_p=1.0, skip full sort+cumsum and use torch.topk.
+# CCCL partition/flagged.cu insight: radix select is O(N×bits_per_pass) vs
+# full sort O(N log N). For vocab=152064: topk ~11 passes vs sort ~17 passes.
+# FULL FILE REPLACEMENT.
+cp ./sampler.py $V/model_executor/layers/sampler.py
+echo "[patch_ops] sampler.py → model_executor/layers/"
+
 # --- transformers: Qwen3_5 tokenizer / model files --------------------------
 pip install transformers==4.55.3 -i https://pypi.tuna.tsinghua.edu.cn/simple
 cp -r ./qwen3_5 /usr/local/lib/python3.10/site-packages/transformers/models/
