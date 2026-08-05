@@ -162,14 +162,73 @@ def extract_hardcoded_values(filepath):
     """Fallback: extract key values from policy_selector return statements.
     
     For algorithms where bi100_* structs don't exist (values computed inline).
-    Extracts the threads_per_block from the first return in the iluvatar branch.
+    Handles multiple patterns:
+      - topk: return {threads, items, load_algo, scan_algo, bits}
+      - transform: constexpr int bi100_bytes_in_flight = N;
+      - batch_memcpy: return {threads, items, ...}
+      - generic: first integer in return {} is threads_per_block
     """
     with open(filepath, 'r') as f:
         content = f.read()
     
     algo = algo_from_filename(filepath)
     
-    # Find iluvatar branch
+    # --- topk special case: extract bits_per_pass from calc_bits_per_pass ---
+    if algo == 'topk':
+        # Extract the return statement: return {threads, items, ..., bits};
+        iluvatar_match = re.search(
+            r'hw\.at_least\(.*iluvatar.*?\)\s*\{(.*?)return\s*\{([^}]+)\}',
+            content, re.DOTALL
+        )
+        if iluvatar_match:
+            return_args = iluvatar_match.group(2).strip()
+            # Pattern: {512, items, BLOCK_LOAD_VECTORIZE, BLOCK_SCAN_WARP_SCANS, calc_bits_per_pass(key_size)}
+            parts = [p.strip() for p in return_args.split(',')]
+            fields = {}
+            if len(parts) >= 1 and parts[0].isdigit():
+                fields['threads'] = int(parts[0])
+            # calc_bits_per_pass for float32 (key_size=4) = 11
+            bits_match = re.search(r'calc_bits_per_pass', return_args)
+            if bits_match:
+                fields['bits_per_pass'] = 11  # key_size=4 for float32 logits
+            return [('__inline_topk__', fields)]
+    
+    # --- transform special case: extract bytes_in_flight + thread config ---
+    if algo == 'transform':
+        fields = {}
+        bif_match = re.search(r'bi100_bytes_in_flight\s*=\s*(\d+)', content)
+        if bif_match:
+            fields['bytes_in_flight'] = int(bif_match.group(1))
+        # Look for thread count in vectorized policy or return statement
+        vec_threads = re.search(
+            r'VectorizedPolicy\s*\{?\s*(\d+)\s*,\s*(\d+)',
+            content
+        )
+        if vec_threads:
+            fields['threads'] = int(vec_threads.group(1))
+            fields['items'] = int(vec_threads.group(2))
+        elif not fields:
+            # Fallback: find any constexpr threads
+            t_match = re.search(r'threads_per_block\s*=?\s*(\d+)', content)
+            if t_match:
+                fields['threads'] = int(t_match.group(1))
+        if fields:
+            return [('__inline_transform__', fields)]
+    
+    # --- batch_memcpy special case ---
+    if algo == 'batch_memcpy':
+        fields = {}
+        t_match = re.search(r'threads_per_block\s*[=:]\s*(\d+)', content)
+        if t_match:
+            fields['threads'] = int(t_match.group(1))
+        if not fields:
+            t_match = re.search(r'return\s*\{?\s*(\d+)', content)
+            if t_match:
+                fields['threads'] = int(t_match.group(1))
+        if fields:
+            return [('__inline_batch_memcpy__', fields)]
+    
+    # --- Generic fallback: find iluvatar branch return value ---
     iluvatar_match = re.search(
         r'hw\.at_least\(.*iluvatar.*?\)\s*\{(.*?)(?=\n\s{2,4}\})',
         content, re.DOTALL
@@ -209,13 +268,24 @@ def generate_patches(header_dir):
                 summary.append(f"SKIP {algo}: no bi100_* structs and no inline values found")
                 continue
 
-        # Use the first non-default struct as the primary tuning
-        # (default is fallback; prefer the type-specific ones)
+        # Select the most relevant struct for vllm's primary data path.
+        # vllm's paged_attention score accumulator is always float32 (4 bytes),
+        # so we prefer bi100_*float32* or bi100_*accum4* structs.
+        # Fallback priority: float32 > accum2 (fp16 KV) > first non-default > first.
         primary = None
-        for name, fields in structs:
-            if 'default' not in name:
-                primary = (name, fields)
+        preference_order = ['float32', 'accum4', 'accum2', 'int32']
+        for pref in preference_order:
+            for name, fields in structs:
+                if pref in name and 'det' not in name and 'default' not in name:
+                    primary = (name, fields)
+                    break
+            if primary:
                 break
+        if primary is None:
+            for name, fields in structs:
+                if 'default' not in name and 'det' not in name:
+                    primary = (name, fields)
+                    break
         if primary is None:
             primary = structs[0]
 
