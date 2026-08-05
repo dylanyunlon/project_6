@@ -157,3 +157,76 @@ while (smem_for_stages(num_stages+1) <= max_dynamic_smem) num_stages++
 
 For BI-V100 this is irrelevant (no pipeline support), but the formula shows
 NVIDIA's strategy: match pipeline depth to problem size / SM count ratio.
+
+---
+
+## CCCL Scan Agent Architecture (agent_scan.cuh)
+
+> Added: 2026-08-04
+
+### Critical difference from reduce: scan DOES use SMEM for tile data
+
+```cpp
+union _TempStorage {
+    BlockLoadT::TempStorage load;       // SMEM for WARP_TRANSPOSE load
+    BlockStoreT::TempStorage store;     // SMEM for WARP_TRANSPOSE store
+    struct {
+        TilePrefixCallbackOpT::TempStorage prefix;  // lookback state
+        BlockScanT::TempStorage scan;                // block scan
+    } scan_storage;
+};
+```
+
+This is a **union** — load, store, and scan share the same SMEM, used
+in phases separated by `__syncthreads()`. Actual SMEM = max of three.
+
+For `BLOCK_LOAD_WARP_TRANSPOSE`:
+  load_smem ≈ threads * items * sizeof(InputT)
+
+For `BlockScan`:
+  scan_smem ≈ threads * sizeof(AccumT) + prefix_callback
+
+The dominant term is load/store: threads * items * type_size.
+
+**Conclusion: our SMEM constraint `threads * items * type_size ≤ 48KB`
+is CORRECT for scan but WRONG (overly conservative) for reduce.**
+
+### Tile processing flow
+
+```
+1. BlockLoad(SMEM).Load(d_in + offset, items[ITEMS_PER_THREAD])
+2. __syncthreads()
+3. BlockScan(SMEM).Scan(items, ..., prefix_op)  // lookback here
+4. __syncthreads()
+5. BlockStore(SMEM).Store(d_out + offset, items)
+```
+
+Each CTA processes exactly one tile (tile_idx = start_tile + blockIdx.x).
+Inter-CTA communication happens in step 3 via TilePrefixCallbackOp,
+which reads predecessor tile states from global memory (the lookback).
+
+### Lookback protocol (TilePrefixCallbackOp)
+
+For tile k, the callback:
+1. Sets own tile state to PARTIAL with local aggregate
+2. Looks back at tiles k-1, k-2, ... until finding an INCLUSIVE prefix
+3. Combines found prefix with local aggregate → own INCLUSIVE prefix
+4. Sets own tile state to INCLUSIVE
+
+The LookbackDelayPolicy controls how aggressively step 2 polls:
+- no_delay: spin immediately (best when few CTAs, e.g., BI-V100 16 SMs)
+- exponential_backon: exponentially increase delay between polls
+  (best when many CTAs compete for L2 coherence, e.g., SM100 148 SMs)
+
+### Impact on muh tuning
+
+For reduce: items_per_thread can be larger because SMEM only stores
+~threads*4 bytes for BlockReduce. The 48KB cap prevents register spill.
+
+For scan: items_per_thread is genuinely SMEM-limited because
+BlockLoad/BlockStore use threads*items*type_size bytes of SMEM.
+
+This means:
+- tuning_reduce.cuh: consider increasing items beyond scale_mem_bound cap
+  for better ILP, especially for small types (fp16, int8)
+- tuning_scan.cuh: current values are correctly SMEM-bounded, don't increase
