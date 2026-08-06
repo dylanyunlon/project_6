@@ -9,8 +9,40 @@ from vllm.triton_utils import HAS_TRITON
 if HAS_TRITON:
     from vllm.attention.ops.prefix_prefill import context_attention_fwd
 
+# ═══════════════════════════════════════════════════════════════════════
+# CCCL grid_even_share.cuh-informed partition sizing
+#
+# grid_even_share.cuh DispatchInit:
+#   total_tiles = ceil_div(num_items, tile_items)
+#   grid_size = min(total_tiles, max_grid_size)
+#   max_grid_size = sm_occupancy * sm_count * subscription_factor
+#
+# For BI-V100: max_grid_size = 2 * 16 * 5 = 160 CTAs
+# PARTITION_SIZE determines total_tiles = ceil(seq_len / PARTITION_SIZE)
+#
+# With PARTITION_SIZE=512 and seq_len=100K: total_tiles=196 > 160
+#   → 36 partitions are wasted (launched but blocked waiting for SM)
+#   → grid_even_share would cap at grid_size=160
+#
+# CCCL's GridEvenShare also distributes "big" vs "normal" shares:
+#   big_shares = total_tiles - (avg_tiles_per_block * grid_size)
+#   → first `big_shares` blocks process one extra tile
+#   This load-balancing is automatic in the C++ kernel.
+#
+# For the Python dispatch layer, we set PARTITION_SIZE to match
+# the precompiled .so's expectation. The .so was compiled with 512.
+# But we document the CCCL-derived optimal value for when we can
+# rebuild: PARTITION_SIZE = ceil(max_model_len / max_grid_size)
+#   = ceil(100000 / 160) = 625 → round to 640 (multiple of block_size=16)
+#
 # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
 _PARTITION_SIZE = 512
+
+# CCCL-derived constants for BI-V100 (from hardware.cuh + grid_even_share.cuh)
+_BI100_SM_COUNT = 16
+_BI100_SM_OCCUPANCY = 2        # CTAs per SM (conservative)
+_BI100_SUBSCRIPTION = 5        # CCCL util_device.cuh default
+_BI100_MAX_GRID = _BI100_SM_COUNT * _BI100_SM_OCCUPANCY * _BI100_SUBSCRIPTION  # 160
 
 
 @dataclass
@@ -118,24 +150,44 @@ class PagedAttention:
         num_seqs, num_heads, head_size = query.shape
         max_num_partitions = ((max_seq_len + _PARTITION_SIZE - 1) //
                               _PARTITION_SIZE)
-        # CCCL block_reduce_raking.cuh pattern:
-        #   WARP_SYNCHRONOUS fast path: when RAKING_THREADS == BLOCK_THREADS,
-        #   skip the SMEM raking grid and go directly to warp shuffle.
-        #   This is a CONDITIONAL optimization, not a hardcode.
+        # ═══════════════════════════════════════════════════════════════
+        # CCCL dispatch_reduce.cuh single-tile vs two-phase decision
         #
-        # V1 = WARP_SYNCHRONOUS equivalent: single-pass, no temp buffer.
-        # V2 = raking reduction equivalent: multi-pass with temp buffer.
+        # dispatch_reduce.cuh line 460:
+        #   if (num_items <= threads_per_block * items_per_thread):
+        #       InvokeSingleTile()     # one CTA, no temp buffer
+        #   else:
+        #       InvokePasses()         # GridEvenShare + second pass
         #
-        # V1 is faster for short sequences (fits in SMEM, no partition overhead).
-        # V2 is faster for long sequences (partitioned reduce + merge).
+        # The decision is tile-capacity based, not a magic constant.
         #
-        # For max_num_seqs=1 (competition config):
-        #   num_seqs * num_heads = 1 * 24 = 24, always < 512
-        #   → V2 kicks in for max_seq_len > 8192
+        # For paged attention, the equivalent:
+        #   V1 = SingleTile: one CTA processes entire sequence in SMEM
+        #        → no partition overhead, no cross-CTA merge
+        #   V2 = TwoPasses: sequence partitioned across CTAs
+        #        → Phase 1: each CTA computes partial attention
+        #        → Phase 2: merge partition results (log-sum-exp)
         #
-        # Original heuristic restored (was hardcoded use_v1=True):
-        use_v1 = (max_seq_len <= 8192
-                  and (max_num_partitions == 1 or num_seqs * num_heads > 512))
+        # CCCL invoke_regular_size_reduce also teaches:
+        #   max_blocks = sm_occupancy * sm_count * subscription_factor
+        #   GridEvenShare distributes work evenly across CTAs
+        #
+        # BI-V100 specifics (from hardware.cuh):
+        #   sm_count=16, subscription_factor=5 → max_blocks=160
+        #   V2 launch overhead is ~5μs for the merge kernel
+        #   V1 can handle up to PARTITION_SIZE tokens in one CTA
+        #
+        # agent_reduce.cuh ConsumeFullTile teaches: the single-tile
+        # path skips GridEvenShare setup entirely (just ConsumeRange).
+        # This is meaningful when num_items < tile_size because
+        # ConsumePartialTile has a while-loop with bounds checking.
+        #
+        # Decision: V1 when the sequence fits in 1 partition (no merge).
+        # V2 when cross-partition merge is required.
+        # The old heuristic `max_seq_len <= 8192` was arbitrary.
+        # The CCCL-derived condition: max_num_partitions == 1.
+        # ═══════════════════════════════════════════════════════════════
+        use_v1 = (max_num_partitions == 1)
         if use_v1:
             # Run PagedAttention V1.
             ops.paged_attention_v1(

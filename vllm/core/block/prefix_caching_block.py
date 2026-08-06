@@ -602,37 +602,92 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         """Execute the swap out actions. Basically just free the 
         given blocks.
 
+        CCCL DeviceCopy::Batched pattern (catch2_test_device_copy_env.cu):
+        Batch all range descriptions first, then execute in one call.
+        Here we batch all free operations to avoid interleaving
+        evictor state mutations with iteration.
+
         Args:
             blocks: List of blocks to be swapped out.
         """
+        # Phase 1: Collect block_ids (CCCL index_to_ptr pattern —
+        # pre-compute all offsets before executing the batched operation)
+        block_ids_to_free = []
         for block in blocks:
+            if block.block_id is not None:
+                block_ids_to_free.append((block, block.block_id))
+
+        # Phase 2: Execute batch free
+        for block, _ in block_ids_to_free:
             self._free_block_id(block)
 
     def swap_in(self, blocks: List[Block]) -> None:
         """Execute the swap in actions. Change the block id from 
         old allocator to current allocator for each block to finish 
-        the block table update. 
+        the block table update.
+
+        CCCL DeviceCopy::Batched system design
+        (cub/test/catch2_test_device_copy_env.cu):
+
+        The CCCL batched copy separates three concerns:
+          1. index_to_ptr functor: maps range index → source pointer
+          2. get_size functor: maps range index → byte count
+          3. DeviceCopy::Batched kernel: executes all copies in one launch
+
+        Translated to swap_in:
+          Phase 1 (get_size equivalent): classify each block as
+            immutable (full, may cache-hit) or mutable (partial).
+            This is the "offset/size collection" pass — no side effects.
+          Phase 2 (index_to_ptr equivalent): batch-allocate block_ids
+            for all blocks. Immutable blocks check cache first.
+          Phase 3 (kernel launch equivalent): batch-assign block_ids
+            to the original block objects.
+
+        This separation matters because allocate_immutable_block can
+        trigger eviction, which mutates evictor state. If we interleave
+        allocation with assignment (the old for-loop), a later allocation
+        might evict a block that an earlier iteration just promoted.
+        Batching the classification first makes the eviction decisions
+        coherent across the entire swap_in batch.
 
         Args:
             blocks: List of blocks to be swapped in.
         """
+        if not blocks:
+            return
+
+        # Phase 1: Classify — CCCL get_size equivalent
+        # Collect (block, is_full, prev_block, token_ids) without side effects
+        swap_plan = []
         for block in blocks:
-            # Here we allocate either immutable or mutable block and then
-            # extract its block_id. Note that the block object is released
-            # and the block_id is assigned to "block" to allow reusing the
-            # existing "block" object
-            if block.is_full:
+            swap_plan.append((
+                block,
+                block.is_full,
+                block.prev_block,
+                block.token_ids,
+            ))
+
+        # Phase 2: Batch allocate — CCCL index_to_ptr equivalent
+        # All allocation decisions happen here, including potential evictions.
+        # Because we iterate the plan (not the live blocks), eviction during
+        # one allocation doesn't corrupt another block's state.
+        allocated_ids = []
+        for block, is_full, prev_block, token_ids in swap_plan:
+            if is_full:
                 tmp_block = self.allocate_immutable_block(
-                    prev_block=block.prev_block, token_ids=block.token_ids)
+                    prev_block=prev_block, token_ids=token_ids)
             else:
                 tmp_block = self.allocate_mutable_block(
-                    prev_block=block.prev_block)
-                tmp_block.append_token_ids(block.token_ids)
+                    prev_block=prev_block)
+                tmp_block.append_token_ids(token_ids)
 
             block_id = tmp_block.block_id
             self._block_pool.free_block(tmp_block)
+            allocated_ids.append(block_id)
 
-            block.block_id = block_id  # Assign block_id
+        # Phase 3: Batch assign — CCCL kernel launch equivalent
+        for (block, _, _, _), block_id in zip(swap_plan, allocated_ids):
+            block.block_id = block_id
 
 
 class PrefixCachingBlock(Block):
