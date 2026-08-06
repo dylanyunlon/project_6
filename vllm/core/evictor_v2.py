@@ -73,6 +73,16 @@ class LRUEvictor(Evictor):
     the same last_accessed time, then the one with the largest num_hashed_tokens
     will be evicted. If two blocks each have the lowest last_accessed time and
     highest num_hashed_tokens value, then one will be chose arbitrarily
+
+    CCCL system design note (from thrust/examples/bucket_sort2d.cu):
+      CCCL's bucket sort uses transform→sort_by_key→lower_bound/upper_bound
+      to build O(1) lookup from bucket_index → item range. This maps to:
+        content_hash → block_id (our _cached_blocks dict)
+        last_accessed → eviction priority (our OrderedDict linear scan)
+      For production: sort_by_key on (last_accessed, -num_hashed_tokens)
+      would make evict() O(1) pop instead of O(n) scan.
+      For competition (max_num_seqs=1): current O(n) scan is fine since
+      n = num_gpu_blocks is bounded by GPU memory / block_size.
     """
 
     def __init__(self):
