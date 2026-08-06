@@ -412,17 +412,25 @@ class PagedAttention:
         else:
             # Run PagedAttention V2.
             assert _PARTITION_SIZE % block_size == 0
-            tmp_output = torch.empty(
+            # CCCL shifted_output lesson (issue #8838): uninitialized output
+            # buffers with offset writes cause illegal memory access.
+            # Use zeros instead of empty for defensive initialization.
+            tmp_output = torch.zeros(
                 size=(num_seqs, num_heads, max_num_partitions, head_size),
                 dtype=output.dtype,
                 device=output.device,
             )
-            exp_sums = torch.empty(
+            exp_sums = torch.zeros(
                 size=(num_seqs, num_heads, max_num_partitions),
                 dtype=torch.float32,
                 device=output.device,
             )
-            max_logits = torch.empty_like(exp_sums)
+            max_logits = torch.full(
+                size=(num_seqs, num_heads, max_num_partitions),
+                fill_value=float('-inf'),
+                dtype=torch.float32,
+                device=output.device,
+            )
             ops.paged_attention_v2(
                 output,
                 exp_sums,
