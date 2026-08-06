@@ -69,20 +69,48 @@ class CacheEngine:
         num_blocks: int,
         device: str,
     ) -> List[torch.Tensor]:
-        """Allocates KV cache on the specified device."""
+        """Allocates KV cache on the specified device.
+
+        CCCL temporary_storage.cuh layout<SlotsCount> system design:
+          Phase 1 (get_size): compute total bytes for all slots
+          Phase 2 (map_to_buffer): allocate one blob, alias into slots
+
+        Applied: instead of N separate torch.zeros (one per layer),
+        compute total size → allocate one contiguous tensor → slice
+        into per-layer views. Reduces cudaMalloc calls from
+        num_attention_layers to 1, and guarantees cross-layer memory
+        contiguity (better L2 locality for multi-layer KV access).
+
+        The slot/alias pattern maps directly:
+          layout slot[i] = layer i's KV cache
+          alias<T> = the typed view into that layer's region
+        """
         kv_cache_shape = self.attn_backend.get_kv_cache_shape(
             num_blocks, self.block_size, self.num_kv_heads, self.head_size)
         pin_memory = is_pin_memory_available() if device == "cpu" else False
         kv_cache: List[torch.Tensor] = []
-        for _ in range(self.num_attention_layers):
-            # null block in CpuGpuBlockAllocator requires at least that
-            # block to be zeroed-out.
-            # We zero-out everything for simplicity.
-            kv_cache.append(
-                torch.zeros(kv_cache_shape,
-                            dtype=self.dtype,
-                            pin_memory=pin_memory,
-                            device=device))
+
+        if self.num_attention_layers == 0 or num_blocks == 0:
+            return kv_cache
+
+        # Phase 1: get_size — compute per-layer element count
+        import math
+        layer_numel = math.prod(kv_cache_shape)
+
+        # Phase 2: map_to_buffer — single contiguous allocation
+        total_numel = self.num_attention_layers * layer_numel
+        contiguous_buffer = torch.zeros(
+            total_numel,
+            dtype=self.dtype,
+            pin_memory=pin_memory,
+            device=device)
+
+        # Alias into per-layer views (CCCL slot.create_alias pattern)
+        for i in range(self.num_attention_layers):
+            start = i * layer_numel
+            layer_flat = contiguous_buffer[start:start + layer_numel]
+            kv_cache.append(layer_flat.view(kv_cache_shape))
+
         return kv_cache
 
     def swap_in(self, src_to_dst: torch.Tensor) -> None:
