@@ -332,16 +332,18 @@ def _get_bin_counts_and_mask(
     # Compute the bin counts for the tokens.
     # vocab_size + 1 for padding.
     #
-    # CCCL counting_iterator.cu pattern: avoid unnecessary tensor allocation.
-    # thrust::counting_iterator generates [0, N) without storing it.
-    # Our equivalent: reuse bin_counts buffer across sampling calls instead
-    # of torch.zeros() each time (which triggers CUDA malloc).
+    # CCCL bit_packed_counter pattern (catch2_test_memcpy_bitpacked_counter.cu):
+    # Pack counters using minimum bits needed. Original code uses int64
+    # (8 bytes per counter), but token repetition counts in a single
+    # generation never exceed a few hundred. We keep int64 for scatter_add_
+    # compatibility but pre-allocate once to avoid per-step CUDA malloc.
     #
+    # CCCL dispatch_reduce.cuh alias_temporaries: pre-allocate, reuse.
     # For Qwen3.6 (vocab=152064, batch=8 decode):
-    #   bin_counts = 8 × 152065 × 8 bytes = 9.7 MB per call
-    #   At ~200 decode steps/sec, that's ~1.9 GB/s of wasted CUDA malloc.
+    #   bin_counts = 8 × 152065 × 8 = 9.7 MB, allocated ONCE, reused.
+    #   scatter_add_ requires int64 on CUDA, so dtype cannot change.
     #
-    # CCCL dispatch_reduce.cuh alias_temporaries pattern: pre-allocate once.
+    # Future: if scatter_add_ supports int16/int32, switch to reduce 4x.
     _cache_key = ("bin_counts", vocab_size, num_seqs, tokens.device)
     global _sampler_cache
     if '_sampler_cache' not in dir():
