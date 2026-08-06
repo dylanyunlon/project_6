@@ -298,7 +298,9 @@ ALL_TESTS = [
     ("TC-08 Stop sequence", test_stop_sequence),
     ("TC-09 Temperature zero", test_temperature_zero),
     ("TC-10 Empty messages error", test_empty_messages_error),
-    ("TC-11 Chat dataset", test_chat_dataset),
+    ("TC-11 Max tokens boundary", test_max_tokens_boundary),
+    ("TC-12 JSON object output", test_json_object_output),
+    ("TC-13 Chat dataset", test_chat_dataset),
 ]
 
 QUICK_TESTS = ALL_TESTS[:5]  # First 5 for quick validation
@@ -336,3 +338,130 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def test_streaming_sse(endpoint: str) -> Tuple[bool, str]:
+    """TC-14: Streaming SSE protocol — data: chunks + [DONE] terminator.
+
+    CCCL parallel: agent_scan.cuh lookback tile_state streaming.
+    Each scan tile publishes its partial result via tile_descriptor_t
+    (SCAN_TILE_INVALID → SCAN_TILE_PARTIAL → SCAN_TILE_INCLUSIVE).
+    SSE is the HTTP analog: each chunk publishes a delta, [DONE] = INCLUSIVE.
+    """
+    url = f"{endpoint}/v1/chat/completions"
+    payload = {
+        "model": "llm",
+        "messages": [{"role": "user", "content": "写一首四句诗"}],
+        "max_tokens": 200,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    resp = requests.post(url, json=payload, timeout=120, stream=True)
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}"
+
+    chunks = []
+    has_done = False
+    has_usage = False
+    content_parts = []
+
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line:
+            continue
+        if line.startswith("data: "):
+            data_str = line[6:].strip()
+            if data_str == "[DONE]":
+                has_done = True
+                continue
+            try:
+                chunk = json.loads(data_str)
+                chunks.append(chunk)
+                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                if "content" in delta and delta["content"]:
+                    content_parts.append(delta["content"])
+                if chunk.get("usage"):
+                    has_usage = True
+            except json.JSONDecodeError:
+                pass
+
+    full_content = "".join(content_parts)
+    if len(chunks) < 5:
+        return False, f"Too few chunks: {len(chunks)}"
+    if not has_done:
+        return False, "Missing [DONE] terminator"
+    if len(full_content) < 10:
+        return False, f"Content too short: '{full_content[:50]}'"
+
+    return True, f"OK: {len(chunks)} chunks, {len(full_content)} chars, usage={has_usage}, [DONE]={has_done}"
+
+
+def test_usage_tokens(endpoint: str) -> Tuple[bool, str]:
+    """TC-15: usage.prompt_tokens and completion_tokens are correct."""
+    code, data = chat_completion(endpoint, [
+        {"role": "user", "content": "hi"}
+    ], max_tokens=20)
+    if code != 200:
+        return False, f"HTTP {code}"
+    usage = data.get("usage", {})
+    pt = usage.get("prompt_tokens", 0)
+    ct = usage.get("completion_tokens", 0)
+    tt = usage.get("total_tokens", 0)
+    if pt <= 0:
+        return False, f"prompt_tokens={pt} <= 0"
+    if ct <= 0:
+        return False, f"completion_tokens={ct} <= 0"
+    if tt != pt + ct:
+        return False, f"total_tokens={tt} != {pt}+{ct}={pt+ct}"
+    return True, f"OK: prompt={pt}, completion={ct}, total={tt}"
+
+
+def test_model_name_validation(endpoint: str) -> Tuple[bool, str]:
+    """TC-16: Wrong model name returns 4xx error."""
+    url = f"{endpoint}/v1/chat/completions"
+    resp = requests.post(url, json={
+        "model": "wrong_name_that_does_not_exist",
+        "messages": [{"role": "user", "content": "hi"}],
+    }, timeout=30)
+    if resp.status_code < 400:
+        return False, f"Expected 4xx, got {resp.status_code}"
+    return True, f"OK: HTTP {resp.status_code} for wrong model name"
+
+
+def test_content_type_sse(endpoint: str) -> Tuple[bool, str]:
+    """TC-17: Streaming response Content-Type contains text/event-stream."""
+    url = f"{endpoint}/v1/chat/completions"
+    payload = {
+        "model": "llm",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 10,
+        "stream": True,
+    }
+    resp = requests.post(url, json=payload, timeout=30, stream=True)
+    ct = resp.headers.get("Content-Type", "")
+    if "text/event-stream" not in ct:
+        return False, f"Content-Type='{ct}', expected text/event-stream"
+    resp.close()
+    return True, f"OK: Content-Type={ct}"
+
+
+def test_instruction_following(endpoint: str) -> Tuple[bool, str]:
+    """TC-18: Instruction following without system prompt."""
+    code, data = chat_completion(endpoint, [
+        {"role": "user", "content": "请只回复 PONG，不要说其他任何内容"}
+    ], max_tokens=20, temperature=0.0)
+    if code != 200:
+        return False, f"HTTP {code}"
+    content = data["choices"][0]["message"]["content"]
+    if "PONG" not in content.upper():
+        return False, f"No PONG in: '{content[:50]}'"
+    return True, f"OK: '{content[:30]}'"
+
+
+# Update ALL_TESTS with the new tests
+ALL_TESTS.extend([
+    ("TC-14 Streaming SSE", test_streaming_sse),
+    ("TC-15 Usage tokens", test_usage_tokens),
+    ("TC-16 Model name validation", test_model_name_validation),
+    ("TC-17 Content-Type SSE", test_content_type_sse),
+    ("TC-18 Instruction following", test_instruction_following),
+])
