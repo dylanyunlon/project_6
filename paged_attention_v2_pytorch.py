@@ -38,6 +38,22 @@ _PARTITION_SIZE = 1024  # CCCL dispatch_scan.cuh insight: tile_size balances
 # For 100K tokens: 1024 → 98 partitions (3 waves), 512 → 195 (6 waves).
 # 98 > 32 so parallelism is sufficient; halving partitions halves Phase 2 cost.
 
+# CCCL dispatch_reduce.cuh GridEvenShare formula (line ~180):
+#   max_blocks = sm_occupancy * sm_count * subscription_factor
+#   subscription_factor = 5 (default in cub/util_device.cuh)
+# For BI-V100: sm_count=16, sm_occupancy ~= 2 (limited by registers/SMEM)
+#   → max_blocks = 2 * 16 * 5 = 160
+# If seq_len=100K with PARTITION_SIZE=1024 → 98 partitions < 160 → fine.
+# Threshold for V1→V2 handoff: when single-tile can't hold all tokens.
+#   CCCL single_tile threshold = threads * items_per_thread
+#   = 512 * 24 = 12288 tokens → V1 handles ≤12288, V2 handles >12288.
+# This aligns with BI-V100 paged_attn.py _PARTITION_SIZE=512:
+#   V2 triggers when seq_len > 512 * (max_blocks_per_seq_for_v1).
+_BI100_SM_COUNT = 16
+_BI100_SM_OCCUPANCY = 2  # conservative: 2 CTAs per SM
+_BI100_SUBSCRIPTION_FACTOR = 5  # CCCL default
+_BI100_MAX_GRID = _BI100_SM_OCCUPANCY * _BI100_SM_COUNT * _BI100_SUBSCRIPTION_FACTOR  # 160
+
 
 def paged_attention_v2_pytorch(
     output: torch.Tensor,          # [num_seqs, num_heads, head_size]
@@ -72,6 +88,15 @@ def paged_attention_v2_pytorch(
     exp_sums.zero_()
     tmp_output.zero_()
 
+    # CCCL kernel_reduce.cuh SingleTile fast path (line ~270):
+    #   if (num_items <= threads_per_block * items_per_thread)
+    #     → InvokeSingleTile() — one CTA, no temp buffer, no Phase 2
+    # PyTorch translation: if seq_len fits in one partition, skip Phase 2 entirely.
+    # This avoids the partition/reshape/bmm overhead for short decode sequences.
+    # Qwen3.6 typical decode: seq_len grows from 1 to 100K over generation.
+    # Early tokens (seq_len < 1024) hit this fast path every step.
+    _SINGLE_TILE_THRESHOLD = _PARTITION_SIZE  # sequences this short skip partitioning
+
     for seq_idx in range(num_seqs):
         seq_len = int(seq_lens[seq_idx].item())
         if seq_len == 0:
@@ -80,6 +105,60 @@ def paged_attention_v2_pytorch(
 
         num_blocks_seq = (seq_len + block_size - 1) // block_size
         num_partitions = (seq_len + _PARTITION_SIZE - 1) // _PARTITION_SIZE
+
+        # ─── CCCL SingleTile fast path ───────────────────────────
+        # From kernel_reduce.cuh: when everything fits in one tile,
+        # do a single-pass attention without partition overhead.
+        # agent_reduce.cuh ConsumeRange → BlockReduce → done.
+        if num_partitions == 1:
+            blk_ids = block_tables[seq_idx, :num_blocks_seq]
+            q = query[seq_idx].float()  # [H, d]
+
+            # Gather KV (same as below but no partition reshape)
+            k_gathered = key_cache[blk_ids]
+            k_flat = (k_gathered
+                      .permute(0, 3, 1, 2, 4)
+                      .reshape(-1, num_kv_heads, head_size))[:seq_len]
+            v_flat = (value_cache[blk_ids]
+                      .permute(0, 3, 1, 2)
+                      .reshape(-1, num_kv_heads, head_size))[:seq_len]
+
+            if k_scale != 1.0:
+                k_flat = k_flat.float().mul_(k_scale)
+            if v_scale != 1.0:
+                v_flat = v_flat.float().mul_(v_scale)
+
+            if gqa_ratio > 1:
+                k_kv = k_flat.permute(1, 2, 0).float().contiguous()
+                v_kv = v_flat.permute(1, 0, 2).float().contiguous()
+                q_grouped = q.view(num_kv_heads, gqa_ratio, 1, head_size)
+                scores = torch.matmul(q_grouped, k_kv.unsqueeze(1)).squeeze(2)
+                scores = scores.reshape(num_heads, seq_len) * scale
+            else:
+                k_t = k_flat.permute(1, 2, 0).float().contiguous()
+                scores = torch.bmm(q.unsqueeze(1), k_t).squeeze(1) * scale
+
+            if alibi_slopes is not None:
+                positions = torch.arange(seq_len, device=query.device, dtype=torch.float32)
+                scores = scores + alibi_slopes.unsqueeze(1) * positions.unsqueeze(0)
+
+            # Direct softmax + V weighted sum — no partition overhead
+            weights = torch.softmax(scores, dim=-1)  # [H, seq_len]
+            if gqa_ratio > 1:
+                w_grouped = weights.view(num_kv_heads, gqa_ratio, 1, seq_len)
+                result = torch.matmul(w_grouped, v_kv.unsqueeze(1)).squeeze(2)
+                output[seq_idx] = result.reshape(num_heads, head_size).to(output.dtype)
+            else:
+                v_perm = v_flat.permute(1, 0, 2).float().contiguous()
+                result = torch.bmm(weights.unsqueeze(1), v_perm).squeeze(1)
+                output[seq_idx] = result.to(output.dtype)
+
+            # Store dummy partition values for compatibility
+            max_logits[seq_idx, :, 0] = scores.max(dim=-1).values
+            exp_sums[seq_idx, :, 0] = weights.sum(dim=-1)
+            tmp_output[seq_idx, :, 0, :] = output[seq_idx].float()
+            continue
+        # ─── End SingleTile fast path ────────────────────────────
 
         # =============================================================
         # Batched KV gather: ONE index_select, ONE reshape
