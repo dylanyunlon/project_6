@@ -718,30 +718,75 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
             k_s = k_flat[seq_start:seq_end].permute(1, 0, 2).float()
             v_s = v_flat[seq_start:seq_end].permute(1, 0, 2).float()
 
-            if k_s.shape[0] != self.num_heads:
-                n = self.num_heads // k_s.shape[0]
-                k_s = k_s.repeat_interleave(n, dim=0).contiguous()
-                v_s = v_s.repeat_interleave(n, dim=0).contiguous()
+            # CCCL agent_reduce.cuh ConsumeFullTile pattern: avoid
+            # materializing expanded data. Instead of repeat_interleave
+            # (which allocates 6x memory for GQA ratio=6), reshape to
+            # [kv_h, 1, seq, d] and let matmul broadcast over gqa groups.
+            #
+            # CCCL DeviceFind::FindIf tuning pattern: policy_selector
+            # injects block_size externally via cuda::execution::tune().
+            # We inject the GQA-aware reshape here instead of hardcoding
+            # repeat_interleave expansion.
+            gqa_ratio = self.num_heads // k_s.shape[0]
+            if gqa_ratio > 1:
+                # k_s: [kv_h, seq, d] → [kv_h, 1, seq, d] for broadcast
+                k_s = k_s.unsqueeze(1)  # [kv_h, 1, seq, d]
+                v_s = v_s.unsqueeze(1)  # [kv_h, 1, seq, d]
+                # q_c will be [kv_h, gqa, chunk, d] after reshape
+                use_gqa_broadcast = True
+            else:
+                use_gqa_broadcast = False
 
             k_pos = torch.arange(q_len, device=query.device)
 
             for qc_start in range(0, q_len, _Q_CHUNK):
                 qc_end = min(qc_start + _Q_CHUNK, q_len)
 
-                q_c = q_flat[seq_start + qc_start:seq_start + qc_end] \
-                      .permute(1, 0, 2).float()
+                if use_gqa_broadcast:
+                    # GQA broadcast path — CCCL agent_reduce.cuh pattern:
+                    # Q: [kv_h, gqa, chunk, d], K: [kv_h, 1, seq, d]
+                    # matmul broadcasts K over gqa dim without materializing.
+                    # Saves 6x memory vs repeat_interleave for Qwen3.6 (ratio=6).
+                    q_c = (q_flat[seq_start + qc_start:seq_start + qc_end]
+                           .float()
+                           .view(-1, self.num_kv_heads, gqa_ratio, self.head_size)
+                           .permute(1, 2, 0, 3))  # [kv_h, gqa, chunk, d]
 
-                attn_w = torch.matmul(q_c, k_s.transpose(-2, -1)) * self.scale
+                    # [kv_h, gqa, chunk, seq] via broadcast
+                    attn_w = torch.matmul(
+                        q_c, k_s.transpose(-2, -1)) * self.scale
 
-                qc_q_pos = torch.arange(qc_start, qc_end, device=query.device)
-                mask = k_pos.unsqueeze(0) > qc_q_pos.unsqueeze(1)
-                attn_w = attn_w.masked_fill(mask.unsqueeze(0), float("-inf"))
+                    qc_q_pos = torch.arange(qc_start, qc_end, device=query.device)
+                    mask = k_pos.unsqueeze(0) > qc_q_pos.unsqueeze(1)
+                    attn_w = attn_w.masked_fill(
+                        mask.unsqueeze(0).unsqueeze(0), float("-inf"))
 
-                attn_w = torch.softmax(attn_w, dim=-1)
-                out_c = torch.matmul(attn_w, v_s).to(orig_dtype)
+                    attn_w = torch.softmax(attn_w, dim=-1)
+                    # [kv_h, gqa, chunk, d]
+                    out_c = torch.matmul(attn_w, v_s).to(orig_dtype)
+                    # → [chunk, kv_h * gqa, d] = [chunk, num_heads, d]
+                    out_c = (out_c.permute(2, 0, 1, 3)
+                             .contiguous()
+                             .view(-1, self.num_heads, self.head_size))
+                    output[seq_start + qc_start:seq_start + qc_end] = out_c
+                else:
+                    # Non-GQA path (kv_heads == num_heads)
+                    q_c = q_flat[seq_start + qc_start:seq_start + qc_end] \
+                          .permute(1, 0, 2).float()
 
-                output[seq_start + qc_start:seq_start + qc_end] = (
-                    out_c.permute(1, 0, 2))
+                    attn_w = torch.matmul(
+                        q_c, k_s.transpose(-2, -1)) * self.scale
+
+                    qc_q_pos = torch.arange(qc_start, qc_end, device=query.device)
+                    mask = k_pos.unsqueeze(0) > qc_q_pos.unsqueeze(1)
+                    attn_w = attn_w.masked_fill(
+                        mask.unsqueeze(0), float("-inf"))
+
+                    attn_w = torch.softmax(attn_w, dim=-1)
+                    out_c = torch.matmul(attn_w, v_s).to(orig_dtype)
+
+                    output[seq_start + qc_start:seq_start + qc_end] = (
+                        out_c.permute(1, 0, 2))
 
             seq_start = seq_end
 
