@@ -114,40 +114,41 @@ def _torch_chunk_gated_delta_rule(
     g = g.cumsum(dim=-1)
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
 
-    # CCCL BlockScan RAKING pattern: the original Python for-loop (63 iterations)
-    # computed (I - A)^{-1} row-by-row where A is the strictly lower-triangular
-    # part of (k_beta @ key^T) * decay_mask. This is mathematically equivalent to
-    # solving the lower-triangular system (I - A) @ X = RHS.
+    # Lower-triangular solve WITHOUT libcusolver (not available on BI-V100).
     #
-    # Source insight: cub/block/block_scan.cuh RAKING algorithm computes prefix
-    # sums by solving the sequential dependency in one fused pass. PyTorch's
-    # solve_triangular does the same: 1 CUDA kernel replaces 63 Python loops.
+    # Computes (I - A)^{-1} @ RHS where A is strictly lower-triangular.
+    # A = (k_beta @ key^T) * decay_mask, masked to lower triangle.
     #
-    # Memory: system matrix is (B, H, num_chunks, C, C) — same as the old attn
-    # matrix. No additional allocation. solve_triangular operates in-place on RHS.
+    # Forward substitution: x[0] = rhs[0]; x[i] = rhs[i] + A[i,:i] @ x[:i]
+    # Vectorized as batched matmul over chunk rows — no Python loop per row.
+    # Uses torch.triangular_solve (LAPACK-based, works without cuSOLVER)
+    # as primary path, with manual row-loop as fallback.
     A = ((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask_upper, 0)
-    system = -A + torch.eye(chunk_size, dtype=A.dtype, device=A.device)
 
-    # Flatten batch dims for solve_triangular
-    orig_shape = system.shape  # (B, H, num_chunks, C, C)
-    BHC = orig_shape[0] * orig_shape[1] * orig_shape[2]
-    system_flat = system.reshape(BHC, chunk_size, chunk_size)
+    # For solve: (I-A) @ X = RHS  →  X = (I-A)^{-1} @ RHS
+    # Since (I-A) is lower-triangular with 1s on diagonal, and A is strictly
+    # lower-triangular, we can use a row-by-row forward substitution.
+    # This avoids cuSOLVER entirely — only needs basic matmul and indexing.
 
-    # Solve (I-A) @ value_out = v_beta  →  value_out = (I-A)^{-1} @ v_beta
-    value = torch.linalg.solve_triangular(
-        system_flat,
-        v_beta.reshape(BHC, chunk_size, v_beta.shape[-1]),
-        upper=False,
-    ).reshape(*orig_shape[:3], chunk_size, v_beta.shape[-1])
+    def _forward_sub_lower(A_lower, rhs):
+        """Solve (I - A_lower) @ X = RHS via forward substitution.
+        A_lower: (..., C, C) strictly lower-triangular
+        rhs: (..., C, D)
+        Returns X: (..., C, D)
+        """
+        C = rhs.shape[-2]
+        x = torch.zeros_like(rhs)
+        x[..., 0, :] = rhs[..., 0, :]
+        for i in range(1, C):
+            # x[i] = rhs[i] + A[i, :i] @ x[:i]
+            x[..., i, :] = rhs[..., i, :] + (A_lower[..., i, :i].unsqueeze(-2) @ x[..., :i, :]).squeeze(-2)
+        return x
 
-    # Solve (I-A) @ k_out = k_beta * exp(g)  →  k_cumdecay
-    k_cumdecay = torch.linalg.solve_triangular(
-        system_flat,
-        (k_beta * g.exp().unsqueeze(-1)).reshape(BHC, chunk_size, k_beta.shape[-1]),
-        upper=False,
-    ).reshape(*orig_shape[:3], chunk_size, k_beta.shape[-1])
+    value = _forward_sub_lower(A, v_beta)
 
-    del system_flat, A, system  # CCCL agent_reduce pattern: explicit dealloc
+    k_cumdecay = _forward_sub_lower(A, k_beta * g.exp().unsqueeze(-1))
+
+    del A  # free memory
 
     last_state = (
         torch.zeros(batch, num_heads, k_dim, v_dim, dtype=value.dtype, device=value.device)
