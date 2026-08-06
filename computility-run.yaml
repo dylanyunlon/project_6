@@ -34,11 +34,11 @@ command:
     - half
 env:
     - name: VLLM_ENGINE_ITERATION_TIMEOUT_S
-      value: 3600
+      value: '3600'
     - name: VLLM_ATTENTION_BACKEND
       value: XFORMERS
     - name: ENABLE_CUSTOM_IPC
-      value: 1
+      value: '1'
     - name: PYTHONPATH
       value: /usr/local/corex/lib/python3/dist-packages:/usr/local/corex/lib64/python3/dist-packages
     - name: LD_LIBRARY_PATH
@@ -52,4 +52,4 @@ env:
     - name: VLLM_REQUEST_METRICS_FILE
       value: /tmp/vllm-request-metrics.jsonl
     - name: VLLM_CACHE_BLOCK_SIZE
-      value: 16
+      value: '16'
