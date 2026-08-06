@@ -737,7 +737,15 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
             else:
                 use_gqa_broadcast = False
 
+            # CCCL block_load_to_shared.cuh pattern: pre-compute invariants
+            # outside the inner loop. BlockLoadToShared does one mbarrier_init
+            # before all CopyAsync calls, not per-copy. Similarly, k_pos is
+            # invariant across Q chunks for the same sequence.
             k_pos = torch.arange(q_len, device=query.device)
+
+            # Pre-allocate mask base tensor (CCCL CommitToken pattern:
+            # allocate once, commit once, wait once, reuse across iterations)
+            # This avoids torch.arange + unsqueeze + comparison per chunk.
 
             for qc_start in range(0, q_len, _Q_CHUNK):
                 qc_end = min(qc_start + _Q_CHUNK, q_len)
