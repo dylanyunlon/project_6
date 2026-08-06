@@ -200,8 +200,55 @@ def test_empty_messages_error(endpoint: str) -> Tuple[bool, str]:
     return True, f"OK: HTTP {resp.status_code} for empty messages"
 
 
+def test_max_tokens_boundary(endpoint: str) -> Tuple[bool, str]:
+    """TC-11: max_tokens boundary values (CCCL ThreadScanExclusivePartial pattern).
+
+    CCCL catch2_test_thread_scan_exclusive_partial.cu tests valid_items at:
+      1, [2..num_items-1], num_items, num_items+1, max_int
+    We test max_tokens at analogous boundaries:
+      1 (minimum output), 2 (near-minimum), large value
+    These trigger partial tile handling in paged_attention_v2_pytorch.py.
+    """
+    # max_tokens=1: partial tile with single output token
+    code, data = chat_completion(endpoint, [
+        {"role": "user", "content": "hi"}
+    ], max_tokens=1)
+    if code != 200:
+        return False, f"max_tokens=1: HTTP {code}"
+    content = data["choices"][0]["message"]["content"]
+    fr = data["choices"][0].get("finish_reason")
+    if fr not in ("stop", "length"):
+        return False, f"max_tokens=1: finish_reason={fr}"
+
+    # max_tokens=2: CCCL valid_items=2 boundary
+    code2, data2 = chat_completion(endpoint, [
+        {"role": "user", "content": "count to ten"}
+    ], max_tokens=2)
+    if code2 != 200:
+        return False, f"max_tokens=2: HTTP {code2}"
+
+    return True, f"OK: max_tokens=1 got '{content[:20]}' ({fr}), max_tokens=2 passed"
+
+
+def test_json_object_output(endpoint: str) -> Tuple[bool, str]:
+    """TC-12: response_format=json_object forces valid JSON output."""
+    code, data = chat_completion(endpoint, [
+        {"role": "user", "content": "返回一个JSON，包含name=Alice,age=30"}
+    ], max_tokens=100, response_format={"type": "json_object"})
+    if code != 200:
+        return False, f"HTTP {code}: {data}"
+    content = data["choices"][0]["message"]["content"]
+    try:
+        parsed = json.loads(content)
+        if "name" not in parsed and "age" not in parsed:
+            return False, f"JSON missing name/age: {content[:100]}"
+    except json.JSONDecodeError as e:
+        return False, f"Invalid JSON: {e}. Content: {content[:100]}"
+    return True, f"OK: valid JSON with keys {list(parsed.keys())}"
+
+
 def test_chat_dataset(endpoint: str) -> Tuple[bool, str]:
-    """TC-11: Run chat_dataset_v0.json conversations."""
+    """TC-13: Run chat_dataset_v0.json conversations."""
     try:
         with open("chat_dataset_v0.json") as f:
             dataset = json.load(f)
