@@ -164,10 +164,14 @@ class BlockTable:
         """Ensures that the BlockTable has at least the specified number of
         empty slots available.
 
-        This method checks if the BlockTable has enough empty slots (i.e.,
-        available space) to accommodate the requested number of tokens. If not,
-        it allocates additional blocks on the GPU to ensure that the required
-        number of empty slots is available.
+        CCCL dispatch_select_if.cuh system design:
+          1. alias_temporaries: compute all allocation sizes upfront,
+             pack into a single temp_storage blob
+          2. streaming_context_t: batch state changes via advance()
+             rather than mutating mid-iteration
+
+        Applied: pre-compute blocks_to_allocate, batch-allocate all
+        blocks, then batch-append. Separates planning from execution.
 
         Args:
             num_empty_slots (int): The minimum number of empty slots required.
@@ -183,11 +187,19 @@ class BlockTable:
         slots_to_allocate = num_empty_slots - self._num_empty_slots
         blocks_to_allocate = cdiv(slots_to_allocate, self._block_size)
 
+        # CCCL alias_temporaries pattern: compute sizes → allocate → init
+        # Phase 1: batch-allocate all blocks (allocation planning)
+        new_blocks = []
+        prev_block = self._blocks[-1] if len(self._blocks) > 0 else None
         for _ in range(blocks_to_allocate):
-            assert len(self._blocks) > 0
-            self._blocks.append(
-                self._allocator.allocate_mutable_block(
-                    prev_block=self._blocks[-1], device=device))
+            new_block = self._allocator.allocate_mutable_block(
+                prev_block=prev_block, device=device)
+            new_blocks.append(new_block)
+            prev_block = new_block
+
+        # Phase 2: batch-append (execution)
+        for block in new_blocks:
+            self._blocks.append(block)
 
     def fork(self) -> "BlockTable":
         """Creates a new BlockTable instance with a copy of the blocks from the
