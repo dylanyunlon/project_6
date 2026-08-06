@@ -406,3 +406,19 @@ if __name__ == "__main__":
     print(f"\nSingle-tile threshold examples:")
     for sl in [100, 500, 1024, 5000, 12288, 50000]:
         print(f"  seq_len={sl:>6d}: single_tile={should_use_single_tile(sl)}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Pattern 7: CCCL C API JIT Build-then-Run → Triton autotune
+# Source: c/parallel.v2/src/reduce.cu, scan.cu
+# EngineX's "algorithm factor substitution" = this pattern
+# ═══════════════════════════════════════════════════════════════
+TRITON_AUTOTUNE_CONFIGS = {
+    "prefill_attention": [
+        {"BLOCK_M": 32, "BLOCK_N": 32, "num_warps": 4, "num_stages": 1},
+        {"BLOCK_M": 16, "BLOCK_N": 32, "num_warps": 4, "num_stages": 1},
+    ],
+    "decode_v1": [{"NUM_THREADS": 512, "items": 24, "vec": 2}],
+    "decode_v2": [{"PARTITION_SIZE": 1024}],
+    "topk": [{"threads": 512, "items": 4, "bits_per_pass": 11}],
+}
