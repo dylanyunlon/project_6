@@ -166,9 +166,17 @@ class PagedAttention:
         #   big_shares = total_tiles - (avg_tiles * grid_size)
         # Our target: ~4 tiles max (Python overhead >> kernel launch overhead)
         # ================================================================
-        _BI100_TARGET_TILES = 4   # minimize Python loop iterations
-        _MIN_TILE_BLOCKS = 64     # floor: avoid tiny matmuls
-        _MAX_TILE_BLOCKS = 4096   # ceiling: avoid single huge allocation
+        # CCCL GridEvenShare: max_blocks = sm_occupancy * sm_count * subscription_factor
+        # BI-V100: 1 * 16 * 5 = 80 max CTAs for CUDA kernels.
+        # But this is Python (PyTorch ops), not CUDA launches — Python loop
+        # overhead dominates. Each iteration = 1 torch.matmul launch + online
+        # softmax update. Target 2 iterations (not 4): the matmul itself is
+        # already parallelized across SMs, so fewer Python loops = less overhead.
+        # For seq_len=100K with block_size=16: 6250 blocks / 2 = 3125 blocks/tile.
+        # Score tensor: 4 kv_heads × 6 gqa × 1 × 50000 × 4B = 4.8 MB — fits.
+        _BI100_TARGET_TILES = 2   # 2 iterations: minimize Python loop overhead
+        _MIN_TILE_BLOCKS = 128    # floor: ensure matmul is large enough to saturate 16 SMs
+        _MAX_TILE_BLOCKS = 8192   # ceiling: 8192 × 16 = 128K tokens per tile — fits in memory
 
         try:
             for i in range(num_seqs):
@@ -412,25 +420,33 @@ class PagedAttention:
         else:
             # Run PagedAttention V2.
             assert _PARTITION_SIZE % block_size == 0
-            # CCCL shifted_output lesson (issue #8838): uninitialized output
-            # buffers with offset writes cause illegal memory access.
-            # Use zeros instead of empty for defensive initialization.
-            tmp_output = torch.zeros(
-                size=(num_seqs, num_heads, max_num_partitions, head_size),
-                dtype=output.dtype,
-                device=output.device,
-            )
-            exp_sums = torch.zeros(
-                size=(num_seqs, num_heads, max_num_partitions),
-                dtype=torch.float32,
-                device=output.device,
-            )
-            max_logits = torch.full(
-                size=(num_seqs, num_heads, max_num_partitions),
-                fill_value=float('-inf'),
-                dtype=torch.float32,
-                device=output.device,
-            )
+            # CCCL agent_merge_sort.cuh union _TempStorage pattern:
+            # agent_merge_sort shares a single SMEM allocation across
+            # load_keys, load_items, store_keys, and block_merge ops
+            # (they don't execute concurrently, so one buffer suffices).
+            # Our equivalent: cache V2 temp tensors across decode steps.
+            # For max_num_seqs=1 (competition config), these shapes are
+            # stable across all decode steps for the same sequence.
+            _v2_key = ("v2_tmp", num_seqs, num_heads, max_num_partitions,
+                       head_size, output.dtype, output.device)
+            _v2_cached = getattr(PagedAttention, '_v2_cache', {}).get(_v2_key)
+            if _v2_cached is not None:
+                tmp_output, exp_sums, max_logits = _v2_cached
+            else:
+                tmp_output = torch.empty(
+                    size=(num_seqs, num_heads, max_num_partitions, head_size),
+                    dtype=output.dtype,
+                    device=output.device,
+                )
+                exp_sums = torch.empty(
+                    size=(num_seqs, num_heads, max_num_partitions),
+                    dtype=torch.float32,
+                    device=output.device,
+                )
+                max_logits = torch.empty_like(exp_sums)
+                if not hasattr(PagedAttention, '_v2_cache'):
+                    PagedAttention._v2_cache = {}
+                PagedAttention._v2_cache[_v2_key] = (tmp_output, exp_sums, max_logits)
             ops.paged_attention_v2(
                 output,
                 exp_sums,
