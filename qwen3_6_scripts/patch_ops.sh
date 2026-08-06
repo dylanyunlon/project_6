@@ -82,7 +82,9 @@ echo "[patch_ops] sampler.py → model_executor/layers/"
 # It modifies pip-installed transformers' configuration_auto.py and __init__.py
 # to register qwen3_5/qwen3_5_moe. These files come from pip (version-specific)
 # so we can't pre-copy them — the patch script inserts lines after known anchors.
-pip install transformers==4.55.3 -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip install transformers==4.55.3 -i https://pypi.tuna.tsinghua.edu.cn/simple 2>/dev/null || \
+pip install transformers==4.55.3 2>/dev/null || \
+echo "[patch_ops] WARNING: pip install transformers failed, using pre-installed version"
 cp -r ./qwen3_5 /usr/local/lib/python3.10/site-packages/transformers/models/
 cp -r ./qwen3_5_moe /usr/local/lib/python3.10/site-packages/transformers/models/
 python3 ./patch_transformers_qwen3_5.py
