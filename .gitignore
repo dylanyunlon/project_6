@@ -5,3 +5,4 @@ muh/
 baseline.muh
 pkgs/
 enginex_base/
+__pycache__/

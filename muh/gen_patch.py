@@ -85,44 +85,101 @@ def algo_from_filename(filepath):
 
 VLLM_INJECTION_POINTS = {
     # ═══════════════════════════════════════════════════════════════════
-    # WARNING: ALL csrc/*.cu targets are DEAD — files do not exist.
-    # enginex-vllm-bi100-qwen36 ships: Python + precompiled .so + Triton.
-    # No .cu source files. gen_patch patches have zero effect.
-    # (Confirmed: commit 41ecb8c, enginex zip analysis)
-    # ═══════════════════════════════════════════════════════════════════
+    # enginex ships Python + precompiled .so + Triton — NO .cu source.
+    # All injection is via Python runtime values and Triton JIT configs.
     #
-    # DEAD injection points (kept for documentation):
+    # DEAD (csrc/*.cu) paths preserved as comments for when/if EngineX
+    # exposes CUDA source in future releases.
+    # ═══════════════════════════════════════════════════════════════════
+
+    # ─── 1. PAGED ATTENTION DECODE (Output TPS × 16.796 = 83%) ─────
+    # paged_attn.py: controls V1/V2 dispatch and partition granularity.
+    # CCCL parallel: compound reduce (summary_statistics.cu Welford pattern).
+    # The ixformer .so has NUM_THREADS baked in — we control PARTITION_SIZE
+    # and V1/V2 threshold from Python, which determines how many CTAs launch.
+    # _PARTITION_SIZE = number of KV tokens per partition in V2.
+    # NOT the same as items_per_thread. Currently hardcoded 512 in paged_attn.py.
+    # Tuning: larger partition → fewer inter-partition reduce passes (good for 16 SMs).
+    # Smaller partition → more parallelism across CTAs (good for many SMs).
+    # BI-V100 with 16 SMs: partition=512 is a reasonable balance.
+    # To change, must also update max_num_partitions calculation.
+    ('reduce', 'partition_size'): [
+        ('paged_attn.py', '_PARTITION_SIZE'),
+    ],
+
+    # ─── 2. TRITON PREFILL ATTENTION ───────────────────────────────
+    # prefix_prefill.py: Triton JIT kernel for context (prefill) attention.
+    # CCCL parallel: scan + reduce + transform (softmax + QKV matmul).
+    # SMEM constraint: BLOCK_N × head_dim × elem_size × 2 ≤ 48KB.
+    # Qwen3.6 head_dim=256, bf16: BLOCK_N=32 → 32KB ✓, BLOCK_N=64 → 64KB ✗
+    ('prefill', 'BLOCK_M'): [
+        ('prefix_prefill.py', 'BLOCK'),
+    ],
+    ('prefill', 'NUM_WARPS'): [
+        ('prefix_prefill.py', 'NUM_WARPS'),
+    ],
+
+    # ─── 3. TRITON FLASH ATTENTION (autotune) ─────────────────────
+    # triton_flash_attention.py: @triton.autotune with 20+ Config entries.
+    # We added BI-V100 specific configs (BLOCK_M=32/64, num_stages=2,
+    # num_warps=2/4) based on CCCL transform benchmark bytes_in_flight=64KB.
+    # Autotune picks the fastest at runtime — our configs compete fairly.
+    ('flash_attn', 'BLOCK_M'): [
+        ('vllm/attention/ops/triton_flash_attention.py', 'BLOCK_M'),
+    ],
+    ('flash_attn', 'BLOCK_N'): [
+        ('vllm/attention/ops/triton_flash_attention.py', 'BLOCK_N'),
+    ],
+
+    # ─── 4. MoE ROUTING (Qwen3.6 is MoE: 256 experts, top-8) ────
+    # fused_moe.py: GEMM tiling for expert-parallel matmul.
+    # CCCL parallel: batch_memcpy (expert weight scatter) + transform (gate).
+    ('moe', 'BLOCK_SIZE_M'): [
+        ('vllm/model_executor/layers/fused_moe/fused_moe.py', 'BLOCK_SIZE_M'),
+    ],
+
+    # ─── 5. RUNTIME HARDWARE OVERRIDES ────────────────────────────
+    # _custom_ops.py: BI-V100 SMEM was hardcoded 32KB → fixed to 48KB.
+    # This unblocks all Triton kernels that tile by SMEM availability.
+    ('runtime', 'SMEM'): [
+        ('vllm/_custom_ops.py', 'get_max_shared_memory'),
+    ],
+
+    # ─── 6. LAUNCH CONFIGURATION (computility-run.yaml) ──────────
+    # Server-level tuning: max-model-len, gpu-memory-utilization, tp,
+    # max-num-seqs, batched-tokens, chunked-prefill, prefix-caching.
+    # CCCL parallel: these control the problem size fed to all kernels.
+    ('scheduler', 'num_steps'): [
+        ('computility-run.yaml', 'num-scheduler-steps'),
+    ],
+    ('scheduler', 'max_num_seqs'): [
+        ('computility-run.yaml', '--max-num-seqs'),
+    ],
+    ('scheduler', 'max_batched_tokens'): [
+        ('computility-run.yaml', '--max-num-batched-tokens'),
+    ],
+    ('scheduler', 'gpu_mem_util'): [
+        ('computility-run.yaml', '--gpu-memory-utilization'),
+    ],
+
+    # ─── 7. PAGED ATTENTION V2 ENABLE (currently force-disabled) ──
+    # paged_attn.py line ~99: use_v1 = True disables V2 for all seq_lens.
+    # V2 partitions long sequences across CTAs (CCCL GridEvenShare pattern).
+    # For seq_len > 8K, V2 should be faster — but needs native C++ impl,
+    # not the PyTorch fallback currently in paged_attention_v2_pytorch.py.
+    ('reduce', 'v1_v2_threshold'): [
+        ('paged_attn.py', 'use_v1'),
+    ],
+
+    # ═══════════════════════════════════════════════════════════════════
+    # DEAD csrc/*.cu injection points (no .cu source in enginex):
     # ('reduce', 'threads'): [('csrc/attention/attention_kernels.cu', 'NUM_THREADS')],
     # ('topk', 'threads'): [('csrc/sampling/sampling_kernels.cu', 'SAMPLING_BLOCK_SIZE')],
     # ('scan', 'threads'): [('csrc/attention/paged_attention_v1.cu', 'SCAN_BLOCK_SIZE')],
     # ('transform', 'threads'): [('csrc/activation_kernels.cu', 'ACTIVATION_BLOCK_SIZE')],
     # ('batch_memcpy', 'threads'): [('csrc/cache_kernels.cu', 'COPY_BLOCK_SIZE')],
     # ('for', 'threads'): [('csrc/pos_encoding_kernels.cu', 'ROPE_BLOCK_SIZE')],
-    #
     # ═══════════════════════════════════════════════════════════════════
-    # REAL injection points (confirmed working):
-    # ═══════════════════════════════════════════════════════════════════
-    ('prefill', 'BLOCK_M'): [
-        ('prefix_prefill.py', 'BLOCK'),           # Triton JIT tl.constexpr
-    ],
-    ('prefill', 'NUM_WARPS'): [
-        ('prefix_prefill.py', 'NUM_WARPS'),       # Triton JIT
-    ],
-    ('flash_attn', 'BLOCK_M'): [
-        ('vllm/attention/ops/triton_flash_attention.py', 'BLOCK_M'),  # Triton autotune
-    ],
-    ('flash_attn', 'BLOCK_N'): [
-        ('vllm/attention/ops/triton_flash_attention.py', 'BLOCK_N'),  # Triton autotune
-    ],
-    ('moe', 'BLOCK_SIZE_M'): [
-        ('vllm/model_executor/layers/fused_moe/fused_moe.py', 'BLOCK_SIZE_M'),  # → ixformer
-    ],
-    ('runtime', 'SMEM'): [
-        ('vllm/_custom_ops.py', 'get_max_shared_memory'),  # 32KB→48KB fix
-    ],
-    ('scheduler', 'num_steps'): [
-        ('computility-run.yaml', 'num-scheduler-steps'),  # Python dispatch overhead
-    ],
 }
 
 
