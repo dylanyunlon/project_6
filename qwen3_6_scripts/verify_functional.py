@@ -457,6 +457,94 @@ def test_instruction_following(endpoint: str) -> Tuple[bool, str]:
     return True, f"OK: '{content[:30]}'"
 
 
+def test_idempotency(endpoint: str) -> Tuple[bool, str]:
+    """TC-19: Idempotent decode — seed=42 temperature=0 two requests identical.
+
+    CCCL parallel: catch2_test_device_reduce_deterministic.cu verifies:
+      env1 = require(determinism::gpu_to_gpu) + tune(policy<1, 128>)
+      env2 = require(determinism::gpu_to_gpu) + tune(policy<2, 256>)
+      REQUIRE(d_output_p1 == d_output_p2)
+    Two different execution policies give BIT-EXACT same result when
+    determinism::gpu_to_gpu is required. This is because CCCL uses
+    Reproducible Floating-point Accumulation (RFA) which guarantees
+    rounding-order independence.
+
+    For vllm: seed=42 + temperature=0.0 locks the RNG and uses argmax.
+    Two identical requests MUST produce identical content strings.
+    This is a hard competition requirement (TC-05 in the PRD).
+    """
+    kwargs = dict(
+        max_tokens=50,
+        temperature=0.0,
+        seed=42,
+    )
+    messages = [{"role": "user", "content": "说hello"}]
+
+    code1, data1 = chat_completion(endpoint, messages, **kwargs)
+    if code1 != 200:
+        return False, f"Request 1: HTTP {code1}"
+    content1 = data1["choices"][0]["message"]["content"]
+
+    code2, data2 = chat_completion(endpoint, messages, **kwargs)
+    if code2 != 200:
+        return False, f"Request 2: HTTP {code2}"
+    content2 = data2["choices"][0]["message"]["content"]
+
+    if content1 != content2:
+        return False, f"NOT idempotent: '{content1[:40]}' vs '{content2[:40]}'"
+    return True, f"OK: identical outputs '{content1[:30]}'"
+
+
+def test_top_p_boundary(endpoint: str) -> Tuple[bool, str]:
+    """TC-20: top_p=1.0 (no nucleus) and top_p=0.01 (extreme nucleus) both work.
+
+    CCCL parallel: catch2_test_device_topk_keys.cu tests k=1 and k=N boundaries.
+    dispatch_topk.cuh's multi-pass radix selection must handle:
+      - k=1: single element (DeviceTopK degenerates to DeviceMin/Max)
+      - k=N: all elements (no filtering, just sort)
+    Similarly, top_p boundaries:
+      - top_p=1.0: no filtering (all tokens eligible)
+      - top_p=0.01: extreme filtering (only top ~1% of probability mass)
+    """
+    # top_p=1.0 (effectively disabled)
+    code1, data1 = chat_completion(endpoint, [
+        {"role": "user", "content": "hi"}
+    ], max_tokens=10, top_p=1.0, temperature=0.7)
+    if code1 != 200:
+        return False, f"top_p=1.0: HTTP {code1}: {data1}"
+
+    # top_p=0.01 (extreme nucleus — only highest prob token)
+    code2, data2 = chat_completion(endpoint, [
+        {"role": "user", "content": "hi"}
+    ], max_tokens=10, top_p=0.01, temperature=0.7)
+    if code2 != 200:
+        return False, f"top_p=0.01: HTTP {code2}: {data2}"
+
+    c1 = data1["choices"][0]["message"]["content"]
+    c2 = data2["choices"][0]["message"]["content"]
+    return True, f"OK: top_p=1.0→'{c1[:20]}', top_p=0.01→'{c2[:20]}'"
+
+
+def test_frequency_penalty(endpoint: str) -> Tuple[bool, str]:
+    """TC-21: frequency_penalty and presence_penalty accepted.
+
+    CCCL parallel: tuning_histogram.cuh — token frequency counting for
+    repetition_penalty is a histogram operation. CCCL's histogram uses
+    privatized bins per CTA to avoid atomic contention.
+    The bin_counts in sampler.py._get_bin_counts_and_mask() is the Python
+    equivalent — scatter_add_ into (batch, vocab+1) tensor.
+    """
+    code, data = chat_completion(endpoint, [
+        {"role": "user", "content": "写一段话"}
+    ], max_tokens=100, frequency_penalty=1.5, presence_penalty=0.5)
+    if code != 200:
+        return False, f"HTTP {code}: {data}"
+    content = data["choices"][0]["message"]["content"]
+    if not content or len(content) < 5:
+        return False, f"Content too short: '{content}'"
+    return True, f"OK: {len(content)} chars with freq=1.5 pres=0.5"
+
+
 # Update ALL_TESTS with the new tests
 ALL_TESTS.extend([
     ("TC-14 Streaming SSE", test_streaming_sse),
@@ -464,4 +552,7 @@ ALL_TESTS.extend([
     ("TC-16 Model name validation", test_model_name_validation),
     ("TC-17 Content-Type SSE", test_content_type_sse),
     ("TC-18 Instruction following", test_instruction_following),
+    ("TC-19 Idempotency (det reduce)", test_idempotency),
+    ("TC-20 Top-p boundary", test_top_p_boundary),
+    ("TC-21 Frequency penalty", test_frequency_penalty),
 ])
