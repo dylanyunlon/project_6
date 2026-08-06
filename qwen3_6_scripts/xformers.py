@@ -743,12 +743,26 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
             # invariant across Q chunks for the same sequence.
             k_pos = torch.arange(q_len, device=query.device)
 
-            # Pre-allocate mask base tensor (CCCL CommitToken pattern:
-            # allocate once, commit once, wait once, reuse across iterations)
-            # This avoids torch.arange + unsqueeze + comparison per chunk.
+            # CCCL agent_sub_warp_merge_sort.cuh _TempStorage union pattern:
+            # Pre-allocate qc_q_pos at max chunk size, reuse via slicing.
+            # Avoids torch.arange allocation inside the inner loop.
+            # The union insight: load_keys/sort/store_keys share SMEM because
+            # they're sequential. Similarly, qc_q_pos is reused each iteration.
+            _max_chunk = min(_Q_CHUNK, q_len)
+            _qc_q_pos_base = torch.arange(_max_chunk, device=query.device)
 
-            for qc_start in range(0, q_len, _Q_CHUNK):
+            # CCCL agent_sub_warp_merge_sort.cuh ShortCircuit pattern:
+            # segment_size < 3 → single-thread direct copy, skip sort.
+            # Here: q_len <= _Q_CHUNK → one chunk, skip the tiling loop.
+            _num_chunks = (q_len + _Q_CHUNK - 1) // _Q_CHUNK
+
+            for qc_idx in range(_num_chunks):
+                qc_start = qc_idx * _Q_CHUNK
                 qc_end = min(qc_start + _Q_CHUNK, q_len)
+                chunk_len = qc_end - qc_start
+
+                # Reuse pre-allocated base + offset (union pattern)
+                qc_q_pos = _qc_q_pos_base[:chunk_len] + qc_start
 
                 if use_gqa_broadcast:
                     # GQA broadcast path — CCCL agent_reduce.cuh pattern:
@@ -764,7 +778,6 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                     attn_w = torch.matmul(
                         q_c, k_s.transpose(-2, -1)) * self.scale
 
-                    qc_q_pos = torch.arange(qc_start, qc_end, device=query.device)
                     mask = k_pos.unsqueeze(0) > qc_q_pos.unsqueeze(1)
                     attn_w = attn_w.masked_fill(
                         mask.unsqueeze(0).unsqueeze(0), float("-inf"))
@@ -785,7 +798,6 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                     attn_w = torch.matmul(
                         q_c, k_s.transpose(-2, -1)) * self.scale
 
-                    qc_q_pos = torch.arange(qc_start, qc_end, device=query.device)
                     mask = k_pos.unsqueeze(0) > qc_q_pos.unsqueeze(1)
                     attn_w = attn_w.masked_fill(
                         mask.unsqueeze(0), float("-inf"))

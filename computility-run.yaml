@@ -8,27 +8,48 @@ command:
     - --served-model-name
     - llm
     - --max-model-len
-    - '100000'
+    - '256000'
     - --gpu-memory-utilization
-    - '0.9'
+    - '0.95'
     - --trust-remote-code
     - -tp
     - '4'
     - --max-num-seqs
-    - '1'
+    - '2'
     - --disable-log-requests
     - --disable-frontend-multiprocessing
     - --max-num-batched-tokens
-    - '8192'
+    - '4096'
     - --enable-chunked-prefill
     - --max-seq-len-to-capture
     - '32768'
+    - --enforce-eager
     - --enable-auto-tool-choice
     - --tool-call-parser
     - qwen3_coder
     - --reasoning-parser
     - qwen3
     - --enable-prefix-caching
+    - --dtype
+    - half
 env:
     - name: VLLM_ENGINE_ITERATION_TIMEOUT_S
       value: 3600
+    - name: VLLM_ATTENTION_BACKEND
+      value: XFORMERS
+    - name: ENABLE_CUSTOM_IPC
+      value: 1
+    - name: PYTHONPATH
+      value: /usr/local/corex/lib/python3/dist-packages:/usr/local/corex/lib64/python3/dist-packages
+    - name: LD_LIBRARY_PATH
+      value: /usr/local/corex/lib64:/usr/local/openmpi/lib
+    - name: VLLM_COREX_FA2_LIBRARY
+      value: /usr/local/corex/lib64/libcorex_fa2.so
+    - name: VLLM_COREX_GDN_LIBRARY
+      value: /usr/local/corex/lib64/libcorex_gdn.so
+    - name: VLLM_COREX_MOE_LIBRARY
+      value: /usr/local/corex/lib64/libcorex_moe.so
+    - name: VLLM_REQUEST_METRICS_FILE
+      value: /tmp/vllm-request-metrics.jsonl
+    - name: VLLM_CACHE_BLOCK_SIZE
+      value: 16
