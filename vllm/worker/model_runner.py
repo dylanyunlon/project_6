@@ -830,9 +830,12 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             for data in self.inter_data_list
         }
 
+        # CCCL bounding_box.cu: compound reduce must track each dimension
+        # independently (lower_left.x separate from lower_left.y).
+        # max_decode_seq_len and max_encoder_seq_len are independent stats.
         cuda_graph_pad_size = self._get_cuda_graph_pad_size(
             num_seqs=len(seq_lens),
-            max_decode_seq_len=max_encoder_seq_len,
+            max_decode_seq_len=max_decode_seq_len,
             max_encoder_seq_len=max_encoder_seq_len)
 
         batch_size = len(input_tokens)
