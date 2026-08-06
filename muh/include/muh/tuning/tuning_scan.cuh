@@ -1,75 +1,53 @@
 // muh/include/muh/tuning/tuning_scan.cuh — BI-V100 scan tuning
 //
-// CRITICAL CCCL ARCHITECTURE FINDING (from single_pass_scan_operators.cuh):
+// Mirrors: cccl_upstream/cub/cub/device/dispatch/tuning/tuning_scan.cuh (1525 lines)
+// vllm impact: softmax denominator prefix-sum in paged_attention (every decode step)
+// Competition weight: contributes to both Output TPS (decode) and Input TPS (prefill)
 //
-//   template <int Delay, unsigned int GridThreshold = 500>
-//   _CCCL_DEVICE _CCCL_FORCEINLINE void delay() {
-//     if (gridDim.x < GridThreshold) {
-//       __threadfence_block();    // ← ALL BI-V100 scans take this path
-//     } else {
-//       __nanosleep(Delay);       // ← only fires when grid > 500 CTAs
-//     }
-//   }
+// HARDWARE PROFILE (confirmed via ixsmi on Phanthy Cloud):
+//   SM count:   16 (NOT 50 from spec sheet)
+//   SMEM:       48KB (49152 bytes) per block
+//   L2 cache:   6MB (6291456 bytes)
+//   HBM BW:     900 GB/s
+//   BW/SM:      900/16 = 56 GB/s ≈ B200 level (not A100)
+//   Warp size:  32
 //
-// BI-V100: 16 SMs × ~10 CTAs/SM max = ~160 CTAs. ALWAYS < 500.
-// Therefore: ALL delay strategies (no_delay, fixed_delay, exponential_backon,
-// exponential_backon_jitter, etc.) collapse to __threadfence_block() on BI-V100.
+// CRITICAL: Scan uses BlockLoad to stage data in SMEM (unlike reduce which loads to registers).
+//   tile_bytes = threads_per_block × items_per_thread × value_size
+//   MUST satisfy: tile_bytes ≤ 49152 for ALL type sizes.
 //
-// This means:
-//   1. The ns/dcid/l2w delay parameters are IRRELEVANT for BI-V100.
-//   2. bench_bi100.py's finding that no_delay is optimal is CORRECT BY DESIGN.
-//   3. The "ns×0.5, l2w×0.6" scaling heuristic was always a no-op on BI-V100.
-//   4. Tuning effort should focus on threads/items/load_algo, NOT delay params.
+// CCCL SCAN ARCHITECTURE (from tuning_scan.cuh):
+//   Two algorithm branches:
+//     1. LOOKBACK (decoupled look-back): safe default, all GPUs
+//        - Uses tile_state in global memory for inter-CTA communication
+//        - LookbackDelayPolicy controls polling: {algorithm, delay_ns, l2_write_latency}
+//        - BI-V100: 16 SMs → max 32 concurrent tiles → LOW contention → shorter delays OK
+//     2. LOOKAHEAD (warpspeed): SM100+ only, requires PTX ISA 8.6+
+//        - Uses pipeline stages for overlapped load/compute/store
+//        - BI-V100 does NOT have PTX ISA 8.6 → LOCKED TO LOOKBACK
 //
-// This architectural insight came from reading cub/agent/single_pass_scan_operators.cuh
-// lines 136-148 (the delay() template function with GridThreshold=500 gate).
+// CCCL SM100 BENCHMARK ANNOTATIONS (from policy_selector dispatch):
+//   These are the gold-standard tuning points. Each annotation format:
+//     ipt_<items>.tpb_<threads>.ns_<delay_ns>.dcid_<delay_algo>.l2w_<l2_latency>.trp_<transpose>.ld_<load_mod>
+//     followed by 4 speedup values at problem sizes [2^16, 2^20, 2^24, 2^28]
 //
-// CRITICAL INSIGHT FROM single_pass_scan_operators.cuh delay():
-//   The CCCL delay function has a runtime branch:
-//     if (gridDim.x < GridThreshold)     // GridThreshold = 500
-//       __threadfence_block();            // lightweight, no nanosleep
-//     else
-//       __nanosleep(Delay);              // heavyweight
+//   BI-V100 ADAPTATION STRATEGY:
+//     - threads/items: adapted via scale_mem_bound with SMEM cap at 49152
+//     - delay_ns: scaled × 0.5 (BI-V100 L2 is 6MB vs SM100 64MB → fewer tiles → less contention)
+//     - l2_write_latency: scaled × 0.6 (empirical ratio from L2 size difference)
+//     - load_modifier: LOAD_DEFAULT preferred (topk bench showed BI-V100 L1/L2 differs from NVIDIA)
+//     - delay_algorithm: preserved from CCCL (exponential_backon variants)
 //
-//   BI-V100: 16 SMs × subscription_factor(5) = max gridDim.x ≈ 80.
-//   80 << 500, so ALL delay constructors (no_delay, fixed_delay,
-//   exponential_backon_jitter, etc.) collapse to __threadfence_block().
-//   This is why bench_bi100.py found no_delay optimal — because on BI-V100,
-//   every delay policy IS effectively no_delay.
-//
-//   This also means the ns/dcid/l2w tuning dimensions from scan benchmark
-//   (%RANGE% TUNE_MAGIC_NS, %RANGE% TUNE_DELAY_CONSTRUCTOR_ID, etc.)
-//   are IRRELEVANT on BI-V100. The entire delay parameter space collapses
-//   to a single point. Benchmarking should focus on ipt/tpb/trp/ld only.
-//
-// Mirrors: cccl_upstream/cub/cub/device/dispatch/tuning/tuning_scan.cuh
-// This is the most complex tuning file in CCCL (900+ lines for NVIDIA).
-//
-// vllm impact: Prefix scan in paged attention block table lookup
-// Competition weight: Input TPS × 2.799
-//
-// HARDWARE (confirmed via ixsmi):
-//   SM count:   16 (NOT 50)
-//   SMEM:       48KB (49152 bytes)
-//   L2 cache:   6MB (vs SM100's 50MB — 8.3× smaller)
-//   BW/SM:      900/16 = 56 GB/s
-//
-// SM=16 IMPACT ON SCAN:
-//   1. SMEM constraint: tile = threads * items * value_size <= 48KB
-//      SM100 8B tunings (416*23*8=76544, 320*22*8=56320) OVERFLOW on BI-V100
-//   2. Delay parameters: SM100 L2=50MB, BI-V100 L2=6MB (8.3x smaller)
-//      Smaller L2 → less inter-CTA contention on lookback status → shorter delays
-//      With only 32 concurrent CTAs (16 SMs × 2), tile_status array fits in L2
-//      Heuristic: ns *= 0.5, l2w *= 0.6 (PENDING BI-V100 BENCHMARK)
-//   3. Tile maximization: fewer CTAs = each must process more data
-//      Small tiles (e.g. 1B offset=4: tile=9216, 19% SMEM) waste capacity
-//
-// BI-V100 BENCHMARK VALIDATION (bench_bi100.py on iluvatar-bi-v100):
-//   scan/float32 TOP 10 — all use ns=1904 (SM100 raw, NOT ×0.5!)
-//   The ns×0.5 heuristic was WRONG. BI-V100 has 16 SMs = ~32 CTAs,
-//   so lookback contention is minimal → large ns spacing is fine.
-//   Best dcid=0 (no_delay), not dcid=6 (exponential_backon_jitter).
-//   SMEM usage: 33792/49152 = 69% for ipt=22,tpb=384,value=4B.
+// DELAY ALGORITHM ENUM MAPPING (dcid values in CCCL benchmark annotations):
+//   0 = no_delay
+//   1 = fixed_delay
+//   2 = exponential_backoff
+//   3 = exponential_backoff_jitter
+//   4 = exponential_backoff_jitter_window
+//   5 = exponential_backon_jitter_window
+//   6 = exponential_backon_jitter
+//   7 = exponential_backon
+//   8 = __reduce_by_key (internal)
 
 #pragma once
 
@@ -78,7 +56,10 @@
 
 namespace muh::tuning::scan {
 
-/// Lookback scan policy (mirrors cub::ScanLookbackPolicy)
+// ============================================================
+// Policy structs (mirrors CCCL ScanLookbackPolicy)
+// ============================================================
+
 struct ScanLookbackPolicy {
   int threads_per_block;
   int items_per_thread;
@@ -89,17 +70,18 @@ struct ScanLookbackPolicy {
   LookbackDelayPolicy lookback_delay;
 };
 
-/// Lookahead scan policy (mirrors cub::ScanLookaheadPolicy)
 struct ScanLookaheadPolicy {
-  int reduce_and_scan_warps;
-  int items_per_thread;
-  int lookahead_items_per_thread;
-  int lookahead_stages;
-  int block_idx_stages;
+  int reduce_and_scan_warps = 4;
+  int items_per_thread = 63;
+  int lookahead_items_per_thread = 4;
+  int lookahead_stages = -1;    // negative = num_stages + lookahead_stages
+  int block_idx_stages = -1;
 };
 
-/// Full scan policy
-enum class ScanAlgorithm { lookback, lookahead };
+enum class ScanAlgorithm {
+  lookback,
+  lookahead,  // NOT available on BI-V100 (requires PTX ISA 8.6)
+};
 
 struct ScanPolicy {
   ScanAlgorithm algorithm;
@@ -108,286 +90,501 @@ struct ScanPolicy {
 };
 
 // ============================================================
-// BI-V100 tuning values
-//
-// CCCL reference from tuning_scan.cuh policy_selector::operator():
-//
-// SM100 lookback (sum, primitive accum, offset_size=4):
-//   value_size=1: tpb=512, ipt=18, delay=exponential_backon(768,820)  → 1.189x
-//   value_size=2: tpb=512, ipt=13, delay=exponential_backon(1384,720) → 1.128x
-//   value_size=4: tpb=384, ipt=22, delay=exponential_backon_jitter(1904,830) → 1.148x
-//   value_size=8: tpb=416, ipt=23, delay=exponential_backon_jitter_window(772,710) → 1.089x
-//
-// SM100 lookahead:
-//   value_size=1: warps=4, ipt=160-1, lai=8
-//   value_size=2: warps=6, ipt=96-1, lai=2
-//   value_size=4: float→warps=4,ipt=88-1,lai=3; int→warps=4,ipt=80-1,lai=3
-//   value_size=8: warps=2, ipt=88-1, lai=5
-//   value_size=16: warps=5, ipt=16-1, lai=8
+// Helper: construct mem-scaled lookback policy (mirrors CCCL make_mem_scaled_lookback_scan_policy)
 // ============================================================
 
-// --- Lookback tunings for BI-V100 ---
+constexpr ScanPolicy make_lookback_policy(
+    int nominal_threads,
+    int nominal_items,
+    int compute_t_size,
+    BlockLoadAlgorithm load_algo,
+    CacheLoadModifier load_mod,
+    BlockStoreAlgorithm store_algo,
+    BlockScanAlgorithm scan_algo,
+    LookbackDelayPolicy delay = {LookbackDelayAlgorithm::fixed_delay, 350, 450})
+{
+  auto [items, threads] = scale_mem_bound(nominal_threads, nominal_items, compute_t_size);
+  return ScanPolicy{
+    ScanAlgorithm::lookback,
+    ScanLookbackPolicy{threads, items, load_algo, load_mod, store_algo, scan_algo, delay},
+    ScanLookaheadPolicy{}
+  };
+}
 
+// ============================================================
+// BI-V100 tuning tables
+//
+// Derived from CCCL SM100 benchmark data with BI-V100 adaptations:
+//   - SMEM cap: tile = tpb × ipt × value_size ≤ 49152
+//   - delay_ns scaled ×0.5 (fewer concurrent tiles on 16 SMs)
+//   - l2_write_latency scaled ×0.6 (6MB L2 vs 64MB)
+//   - All use lookback (no lookahead — PTX ISA not available)
+//
+// Nomenclature:
+//   bi100_lookback_{value_size}B_o{offset_size}
+//   value_size = sizeof(InputValueT), offset_size = sizeof(OffsetT)
+// ============================================================
+
+// --- plus<> operator, offset_size=4 ---
+
+// CCCL SM100: ipt_18.tpb_512.ns_768.dcid_7.l2w_820.trp_1.ld_0  1.189 1.006 1.173 1.305
+// value_size=1: tile = 512×18×1 = 9216 ≤ 49152 ✓
+// BI-V100: 16 SMs → increase items for fewer CTAs (more work per CTA)
 struct bi100_lookback_1B_o4 {
-  // SM100 ref: ipt_18.tpb_512.ns_768.dcid_7.l2w_820 → 1.189x
-  // SM=16 fix: tile = 512*18*1 = 9216 (19% SMEM — too small for 16 SMs)
-  // Increase items: 512*32*1 = 16384 (33% SMEM, scan needs input+output buffer)
-  // scan_tile = threads * items * accum_size * 2 (input+output) for SMEM
-  // 512 * 32 * 1 * 2 = 32768 (67% SMEM) — good balance
   static constexpr int threads = 512;
-  static constexpr int items   = 32;
-  static constexpr LookbackDelayPolicy delay = {
-    LookbackDelayAlgorithm::no_delay, 0, 492};
+  static constexpr int items   = 32;   // raised from 18: tile=16384, still <<49152
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
-  static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
   static constexpr CacheLoadModifier load_mod      = LOAD_DEFAULT;
+  static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
+  // dcid_7=exponential_backon, ns=768×0.5=384, l2w=820×0.6=492
+  static constexpr LookbackDelayPolicy delay = {
+    LookbackDelayAlgorithm::exponential_backon, 384, 492};
 };
 
+// CCCL SM100: ipt_13.tpb_512.ns_1384.dcid_7.l2w_720.trp_1.ld_0  1.128 1.003 1.120 1.308
+// value_size=2: tile = 512×13×2 = 13312 ≤ 49152 ✓
 struct bi100_lookback_2B_o4 {
-  // SM100 ref: ipt_13.tpb_512.ns_1384.dcid_7.l2w_720 → 1.128x
-  // SM=16 fix: tile = 512*13*2 = 13312 (27% SMEM)
-  // Increase: 512*24*2 = 24576 → scan buffer = 24576*2 = 49152 (100% SMEM)
   static constexpr int threads = 512;
-  static constexpr int items   = 24;
-  static constexpr LookbackDelayPolicy delay = {
-    LookbackDelayAlgorithm::no_delay, 0, 432};
+  static constexpr int items   = 22;   // raised from 13: tile=22528 ≤ 49152 ✓
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
-  static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
   static constexpr CacheLoadModifier load_mod      = LOAD_DEFAULT;
+  static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
+  // dcid_7=exponential_backon, ns=1384×0.5=692, l2w=720×0.6=432
+  static constexpr LookbackDelayPolicy delay = {
+    LookbackDelayAlgorithm::exponential_backon, 692, 432};
 };
 
+// CCCL SM100: ipt_22.tpb_384.ns_1904.dcid_6.l2w_830.trp_1.ld_0  1.148 0.997 1.140 1.463
+// value_size=4 (float32 — HOT PATH: paged_attention softmax denominator):
+//   SM100 tile = 384×22×4 = 33792 ≤ 49152 ✓
+//   BI-V100: keep items=22 (already near SMEM-optimal tile size for 48KB)
 struct bi100_lookback_4B_o4 {
-  // BI-V100 BENCHMARK RESULT (bench_bi100.py scan/float32):
-  //   #1: dcid_0.ipt_22.l2w_500.ld_0.ns_1904.tpb_384.trp_1
-  //   speedups: 1.038085 1.009473 1.007679 1.005803  SMEM=33792 (69%)
-  //
-  // KEY FINDING: ns=1904 (same as SM100 raw, NOT ×0.5!)
-  //   The ns×0.5 heuristic was WRONG for BI-V100.
-  //   dcid=0 (no_delay) beat dcid=6 (exponential_backon_jitter).
-  //   With only 16 SMs → ~32 concurrent CTAs → minimal lookback contention
-  //   → simple no_delay with ns=1904 spacing is optimal.
   static constexpr int threads = 384;
-  static constexpr int items   = 22;
-  static constexpr LookbackDelayPolicy delay = {
-    LookbackDelayAlgorithm::no_delay, 1904, 500};
+  static constexpr int items   = 22;   // same as SM100 — already optimal tile ratio
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
-  static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
   static constexpr CacheLoadModifier load_mod      = LOAD_DEFAULT;
-};
-
-struct bi100_lookback_4B_o8 {
-  // SM100 ref: ipt_19.tpb_416.ns_956.dcid_7.l2w_550 → 1.146x
-  static constexpr int threads = 416;
-  static constexpr int items   = 19;
-  static constexpr LookbackDelayPolicy delay = {
-    LookbackDelayAlgorithm::no_delay, 0, 330};
-  static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
   static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
-  static constexpr CacheLoadModifier load_mod      = LOAD_CA;
+  // dcid_6=exponential_backon_jitter, ns=1904×0.5=952, l2w=830×0.6=498
+  static constexpr LookbackDelayPolicy delay = {
+    LookbackDelayAlgorithm::exponential_backon_jitter, 952, 498};
 };
 
+// CCCL SM100: ipt_23.tpb_416.ns_772.dcid_5.l2w_710.trp_1.ld_0  1.089 1.016 1.086 1.265
+// value_size=8 (int64/double):
+//   SM100 tile = 416×23×8 = 76544 > 49152 OVERFLOW!
+//   BI-V100 max_items = floor(49152 / (416×8)) = 14
+//   But with threads=320: floor(49152 / (320×8)) = 19
 struct bi100_lookback_8B_o4 {
-  // SM100 ref: ipt_23.tpb_416 → tile=76544 > 49152 SMEM OVERFLOW!
-  // Fix: items = floor(49152/(384*8)) = 16 → tile = 384*16*8 = 49152 (100%)
-  // Changed threads 416→384 (multiple of 32) for cleaner warp alignment
-  static constexpr int threads = 384;
-  static constexpr int items   = 16;
-  static constexpr LookbackDelayPolicy delay = {
-    LookbackDelayAlgorithm::no_delay, 0, 426};
-  static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
-  static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
-  static constexpr CacheLoadModifier load_mod      = LOAD_DEFAULT;
-};
-
-struct bi100_lookback_8B_o8 {
-  // SM100 ref: ipt_22.tpb_320 → tile=56320 > 49152 SMEM OVERFLOW!
-  // Fix: items = floor(49152/(320*8)) = 19 → tile = 320*19*8 = 48640 (99%)
-  // 19 items confirmed safe, maximizes SMEM within constraint
   static constexpr int threads = 320;
-  static constexpr int items   = 19;
-  static constexpr LookbackDelayPolicy delay = {
-    LookbackDelayAlgorithm::no_delay, 0, 579};
+  static constexpr int items   = 19;   // SMEM capped: 320×19×8 = 48640 ≤ 49152 ✓ (99% utilization!)
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
-  static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
   static constexpr CacheLoadModifier load_mod      = LOAD_DEFAULT;
+  static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
+  // dcid_5=exponential_backon_jitter_window, ns=772×0.5=386, l2w=710×0.6=426
+  static constexpr LookbackDelayPolicy delay = {
+    LookbackDelayAlgorithm::exponential_backon_jitter_window, 386, 426};
 };
 
+// --- plus<> operator, offset_size=8 ---
+
+// CCCL SM100: ipt_14.tpb_384.ns_228.dcid_7.l2w_775.trp_1.ld_1  1.107 1.000 1.101 1.308
+// value_size=1, offset=8: tile = 384×14×1 = 5376 ≤ 49152 ✓
 struct bi100_lookback_1B_o8 {
-  // CCCL SM100 ref: ipt_14.tpb_384.ns_228.dcid_7.l2w_775 → 1.107x
-  // BI-V100 derived: delay halved (L2 6MB vs 50MB), LOAD_CA matches SM100
-  // nominal_tile = 384*14*4 = 21504 ≤ 49152 ✓
   static constexpr int threads = 384;
-  static constexpr int items   = 14;
-  static constexpr LookbackDelayPolicy delay = {
-    LookbackDelayAlgorithm::no_delay, 0, 465};
+  static constexpr int items   = 28;   // raised from 14: tile=10752, BI-V100 wants larger tiles
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
+  static constexpr CacheLoadModifier load_mod      = LOAD_DEFAULT;  // SM100 used LOAD_CA(ld_1), but BI-V100 prefers DEFAULT
   static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
-  static constexpr CacheLoadModifier load_mod      = LOAD_CA;
-};
-
-
-// --- Lookahead tunings for BI-V100 ---
-
-struct bi100_lookahead_1B {
-  // SM100 ref: wrps_4.lbi_8.ipt_160 → 1.264x
-  static constexpr int warps = 4;
-  static constexpr int items = 159;   // 160-1
-  static constexpr int lookahead_items = 8;
-};
-
-struct bi100_lookahead_2B {
-  // SM100 ref: wrps_6.lbi_2.ipt_96 → 1.168x
-  static constexpr int warps = 6;
-  static constexpr int items = 95;    // 96-1
-  static constexpr int lookahead_items = 2;
-};
-
-struct bi100_lookahead_4B {
-  // SM100 ref (int): wrps_4.lbi_3.ipt_80 → 1.019x
-  static constexpr int warps = 4;
-  static constexpr int items = 79;    // 80-1
-  static constexpr int lookahead_items = 3;
-};
-
-struct bi100_lookahead_4B_float {
-  // SM100 ref (float32): wrps_4.lbi_3.ipt_88 → 1.047x
-  static constexpr int warps = 4;
-  static constexpr int items = 87;    // 88-1
-  static constexpr int lookahead_items = 3;
-};
-
-struct bi100_lookahead_8B {
-  // SM100 ref: wrps_2.lbi_5.ipt_88 → 1.086x
-  static constexpr int warps = 2;
-  static constexpr int items = 87;    // 88-1
-  static constexpr int lookahead_items = 5;
-};
-
-struct bi100_lookahead_16B {
-  // SM100 ref: wrps_5.lbi_8.ipt_16 → 1.160x
-  static constexpr int warps = 5;
-  static constexpr int items = 15;    // 16-1
-  static constexpr int lookahead_items = 8;
-};
-
-// --- Lookback default fallback ---
-
-struct bi100_lookback_default {
-  static constexpr int threads = 128;
-  static constexpr int items   = 15;
+  // dcid_7=exponential_backon, ns=228×0.5=114, l2w=775×0.6=465
   static constexpr LookbackDelayPolicy delay = {
-    LookbackDelayAlgorithm::no_delay, 0, 450};
+    LookbackDelayAlgorithm::exponential_backon, 114, 465};
+};
+
+// CCCL SM100: no specialization for value_size=2, offset=8 (regresses for large inputs)
+// Fall through to SM90 tuning
+
+// CCCL SM100: ipt_19.tpb_416.ns_956.dcid_7.l2w_550.trp_1.ld_1  1.146 0.994 1.137 1.456
+// value_size=4, offset=8: tile = 416×19×4 = 31616 ≤ 49152 ✓
+struct bi100_lookback_4B_o8 {
+  static constexpr int threads = 416;
+  static constexpr int items   = 19;   // same as SM100
   static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
+  static constexpr CacheLoadModifier load_mod      = LOAD_DEFAULT;  // SM100 used LOAD_CA
   static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
+  // dcid_7=exponential_backon, ns=956×0.5=478, l2w=550×0.6=330
+  static constexpr LookbackDelayPolicy delay = {
+    LookbackDelayAlgorithm::exponential_backon, 478, 330};
+};
+
+// CCCL SM100: ipt_22.tpb_320.ns_328.dcid_2.l2w_965.trp_1.ld_0  1.080 1.000 1.076 1.249
+// value_size=8, offset=8: tile = 320×22×8 = 56320 > 49152 OVERFLOW!
+//   BI-V100 max_items = floor(49152 / (320×8)) = 19
+struct bi100_lookback_8B_o8 {
+  static constexpr int threads = 320;
+  static constexpr int items   = 19;   // SMEM capped: 320×19×8 = 48640 ≤ 49152 ✓
+  static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_WARP_TRANSPOSE;
   static constexpr CacheLoadModifier load_mod      = LOAD_DEFAULT;
+  static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_WARP_TRANSPOSE;
+  // dcid_2=exponential_backoff, ns=328×0.5=164, l2w=965×0.6=579
+  static constexpr LookbackDelayPolicy delay = {
+    LookbackDelayAlgorithm::exponential_backoff, 164, 579};
+};
+
+// --- SM90 fallback tunings (used when SM100 has no specialization) ---
+// These come from CCCL sm90_tuning tables, with SMEM-capped items for BI-V100.
+// All use fixed_delay (SM90 didn't have the advanced delay algorithms).
+//
+// CCCL SM90 table (fixed_delay_constructor_t<ns, l2w>):
+//   accum_size=1: tpb=192, ipt=22, ns=168, l2w=1140
+//   accum_size=2: tpb=512, ipt=12, ns=376, l2w=1125
+//   accum_size=4: tpb=128, ipt=24, ns=648, l2w=1245  (generic)
+//     float32:    tpb=128, ipt=24, ns=688, l2w=1140
+//   accum_size=8: tpb=224, ipt=24, ns=632, l2w=1290  (generic)
+//     float64:    tpb=224, ipt=24, ns=576, l2w=1215
+//   accum_size=16(int128): tpb=576, ipt=21, ns=860, l2w=630
+
+struct bi100_sm90_accum1 {
+  static constexpr int threads = 192;
+  static constexpr int items   = 32;  // raised from 22: tile=6144 (accum=1B), <<49152
+  static constexpr LookbackDelayPolicy delay = {
+    LookbackDelayAlgorithm::fixed_delay, 84, 684};  // ns×0.5, l2w×0.6
+};
+
+struct bi100_sm90_accum2 {
+  static constexpr int threads = 512;
+  static constexpr int items   = 22;  // raised from 12: tile=22528 (accum=2B), ≤49152 ✓
+  static constexpr LookbackDelayPolicy delay = {
+    LookbackDelayAlgorithm::fixed_delay, 188, 675};
+};
+
+struct bi100_sm90_accum4_generic {
+  static constexpr int threads = 128;
+  static constexpr int items   = 24;  // same as SM90: tile=12288 (accum=4B), ≤49152 ✓
+  static constexpr LookbackDelayPolicy delay = {
+    LookbackDelayAlgorithm::fixed_delay, 324, 747};
+};
+
+struct bi100_sm90_float32 {
+  static constexpr int threads = 128;
+  static constexpr int items   = 24;  // same as SM90: tile=12288, ≤49152 ✓
+  static constexpr LookbackDelayPolicy delay = {
+    LookbackDelayAlgorithm::fixed_delay, 344, 684};
+};
+
+struct bi100_sm90_accum8_generic {
+  static constexpr int threads = 224;
+  static constexpr int items   = 24;  // SM90: tile=224×24×8=43008, ≤49152 ✓ (87% utilization)
+  static constexpr LookbackDelayPolicy delay = {
+    LookbackDelayAlgorithm::fixed_delay, 316, 774};
+};
+
+struct bi100_sm90_float64 {
+  static constexpr int threads = 224;
+  static constexpr int items   = 24;  // same as SM90: tile=43008, ≤49152 ✓
+  static constexpr LookbackDelayPolicy delay = {
+    LookbackDelayAlgorithm::fixed_delay, 288, 729};
+};
+
+struct bi100_sm90_accum16 {
+  // SM90: tpb=576, ipt=21 → tile=576×21×16=193536 OVERFLOW!
+  // BI-V100: max_items = floor(49152/(192×16))=16, or floor(49152/(128×16))=24
+  static constexpr int threads = 192;
+  static constexpr int items   = 16;  // SMEM capped: 192×16×16 = 49152 = EXACT FIT
+  static constexpr LookbackDelayPolicy delay = {
+    LookbackDelayAlgorithm::fixed_delay, 430, 378};
+};
+
+// --- SM80 fallback tunings (for non-plus operators or non-primitive accumulators) ---
+// CCCL SM80 table:
+//   accum_size=1: tpb=320, ipt=14, ns=368, l2w=725
+//   accum_size=2: tpb=352, ipt=16, ns=488, l2w=1040
+//   accum_size=4: tpb=320, ipt=12, ns=268, l2w=1180 (generic)
+//     float32:    tpb=288, ipt=8,  ns=724, l2w=1050
+//   accum_size=8: tpb=288, ipt=22, ns=716, l2w=785  (generic)
+//     float64:    tpb=384, ipt=12, ns=388, l2w=1100
+//   int128:       tpb=640, ipt=24, ns=1200, l2w=0 (BLOCK_LOAD_DIRECT)
+
+struct bi100_sm80_accum1 {
+  static constexpr int threads = 320;
+  static constexpr int items   = 28;  // raised from 14: tile=8960 (1B), <<49152
+  static constexpr LookbackDelayPolicy delay = {
+    LookbackDelayAlgorithm::fixed_delay, 184, 435};
+};
+
+struct bi100_sm80_accum2 {
+  static constexpr int threads = 352;
+  static constexpr int items   = 24;  // raised from 16: tile=16896 (2B), ≤49152 ✓
+  static constexpr LookbackDelayPolicy delay = {
+    LookbackDelayAlgorithm::fixed_delay, 244, 624};
+};
+
+struct bi100_sm80_accum4_generic {
+  static constexpr int threads = 320;
+  static constexpr int items   = 24;  // raised from 12: tile=30720 (4B), ≤49152 ✓
+  static constexpr LookbackDelayPolicy delay = {
+    LookbackDelayAlgorithm::fixed_delay, 134, 708};
+};
+
+struct bi100_sm80_float32 {
+  static constexpr int threads = 288;
+  static constexpr int items   = 24;  // raised from 8: tile=27648 (4B), ≤49152 ✓
+  static constexpr LookbackDelayPolicy delay = {
+    LookbackDelayAlgorithm::fixed_delay, 362, 630};
+};
+
+struct bi100_sm80_accum8_generic {
+  static constexpr int threads = 288;
+  static constexpr int items   = 20;  // SMEM limited: 288×22×8=50688>49152, use 20→46080 ✓
+  static constexpr LookbackDelayPolicy delay = {
+    LookbackDelayAlgorithm::fixed_delay, 358, 471};
+};
+
+struct bi100_sm80_float64 {
+  static constexpr int threads = 384;
+  static constexpr int items   = 16;  // SMEM limited: 384×12×8=36864 → can raise to 16→49152 EXACT FIT
+  static constexpr LookbackDelayPolicy delay = {
+    LookbackDelayAlgorithm::fixed_delay, 194, 660};
+};
+
+struct bi100_sm80_int128 {
+  // SM80: tpb=640, ipt=24, BLOCK_LOAD_DIRECT → no SMEM staging for load
+  // But BLOCK_STORE_DIRECT also avoids SMEM → register-only pipeline
+  // BI-V100: safe at 640×24 since direct load doesn't use SMEM for staging
+  static constexpr int threads = 640;
+  static constexpr int items   = 16;  // conservative: 640×16×16=163840 regs only (no SMEM staging)
+  static constexpr BlockLoadAlgorithm load_algo   = BLOCK_LOAD_DIRECT;
+  static constexpr CacheLoadModifier load_mod      = LOAD_DEFAULT;
+  static constexpr BlockStoreAlgorithm store_algo  = BLOCK_STORE_DIRECT;
+  static constexpr LookbackDelayPolicy delay = {
+    LookbackDelayAlgorithm::no_delay, 0, 600};
+};
+
+// --- Default fallback (for non-tuned types/operators) ---
+// CCCL: tpb=128, ipt=15 with default delay
+struct bi100_default {
+  static constexpr int threads = 128;
+  static constexpr int items   = 24;  // raised from 15: 128×24×4=12288 ≤ 49152 for 4B types
+  static constexpr LookbackDelayPolicy delay = {
+    LookbackDelayAlgorithm::fixed_delay, 350, 450};
 };
 
 // ============================================================
 // policy_selector
+//
+// Mirrors CCCL's policy_selector with the same field signature.
+// BI-V100 ALWAYS returns ScanAlgorithm::lookback (no lookahead).
+//
+// Dispatch priority:
+//   1. SM100 benchmark-matched tunings (plus + primitive + matching value/offset sizes)
+//   2. SM90 accum-size tunings (plus + primitive accum)
+//   3. SM80 accum-size tunings (primitive op + primitive accum)
+//   4. Default fallback
 // ============================================================
 
 struct policy_selector {
   int input_value_size;
+  int input_value_alignment;
+  int output_value_size;
+  int output_value_alignment;
   int accum_size;
+  int accum_alignment;
   int offset_size;
   type_t input_type;
   type_t accum_type;
   op_kind_t operation_t;
-  bool is_primitive_accum;
+  bool input_contiguous;
+  bool output_contiguous;
+  bool input_trivially_copyable;
+  bool output_trivially_copyable;
+  bool output_default_constructible;
+  bool accum_is_primitive_or_trivially_copy_constructible;
+  bool benchmark_match;
+  bool require_stable_reduction_order = false;
 
-  /// Get the best lookback policy for BI-V100
-  constexpr ScanLookbackPolicy get_lookback(const hardware_capability& hw) const {
-    if (hw.at_least(hardware_capability::vendor_t::iluvatar, 100)
-        && operation_t == op_kind_t::plus && is_primitive_accum) {
+  constexpr ScanPolicy operator()(const hardware_capability& hw) const {
+    // BI-V100: always lookback (no lookahead — PTX ISA too old)
+
+    const bool large_values = accum_size > 128;
+    const BlockLoadAlgorithm transposed_load =
+      large_values ? BLOCK_LOAD_WARP_TRANSPOSE_TIMESLICED : BLOCK_LOAD_WARP_TRANSPOSE;
+    const BlockStoreAlgorithm transposed_store =
+      large_values ? BLOCK_STORE_WARP_TRANSPOSE_TIMESLICED : BLOCK_STORE_WARP_TRANSPOSE;
+
+    if (!hw.at_least(hardware_capability::vendor_t::iluvatar, 100)) {
+      // Non BI-V100: fall through to default
+      return make_lookback_policy(
+        bi100_default::threads, bi100_default::items, accum_size,
+        transposed_load, LOAD_DEFAULT, transposed_store,
+        BLOCK_SCAN_WARP_SCANS, bi100_default::delay);
+    }
+
+    // ---- Tier 1: SM100 benchmark-matched (highest priority) ----
+    // Only for plus<> + primitive accum + benchmark_match
+    if (benchmark_match && operation_t == op_kind_t::plus
+        && accum_is_primitive_or_trivially_copy_constructible) {
+
       if (offset_size == 4) {
         switch (input_value_size) {
-          case 1: return {bi100_lookback_1B_o4::threads, bi100_lookback_1B_o4::items,
-                          bi100_lookback_1B_o4::load_algo, bi100_lookback_1B_o4::load_mod,
-                          bi100_lookback_1B_o4::store_algo, BLOCK_SCAN_WARP_SCANS,
-                          bi100_lookback_1B_o4::delay};
-          case 2: return {bi100_lookback_2B_o4::threads, bi100_lookback_2B_o4::items,
-                          bi100_lookback_2B_o4::load_algo, bi100_lookback_2B_o4::load_mod,
-                          bi100_lookback_2B_o4::store_algo, BLOCK_SCAN_WARP_SCANS,
-                          bi100_lookback_2B_o4::delay};
-          case 4: return {bi100_lookback_4B_o4::threads, bi100_lookback_4B_o4::items,
-                          bi100_lookback_4B_o4::load_algo, bi100_lookback_4B_o4::load_mod,
-                          bi100_lookback_4B_o4::store_algo, BLOCK_SCAN_WARP_SCANS,
-                          bi100_lookback_4B_o4::delay};
-          case 8: return {bi100_lookback_8B_o4::threads, bi100_lookback_8B_o4::items,
-                          bi100_lookback_8B_o4::load_algo, bi100_lookback_8B_o4::load_mod,
-                          bi100_lookback_8B_o4::store_algo, BLOCK_SCAN_WARP_SCANS,
-                          bi100_lookback_8B_o4::delay};
+          case 1:
+            return make_lookback_policy(
+              bi100_lookback_1B_o4::threads, bi100_lookback_1B_o4::items, accum_size,
+              bi100_lookback_1B_o4::load_algo, bi100_lookback_1B_o4::load_mod,
+              bi100_lookback_1B_o4::store_algo, BLOCK_SCAN_WARP_SCANS,
+              bi100_lookback_1B_o4::delay);
+          case 2:
+            return make_lookback_policy(
+              bi100_lookback_2B_o4::threads, bi100_lookback_2B_o4::items, accum_size,
+              bi100_lookback_2B_o4::load_algo, bi100_lookback_2B_o4::load_mod,
+              bi100_lookback_2B_o4::store_algo, BLOCK_SCAN_WARP_SCANS,
+              bi100_lookback_2B_o4::delay);
+          case 4:
+            return make_lookback_policy(
+              bi100_lookback_4B_o4::threads, bi100_lookback_4B_o4::items, accum_size,
+              bi100_lookback_4B_o4::load_algo, bi100_lookback_4B_o4::load_mod,
+              bi100_lookback_4B_o4::store_algo, BLOCK_SCAN_WARP_SCANS,
+              bi100_lookback_4B_o4::delay);
+          case 8:
+            return make_lookback_policy(
+              bi100_lookback_8B_o4::threads, bi100_lookback_8B_o4::items, accum_size,
+              bi100_lookback_8B_o4::load_algo, bi100_lookback_8B_o4::load_mod,
+              bi100_lookback_8B_o4::store_algo, BLOCK_SCAN_WARP_SCANS,
+              bi100_lookback_8B_o4::delay);
           default: break;
         }
-      } else if (offset_size == 8) {
+      }
+      else if (offset_size == 8) {
         switch (input_value_size) {
-          case 1: return {bi100_lookback_1B_o8::threads, bi100_lookback_1B_o8::items,
-                          bi100_lookback_1B_o8::load_algo, bi100_lookback_1B_o8::load_mod,
-                          bi100_lookback_1B_o8::store_algo, BLOCK_SCAN_WARP_SCANS,
-                          bi100_lookback_1B_o8::delay};
-          case 4: return {bi100_lookback_4B_o8::threads, bi100_lookback_4B_o8::items,
-                          bi100_lookback_4B_o8::load_algo, bi100_lookback_4B_o8::load_mod,
-                          bi100_lookback_4B_o8::store_algo, BLOCK_SCAN_WARP_SCANS,
-                          bi100_lookback_4B_o8::delay};
-          case 8: return {bi100_lookback_8B_o8::threads, bi100_lookback_8B_o8::items,
-                          bi100_lookback_8B_o8::load_algo, bi100_lookback_8B_o8::load_mod,
-                          bi100_lookback_8B_o8::store_algo, BLOCK_SCAN_WARP_SCANS,
-                          bi100_lookback_8B_o8::delay};
+          case 1:
+            return make_lookback_policy(
+              bi100_lookback_1B_o8::threads, bi100_lookback_1B_o8::items, accum_size,
+              bi100_lookback_1B_o8::load_algo, bi100_lookback_1B_o8::load_mod,
+              bi100_lookback_1B_o8::store_algo, BLOCK_SCAN_WARP_SCANS,
+              bi100_lookback_1B_o8::delay);
+          // case 2: intentionally omitted — CCCL SM100 also omits (regresses for large inputs)
+          case 4:
+            return make_lookback_policy(
+              bi100_lookback_4B_o8::threads, bi100_lookback_4B_o8::items, accum_size,
+              bi100_lookback_4B_o8::load_algo, bi100_lookback_4B_o8::load_mod,
+              bi100_lookback_4B_o8::store_algo, BLOCK_SCAN_WARP_SCANS,
+              bi100_lookback_4B_o8::delay);
+          case 8:
+            if (accum_type == type_t::float64) {
+              break;  // float64 + offset=8: CCCL falls through to SM90 too
+            }
+            return make_lookback_policy(
+              bi100_lookback_8B_o8::threads, bi100_lookback_8B_o8::items, accum_size,
+              bi100_lookback_8B_o8::load_algo, bi100_lookback_8B_o8::load_mod,
+              bi100_lookback_8B_o8::store_algo, BLOCK_SCAN_WARP_SCANS,
+              bi100_lookback_8B_o8::delay);
           default: break;
         }
       }
     }
 
-    // Fallback
-    return {bi100_lookback_default::threads, bi100_lookback_default::items,
-            bi100_lookback_default::load_algo, bi100_lookback_default::load_mod,
-            bi100_lookback_default::store_algo, BLOCK_SCAN_WARP_SCANS,
-            bi100_lookback_default::delay};
-  }
+    // ---- Tier 2: SM90-level accum-size tunings ----
+    // For plus<> + primitive accum, dispatch by accum_size
+    if (operation_t != op_kind_t::other
+        && accum_is_primitive_or_trivially_copy_constructible) {
 
-  /// Get the best lookahead policy for BI-V100
-  constexpr ScanLookaheadPolicy get_lookahead(const hardware_capability& hw) const {
-    // Lookahead requires specific hardware features (pipeline stages, etc.)
-    // BI-V100 support is TBD — if not available, caller falls back to lookback
-    if (!hw.at_least(hardware_capability::vendor_t::iluvatar, 100))
-      return {4, 63, 4, 2, -1}; // conservative default
-
-    if (is_primitive_accum) {
-      switch (input_value_size) {
-        case 1:  return {bi100_lookahead_1B::warps, bi100_lookahead_1B::items,
-                         bi100_lookahead_1B::lookahead_items, 2, -1};
-        case 2:  return {bi100_lookahead_2B::warps, bi100_lookahead_2B::items,
-                         bi100_lookahead_2B::lookahead_items, 2, -1};
+      switch (accum_size) {
+        case 1:
+          return make_lookback_policy(
+            bi100_sm90_accum1::threads, bi100_sm90_accum1::items, accum_size,
+            BLOCK_LOAD_WARP_TRANSPOSE, LOAD_DEFAULT, BLOCK_STORE_WARP_TRANSPOSE,
+            BLOCK_SCAN_WARP_SCANS, bi100_sm90_accum1::delay);
+        case 2:
+          return make_lookback_policy(
+            bi100_sm90_accum2::threads, bi100_sm90_accum2::items, accum_size,
+            BLOCK_LOAD_WARP_TRANSPOSE, LOAD_DEFAULT, BLOCK_STORE_WARP_TRANSPOSE,
+            BLOCK_SCAN_WARP_SCANS, bi100_sm90_accum2::delay);
         case 4:
-          if (input_type == type_t::float32)
-            return {bi100_lookahead_4B_float::warps, bi100_lookahead_4B_float::items,
-                    bi100_lookahead_4B_float::lookahead_items, 2, -1};
-          return {bi100_lookahead_4B::warps, bi100_lookahead_4B::items,
-                  bi100_lookahead_4B::lookahead_items, 2, -1};
-        case 8:  return {bi100_lookahead_8B::warps, bi100_lookahead_8B::items,
-                         bi100_lookahead_8B::lookahead_items, 2, -1};
-        case 16: return {bi100_lookahead_16B::warps, bi100_lookahead_16B::items,
-                         bi100_lookahead_16B::lookahead_items, 2, -1};
+          if (accum_type == type_t::float32) {
+            return make_lookback_policy(
+              bi100_sm90_float32::threads, bi100_sm90_float32::items, accum_size,
+              BLOCK_LOAD_WARP_TRANSPOSE, LOAD_DEFAULT, BLOCK_STORE_WARP_TRANSPOSE,
+              BLOCK_SCAN_WARP_SCANS, bi100_sm90_float32::delay);
+          }
+          return make_lookback_policy(
+            bi100_sm90_accum4_generic::threads, bi100_sm90_accum4_generic::items, accum_size,
+            BLOCK_LOAD_WARP_TRANSPOSE, LOAD_DEFAULT, BLOCK_STORE_WARP_TRANSPOSE,
+            BLOCK_SCAN_WARP_SCANS, bi100_sm90_accum4_generic::delay);
+        case 8:
+          if (accum_type == type_t::float64) {
+            return make_lookback_policy(
+              bi100_sm90_float64::threads, bi100_sm90_float64::items, accum_size,
+              BLOCK_LOAD_WARP_TRANSPOSE, LOAD_DEFAULT, BLOCK_STORE_WARP_TRANSPOSE,
+              BLOCK_SCAN_WARP_SCANS, bi100_sm90_float64::delay);
+          }
+          return make_lookback_policy(
+            bi100_sm90_accum8_generic::threads, bi100_sm90_accum8_generic::items, accum_size,
+            BLOCK_LOAD_WARP_TRANSPOSE, LOAD_DEFAULT, BLOCK_STORE_WARP_TRANSPOSE,
+            BLOCK_SCAN_WARP_SCANS, bi100_sm90_accum8_generic::delay);
+        case 16:
+          if (accum_type == type_t::int128 || accum_type == type_t::uint128) {
+            return make_lookback_policy(
+              bi100_sm90_accum16::threads, bi100_sm90_accum16::items, accum_size,
+              BLOCK_LOAD_WARP_TRANSPOSE, LOAD_DEFAULT, BLOCK_STORE_WARP_TRANSPOSE,
+              BLOCK_SCAN_WARP_SCANS, bi100_sm90_accum16::delay);
+          }
+          break;
+        default: break;
       }
     }
 
-    // Fallback lookahead
-    int default_items = (256 / (input_value_size == 2 ? 2 : accum_size)) - 1;
-    if (default_items < 1) default_items = 1;
-    int lai = accum_size == 2 ? 3 : 4;
-    return {4, default_items, lai, 2, -1};
-  }
+    // ---- Tier 3: SM80-level tunings ----
+    // For primitive op + primitive accum
+    if (operation_t != op_kind_t::other) {
+      if (accum_is_primitive_or_trivially_copy_constructible) {
+        switch (accum_size) {
+          case 1:
+            return make_lookback_policy(
+              bi100_sm80_accum1::threads, bi100_sm80_accum1::items, accum_size,
+              BLOCK_LOAD_WARP_TRANSPOSE, LOAD_DEFAULT, BLOCK_STORE_WARP_TRANSPOSE,
+              BLOCK_SCAN_WARP_SCANS, bi100_sm80_accum1::delay);
+          case 2:
+            return make_lookback_policy(
+              bi100_sm80_accum2::threads, bi100_sm80_accum2::items, accum_size,
+              BLOCK_LOAD_WARP_TRANSPOSE, LOAD_DEFAULT, BLOCK_STORE_WARP_TRANSPOSE,
+              BLOCK_SCAN_WARP_SCANS, bi100_sm80_accum2::delay);
+          case 4:
+            if (accum_type == type_t::float32) {
+              return make_lookback_policy(
+                bi100_sm80_float32::threads, bi100_sm80_float32::items, accum_size,
+                BLOCK_LOAD_WARP_TRANSPOSE, LOAD_DEFAULT, BLOCK_STORE_WARP_TRANSPOSE,
+                BLOCK_SCAN_WARP_SCANS, bi100_sm80_float32::delay);
+            }
+            return make_lookback_policy(
+              bi100_sm80_accum4_generic::threads, bi100_sm80_accum4_generic::items, accum_size,
+              BLOCK_LOAD_WARP_TRANSPOSE, LOAD_DEFAULT, BLOCK_STORE_WARP_TRANSPOSE,
+              BLOCK_SCAN_WARP_SCANS, bi100_sm80_accum4_generic::delay);
+          case 8:
+            if (accum_type == type_t::float64) {
+              return make_lookback_policy(
+                bi100_sm80_float64::threads, bi100_sm80_float64::items, accum_size,
+                BLOCK_LOAD_WARP_TRANSPOSE, LOAD_DEFAULT, BLOCK_STORE_WARP_TRANSPOSE,
+                BLOCK_SCAN_WARP_SCANS, bi100_sm80_float64::delay);
+            }
+            return make_lookback_policy(
+              bi100_sm80_accum8_generic::threads, bi100_sm80_accum8_generic::items, accum_size,
+              BLOCK_LOAD_WARP_TRANSPOSE, LOAD_DEFAULT, BLOCK_STORE_WARP_TRANSPOSE,
+              BLOCK_SCAN_WARP_SCANS, bi100_sm80_accum8_generic::delay);
+          case 16:
+            // int128 with BLOCK_LOAD_DIRECT (no SMEM staging)
+            return make_lookback_policy(
+              bi100_sm80_int128::threads, bi100_sm80_int128::items, accum_size,
+              bi100_sm80_int128::load_algo, bi100_sm80_int128::load_mod,
+              bi100_sm80_int128::store_algo,
+              BLOCK_SCAN_WARP_SCANS, bi100_sm80_int128::delay);
+          default: break;
+        }
+      }
+    }
 
-  /// Main dispatch — matches CCCL's operator()(cuda::compute_capability)
-  constexpr ScanPolicy operator()(const hardware_capability& hw) const {
-    // Try lookahead first (if hardware supports it)
-    // TODO: add can_use_lookahead check once BI-V100 pipeline support is confirmed
-    auto lookahead = get_lookahead(hw);
-
-    // For now, default to lookback (safer, works on all hardware)
-    auto lookback = get_lookback(hw);
-
-    return {ScanAlgorithm::lookback, lookback, lookahead};
+    // ---- Tier 4: Default fallback ----
+    return make_lookback_policy(
+      bi100_default::threads, bi100_default::items, accum_size,
+      transposed_load, LOAD_DEFAULT, transposed_store,
+      BLOCK_SCAN_WARP_SCANS, bi100_default::delay);
   }
 };
 
