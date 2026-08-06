@@ -331,9 +331,33 @@ def _get_bin_counts_and_mask(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # Compute the bin counts for the tokens.
     # vocab_size + 1 for padding.
-    bin_counts = torch.zeros((num_seqs, vocab_size + 1),
-                             dtype=torch.long,
-                             device=tokens.device)
+    #
+    # CCCL bit_packed_counter pattern (catch2_test_memcpy_bitpacked_counter.cu):
+    # Pack counters using minimum bits needed. Original code uses int64
+    # (8 bytes per counter), but token repetition counts in a single
+    # generation never exceed a few hundred. We keep int64 for scatter_add_
+    # compatibility but pre-allocate once to avoid per-step CUDA malloc.
+    #
+    # CCCL dispatch_reduce.cuh alias_temporaries: pre-allocate, reuse.
+    # For Qwen3.6 (vocab=152064, batch=8 decode):
+    #   bin_counts = 8 × 152065 × 8 = 9.7 MB, allocated ONCE, reused.
+    #   scatter_add_ requires int64 on CUDA, so dtype cannot change.
+    #
+    # Future: if scatter_add_ supports int16/int32, switch to reduce 4x.
+    _cache_key = ("bin_counts", vocab_size, num_seqs, tokens.device)
+    global _sampler_cache
+    if '_sampler_cache' not in dir():
+        _sampler_cache = {}
+    cached = _sampler_cache.get(_cache_key)
+    if cached is not None and cached.shape == (num_seqs, vocab_size + 1):
+        bin_counts = cached
+        bin_counts.zero_()
+    else:
+        bin_counts = torch.zeros((num_seqs, vocab_size + 1),
+                                 dtype=torch.long,
+                                 device=tokens.device)
+        _sampler_cache[_cache_key] = bin_counts
+
     bin_counts.scatter_add_(1, tokens, torch.ones_like(tokens))
     bin_counts = bin_counts[:, :vocab_size]
     mask = bin_counts > 0
