@@ -92,7 +92,9 @@ class PagedAttention:
         seq_lens: torch.Tensor,
         max_seq_len: int,
         kv_cache_dtype: str,
-        num_kv_heads: int,
+        num_kv_heads,  # Actually head_mapping tensor from xformers.py for V1,
+                       # or int num_kv_heads for V2. See _custom_ops.py signatures.
+                       # CCCL catch2_test_block_reduce.cu BlockDimY/Z ↔ GQA groups.
         scale: float,
         alibi_slopes: Optional[torch.Tensor],
         k_scale: float,
