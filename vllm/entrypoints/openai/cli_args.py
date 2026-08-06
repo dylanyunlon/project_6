@@ -213,6 +213,20 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         " into OpenAI API format, the name register in this plugin can be used "
         "in --tool-call-parser.")
 
+    # Reasoning parser: separates <think>...</think> reasoning from response.
+    # Qwen3 models emit reasoning tokens wrapped in <think> tags.
+    # This stub accepts the argument so the server can start; actual reasoning
+    # separation is handled at the output parsing level in serving_chat.py.
+    parser.add_argument(
+        "--reasoning-parser",
+        type=str,
+        default=None,
+        help=
+        "Select the reasoning parser for models that emit chain-of-thought "
+        "reasoning tokens (e.g. Qwen3 <think> tags). Currently supported: "
+        "qwen3. If not specified, reasoning tokens are included in the "
+        "response content.")
+
     parser = AsyncEngineArgs.add_cli_args(parser)
 
     parser.add_argument('--max-log-len',
