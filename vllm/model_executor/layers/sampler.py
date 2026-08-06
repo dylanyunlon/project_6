@@ -331,9 +331,31 @@ def _get_bin_counts_and_mask(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # Compute the bin counts for the tokens.
     # vocab_size + 1 for padding.
-    bin_counts = torch.zeros((num_seqs, vocab_size + 1),
-                             dtype=torch.long,
-                             device=tokens.device)
+    #
+    # CCCL counting_iterator.cu pattern: avoid unnecessary tensor allocation.
+    # thrust::counting_iterator generates [0, N) without storing it.
+    # Our equivalent: reuse bin_counts buffer across sampling calls instead
+    # of torch.zeros() each time (which triggers CUDA malloc).
+    #
+    # For Qwen3.6 (vocab=152064, batch=8 decode):
+    #   bin_counts = 8 × 152065 × 8 bytes = 9.7 MB per call
+    #   At ~200 decode steps/sec, that's ~1.9 GB/s of wasted CUDA malloc.
+    #
+    # CCCL dispatch_reduce.cuh alias_temporaries pattern: pre-allocate once.
+    _cache_key = ("bin_counts", vocab_size, num_seqs, tokens.device)
+    global _sampler_cache
+    if '_sampler_cache' not in dir():
+        _sampler_cache = {}
+    cached = _sampler_cache.get(_cache_key)
+    if cached is not None and cached.shape == (num_seqs, vocab_size + 1):
+        bin_counts = cached
+        bin_counts.zero_()
+    else:
+        bin_counts = torch.zeros((num_seqs, vocab_size + 1),
+                                 dtype=torch.long,
+                                 device=tokens.device)
+        _sampler_cache[_cache_key] = bin_counts
+
     bin_counts.scatter_add_(1, tokens, torch.ones_like(tokens))
     bin_counts = bin_counts[:, :vocab_size]
     mask = bin_counts > 0
