@@ -1,3 +1,4 @@
+#!/bin/bash
 # BI-V100 engine patches for Qwen3.6-35B-A3B (Qwen3_5 architecture)
 #
 # All modifications are FULL FILE REPLACEMENTS — no AST patch scripts.
