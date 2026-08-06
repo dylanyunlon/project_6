@@ -1,5 +1,29 @@
 // muh/include/muh/tuning/tuning_scan.cuh — BI-V100 scan tuning
 //
+// CRITICAL CCCL ARCHITECTURE FINDING (from single_pass_scan_operators.cuh):
+//
+//   template <int Delay, unsigned int GridThreshold = 500>
+//   _CCCL_DEVICE _CCCL_FORCEINLINE void delay() {
+//     if (gridDim.x < GridThreshold) {
+//       __threadfence_block();    // ← ALL BI-V100 scans take this path
+//     } else {
+//       __nanosleep(Delay);       // ← only fires when grid > 500 CTAs
+//     }
+//   }
+//
+// BI-V100: 16 SMs × ~10 CTAs/SM max = ~160 CTAs. ALWAYS < 500.
+// Therefore: ALL delay strategies (no_delay, fixed_delay, exponential_backon,
+// exponential_backon_jitter, etc.) collapse to __threadfence_block() on BI-V100.
+//
+// This means:
+//   1. The ns/dcid/l2w delay parameters are IRRELEVANT for BI-V100.
+//   2. bench_bi100.py's finding that no_delay is optimal is CORRECT BY DESIGN.
+//   3. The "ns×0.5, l2w×0.6" scaling heuristic was always a no-op on BI-V100.
+//   4. Tuning effort should focus on threads/items/load_algo, NOT delay params.
+//
+// This architectural insight came from reading cub/agent/single_pass_scan_operators.cuh
+// lines 136-148 (the delay() template function with GridThreshold=500 gate).
+//
 // CRITICAL INSIGHT FROM single_pass_scan_operators.cuh delay():
 //   The CCCL delay function has a runtime branch:
 //     if (gridDim.x < GridThreshold)     // GridThreshold = 500
