@@ -42,6 +42,14 @@ echo "[patch_ops] _custom_ops.py → / (SMEM 32KB→48KB fix)"
 cp ./paged_attn.py $V/attention/ops/paged_attn.py
 echo "[patch_ops] paged_attn.py → attention/ops/"
 
+# --- prefix_prefill.py: Triton-free prefix attention -------------------------
+# On BI-V100, Triton is not installed. This file provides the context_attention_fwd
+# function that paged_attn.py imports. Even though our paged_attn.py comments out
+# the Triton import, the base xformers.py may still try to import it.
+# Deploy it so the import doesn't crash — the function itself won't be called.
+cp ./prefix_prefill.py $V/attention/ops/prefix_prefill.py
+echo "[patch_ops] prefix_prefill.py → attention/ops/"
+
 # --- model_runner.py: prefix_cache_hit fix -----------------------------------
 # Bug: Case 1 (prefix_cache_len <= context_len) leaves prefix_cache_hit=True,
 # causing undersized block_tables in chunked prefill chunk 2+.
@@ -98,6 +106,14 @@ cp ./mamba_cache.py $V/model_executor/models/
 cp ./qwen3_5.py $V/model_executor/models/qwen3_5.py
 cp ./registry.py $V/model_executor/models/registry.py
 echo "[patch_ops] qwen3_5.py + registry.py deployed"
+
+# --- paged_attention_v2_pytorch.py: PyTorch V2 attention fallback ------------
+# _custom_ops.py imports this from the parent of its own directory.
+# In docker, vllm lives at $V/, so we place it one level up AND next to _custom_ops.
+# Belt-and-suspenders: also copy to /workspace/ where _custom_ops.py's _repo_root points.
+cp ./paged_attention_v2_pytorch.py $V/paged_attention_v2_pytorch.py
+cp ./paged_attention_v2_pytorch.py /workspace/paged_attention_v2_pytorch.py
+echo "[patch_ops] paged_attention_v2_pytorch.py → $V/ + /workspace/"
 
 # --- sequence.py: fix completion_tokens inflation ----------------------------
 cp ./sequence.py $V/sequence.py

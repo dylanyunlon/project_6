@@ -150,13 +150,34 @@ def paged_attention_v2(
     # Our PyTorch V2 implementation follows the same pattern:
     #   Phase 1: partition attention (each partition = one tile)
     #   Phase 2: cross-partition log-sum-exp reduction (summary_statistics binary_op)
+    # paged_attention_v2_pytorch.py — try multiple import locations
+    # In docker: may be at /workspace/, next to vllm package, or in vllm/ itself
     import sys, os
-    # paged_attention_v2_pytorch.py is in the repo root, not inside vllm package
-    _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if _repo_root not in sys.path:
-        sys.path.insert(0, _repo_root)
-    from paged_attention_v2_pytorch import paged_attention_v2_pytorch
-    paged_attention_v2_pytorch(
+    _pav2 = None
+    # Try 1: same package (patch_ops copies it next to _custom_ops.py)
+    try:
+        from vllm.paged_attention_v2_pytorch import paged_attention_v2_pytorch
+        _pav2 = paged_attention_v2_pytorch
+    except ImportError:
+        pass
+    # Try 2: /workspace/ (Dockerfile WORKDIR)
+    if _pav2 is None:
+        try:
+            _ws = '/workspace'
+            if _ws not in sys.path:
+                sys.path.insert(0, _ws)
+            from paged_attention_v2_pytorch import paged_attention_v2_pytorch
+            _pav2 = paged_attention_v2_pytorch
+        except ImportError:
+            pass
+    # Try 3: repo root relative to this file
+    if _pav2 is None:
+        _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _repo_root not in sys.path:
+            sys.path.insert(0, _repo_root)
+        from paged_attention_v2_pytorch import paged_attention_v2_pytorch
+        _pav2 = paged_attention_v2_pytorch
+    _pav2(
         out, exp_sum, max_logits, tmp_out,
         query, key_cache, value_cache,
         num_kv_heads, scale, block_tables, seq_lens,
