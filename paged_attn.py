@@ -412,17 +412,33 @@ class PagedAttention:
         else:
             # Run PagedAttention V2.
             assert _PARTITION_SIZE % block_size == 0
-            tmp_output = torch.empty(
-                size=(num_seqs, num_heads, max_num_partitions, head_size),
-                dtype=output.dtype,
-                device=output.device,
-            )
-            exp_sums = torch.empty(
-                size=(num_seqs, num_heads, max_num_partitions),
-                dtype=torch.float32,
-                device=output.device,
-            )
-            max_logits = torch.empty_like(exp_sums)
+            # CCCL agent_merge_sort.cuh union _TempStorage pattern:
+            # agent_merge_sort shares a single SMEM allocation across
+            # load_keys, load_items, store_keys, and block_merge ops
+            # (they don't execute concurrently, so one buffer suffices).
+            # Our equivalent: cache V2 temp tensors across decode steps.
+            # For max_num_seqs=1 (competition config), these shapes are
+            # stable across all decode steps for the same sequence.
+            _v2_key = ("v2_tmp", num_seqs, num_heads, max_num_partitions,
+                       head_size, output.dtype, output.device)
+            _v2_cached = getattr(PagedAttention, '_v2_cache', {}).get(_v2_key)
+            if _v2_cached is not None:
+                tmp_output, exp_sums, max_logits = _v2_cached
+            else:
+                tmp_output = torch.empty(
+                    size=(num_seqs, num_heads, max_num_partitions, head_size),
+                    dtype=output.dtype,
+                    device=output.device,
+                )
+                exp_sums = torch.empty(
+                    size=(num_seqs, num_heads, max_num_partitions),
+                    dtype=torch.float32,
+                    device=output.device,
+                )
+                max_logits = torch.empty_like(exp_sums)
+                if not hasattr(PagedAttention, '_v2_cache'):
+                    PagedAttention._v2_cache = {}
+                PagedAttention._v2_cache[_v2_key] = (tmp_output, exp_sums, max_logits)
             ops.paged_attention_v2(
                 output,
                 exp_sums,
