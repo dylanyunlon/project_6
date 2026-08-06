@@ -297,6 +297,7 @@ def select_moe_config(
 QWEN36_HEAD_DIM = 256       # text_cfg.head_dim
 QWEN36_NUM_KV_HEADS = 4     # num_key_value_heads
 QWEN36_MAX_SEQ_LEN = 100000 # from computility-run.yaml
+QWEN36_MAX_NUM_SEQS = 1     # CRITICAL: computility-run.yaml --max-num-seqs 1
 QWEN36_NUM_EXPERTS = 256    # MoE experts
 QWEN36_TOP_K = 8            # MoE top-k
 QWEN36_HIDDEN = 3584        # hidden_size
