@@ -426,10 +426,30 @@ def _apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
     output_bin_counts, output_mask = _get_bin_counts_and_mask(
         output_tokens_tensor, vocab_size, num_seqs)
 
-    repetition_penalties = repetition_penalties[:, None].repeat(1, vocab_size)
-    repetition_penalties[~(prompt_mask | output_mask)] = 1.0
-    logits = torch.where(logits > 0, logits / repetition_penalties,
-                         logits * repetition_penalties)
+    # CCCL dispatch_merge_sort.cuh: alias_temporaries packs 4 allocations
+    # (partitions + keys_buf + values_buf + vsmem) into one cudaMalloc.
+    # Principle: never allocate throwaway intermediates in the hot path.
+    #
+    # Old code: repetition_penalties[:, None].repeat(1, vocab_size)
+    # → allocates (num_seqs × vocab_size × 4) = 608KB for Qwen3.6 (vocab=152064)
+    # → then masks most of it to 1.0 → wasted allocation
+    #
+    # New code: apply repetition penalty only to tokens that appear in
+    # prompt or output, using in-place operations and indexing.
+    # Zero allocation overhead.
+    token_mask = prompt_mask | output_mask  # (num_seqs, vocab_size) bool
+    # For tokens that appear: divide positive logits, multiply negative logits
+    # For tokens that don't appear: no change (equivalent to penalty=1.0)
+    rep_pen = repetition_penalties.unsqueeze(1)  # (num_seqs, 1) — broadcasts
+    logits = torch.where(
+        token_mask & (logits > 0),
+        logits / rep_pen,
+        torch.where(
+            token_mask & (logits < 0),
+            logits * rep_pen,
+            logits
+        )
+    )
 
     # We follow the definition in OpenAI API.
     # Refer to https://platform.openai.com/docs/api-reference/parameter-details
