@@ -30,6 +30,16 @@ if envs.VLLM_USE_FLASHINFER_SAMPLER and find_spec("flashinfer"):
 else:
     flashinfer_top_k_top_p_sampling = None
 
+# CCCL alias_temporaries pattern (dispatch_topk.cuh line ~340):
+# All temporary buffers (counter, histogram, candidate double-buffer) are
+# pre-allocated into a single d_temp_storage blob at launch time, then
+# aliased via pointer arithmetic. No per-kernel-launch malloc.
+#
+# Python equivalent: module-level dict mapping (shape_key → pre-allocated tensor).
+# Survives across decode steps within the same process lifetime.
+# Keys: ("bin_counts", vocab_size, num_seqs, device) etc.
+_sampler_temp_storage: Dict = {}
+
 # (num_token_ids, num_parent_ids) per sequence group.
 SampleResultType = List[Tuple[List[int], List[int]]]
 
@@ -332,23 +342,16 @@ def _get_bin_counts_and_mask(
     # Compute the bin counts for the tokens.
     # vocab_size + 1 for padding.
     #
-    # CCCL bit_packed_counter pattern (catch2_test_memcpy_bitpacked_counter.cu):
-    # Pack counters using minimum bits needed. Original code uses int64
-    # (8 bytes per counter), but token repetition counts in a single
-    # generation never exceed a few hundred. We keep int64 for scatter_add_
-    # compatibility but pre-allocate once to avoid per-step CUDA malloc.
+    # CCCL alias_temporaries pattern (dispatch_reduce.cuh, dispatch_topk.cuh):
+    # Pre-allocate all temporary buffers once, reuse across kernel launches.
+    # In dispatch_topk.cuh this is done via alias_temporaries() which packs
+    # counter + histogram + double-buffer into a single d_temp_storage blob.
     #
-    # CCCL dispatch_reduce.cuh alias_temporaries: pre-allocate, reuse.
-    # For Qwen3.6 (vocab=152064, batch=8 decode):
-    #   bin_counts = 8 × 152065 × 8 = 9.7 MB, allocated ONCE, reused.
+    # For Qwen3.6 (vocab=152064, max_num_seqs=1 decode):
+    #   bin_counts = 1 × 152065 × 8 = 1.2 MB, allocated ONCE, reused.
     #   scatter_add_ requires int64 on CUDA, so dtype cannot change.
-    #
-    # Future: if scatter_add_ supports int16/int32, switch to reduce 4x.
     _cache_key = ("bin_counts", vocab_size, num_seqs, tokens.device)
-    global _sampler_cache
-    if '_sampler_cache' not in dir():
-        _sampler_cache = {}
-    cached = _sampler_cache.get(_cache_key)
+    cached = _sampler_temp_storage.get(_cache_key)
     if cached is not None and cached.shape == (num_seqs, vocab_size + 1):
         bin_counts = cached
         bin_counts.zero_()
@@ -356,7 +359,7 @@ def _get_bin_counts_and_mask(
         bin_counts = torch.zeros((num_seqs, vocab_size + 1),
                                  dtype=torch.long,
                                  device=tokens.device)
-        _sampler_cache[_cache_key] = bin_counts
+        _sampler_temp_storage[_cache_key] = bin_counts
 
     bin_counts.scatter_add_(1, tokens, torch.ones_like(tokens))
     bin_counts = bin_counts[:, :vocab_size]
