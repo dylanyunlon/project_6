@@ -166,6 +166,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     logprobs: Optional[bool] = False
     top_logprobs: Optional[int] = 0
     max_tokens: Optional[int] = None
+    # OpenAI newer API uses max_completion_tokens as alias for max_tokens.
+    # CCCL namespace_wrapped.cu pattern: accept alternate names for same concept.
+    # Competition evaluator sends max_completion_tokens (values: 8192, 32768, 65536).
+    max_completion_tokens: Optional[int] = None
     n: Optional[int] = 1
     presence_penalty: Optional[float] = 0.0
     response_format: Optional[ResponseFormat] = None
@@ -182,6 +186,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # NOTE this will be ignored by VLLM -- the model determines the behavior
     parallel_tool_calls: Optional[bool] = False
     user: Optional[str] = None
+    # Qwen3/OpenAI thinking/reasoning control.
+    # Competition evaluator sends thinking={enable:true/false}.
+    thinking: Optional[dict] = None
 
     # doc: begin-chat-completion-sampling-params
     best_of: Optional[int] = None
@@ -397,6 +404,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
         reasoning_content is intentionally kept — chat_utils.py wraps it as
         <think>...</think> for multi-turn reasoning history.
         """
+        # Map max_completion_tokens → max_tokens (OpenAI API v2 name)
+        if data.get("max_completion_tokens") is not None and data.get("max_tokens") is None:
+            data["max_tokens"] = data["max_completion_tokens"]
+
         messages = data.get("messages")
         if not isinstance(messages, list):
             return data
@@ -406,11 +417,19 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 normalized.append(msg)
                 continue
             if msg.get("content") is None:
-                if msg.get("reasoning_content") is None:
+                # Allow tool_calls messages and tool-role messages without content.
+                # CCCL namespace pattern: accept valid alternate message formats.
+                if msg.get("reasoning_content") is not None:
+                    msg = {**msg, "content": ""}
+                elif msg.get("tool_calls") is not None:
+                    msg = {**msg, "content": ""}
+                elif msg.get("role") == "tool":
+                    msg = {**msg, "content": ""}
+                else:
                     raise ValueError(
-                        "Each message must have at least one of 'content' or "
-                        "'reasoning_content'.")
-                msg = {**msg, "content": ""}
+                        "Each message must have at least one of 'content', "
+                        "'reasoning_content', or 'tool_calls'.")
+                    
             normalized.append(msg)
         data = {**data, "messages": normalized}
         return data
