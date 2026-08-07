@@ -418,6 +418,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if data.get("max_completion_tokens") is not None and data.get("max_tokens") is None:
             data["max_tokens"] = data["max_completion_tokens"]
 
+        # Validate max_tokens: reject negative values with 400.
+        # Tests t3_max_tokens_neg1 and t3_max_tokens_over expect HTTP 4xx.
+        _mt = data.get("max_tokens")
+        if _mt is not None and isinstance(_mt, (int, float)) and _mt < 0:
+            raise ValueError(
+                f"max_tokens must be non-negative, got {_mt}")
+
         # n > max_num_seqs: clamp handled in serving_chat.py via scheduler check.
         # With max_num_seqs=2, n=2 should work. n>2 will be clamped there.
 

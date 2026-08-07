@@ -312,9 +312,33 @@ async def show_version():
 @router.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest,
                                  raw_request: Request):
-
-    generator = await chat(raw_request).create_chat_completion(
-        request, raw_request)
+    # CCCL LookbackDelayPolicy-inspired graceful degradation:
+    # Catch engine-fatal exceptions at the API boundary so one bad request
+    # (e.g. OOM from n=2) returns HTTP 503 instead of killing the process.
+    try:
+        generator = await chat(raw_request).create_chat_completion(
+            request, raw_request)
+    except Exception as e:
+        err_msg = str(e)
+        # Detect OOM or engine death — return 503 (retryable) not 500
+        if "OutOfMemory" in err_msg or "CUDA out of memory" in err_msg:
+            logger.error("OOM caught at API boundary: %s", err_msg)
+            return JSONResponse(
+                content={"error": {"message": "GPU memory insufficient for this request",
+                                   "type": "server_error", "code": "oom"}},
+                status_code=503)
+        elif "Dead" in type(e).__name__ or "dead" in err_msg.lower():
+            logger.error("Engine dead caught at API boundary: %s", err_msg)
+            return JSONResponse(
+                content={"error": {"message": "Engine temporarily unavailable",
+                                   "type": "server_error", "code": "engine_dead"}},
+                status_code=503)
+        else:
+            logger.exception("Unhandled error in chat completion")
+            return JSONResponse(
+                content={"error": {"message": err_msg,
+                                   "type": "server_error", "code": "internal"}},
+                status_code=500)
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(content=generator.model_dump(),
