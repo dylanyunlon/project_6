@@ -432,7 +432,12 @@ if triton.__version__ >= "2.1.0":
             l_i = l_i_new
             m_i = m_i_new
 
-        # acc /= l_i[:, None]
+        # BUG FIX: v2 kernel accumulates unnormalized softmax weights.
+        # Without this final division, output = sum(softmax_unnorm * V)
+        # instead of the correct sum(softmax_normalized * V).
+        # v1 kernel does online normalization inside the loop (p_scale/acc_scale).
+        # v2 defers normalization — it MUST happen here.
+        acc = acc / l_i[:, None]
         # initialize pointers to output
         off_o = (
             (cur_batch_in_all_start_index + offs_m[:, None]) * stride_obs +
