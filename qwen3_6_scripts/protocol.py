@@ -418,14 +418,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if data.get("max_completion_tokens") is not None and data.get("max_tokens") is None:
             data["max_tokens"] = data["max_completion_tokens"]
 
-        # Clamp n to 1 to prevent engine crash. Competition config uses
-        # max_num_seqs=1; n>1 deadlocks the scheduler (break-not-continue bug)
-        # or causes OOM, crashing the engine for ALL subsequent requests.
-        # Sub508: t2_n_2 → HTTP 500 → 19 cascade failures.
-        # t2_n_2 will FAIL (1 choice instead of 2) but prevents cascade.
-        n_val = data.get("n")
-        if n_val is not None and isinstance(n_val, int) and n_val > 1:
-            data["n"] = 1
+        # n > max_num_seqs: clamp handled in serving_chat.py via scheduler check.
+        # With max_num_seqs=2, n=2 should work. n>2 will be clamped there.
 
         # Map thinking parameter → chat_template_kwargs.enable_thinking
         # OpenAI API format: thinking={"type":"enabled"} / {"type":"disabled"}
