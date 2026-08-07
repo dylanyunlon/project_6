@@ -50,6 +50,8 @@ class CustomChatCompletionMessageParam(TypedDict, total=False):
     same role.
     """
 
+    reasoning_content: Optional[str]
+
     tool_call_id: Optional[str]
 
     tool_calls: Optional[List[dict]]
@@ -99,10 +101,15 @@ class ModelList(OpenAIBaseModel):
     data: List[ModelCard] = Field(default_factory=list)
 
 
+class PromptTokensDetails(OpenAIBaseModel):
+    cached_tokens: int = 0
+
+
 class UsageInfo(OpenAIBaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
+    prompt_tokens_details: Optional[PromptTokensDetails] = None
 
 
 class RequestResponseMetadata(BaseModel):
@@ -175,6 +182,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     top_p: Optional[float] = 1.0
     tools: Optional[List[ChatCompletionToolsParam]] = None
     tool_choice: Optional[Union[Literal["none"], Literal["auto"],
+                                Literal["required"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
 
     # NOTE this will be ignored by VLLM -- the model determines the behavior
@@ -456,12 +464,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     "When using `tool_choice`, `tools` must be set.")
 
             # make sure that tool choice is either a named tool
-            # OR that it's set to "auto"
-            if data["tool_choice"] != "auto" and not isinstance(
-                    data["tool_choice"], dict):
+            # OR that it's set to "auto" / "required" / "none"
+            if data["tool_choice"] not in ("auto", "required", "none") \
+                    and not isinstance(data["tool_choice"], dict):
                 raise ValueError(
-                    "`tool_choice` must either be a named tool or \"auto\". "
-                    "`tool_choice=\"none\" is not supported.")
+                    "`tool_choice` must be a named tool, \"auto\", "
+                    "\"required\", or \"none\".")
 
             # ensure that if "tool_choice" is specified as an object,
             # it matches a valid tool
@@ -839,6 +847,7 @@ class ExtractedToolCallInformation(BaseModel):
 class ChatMessage(OpenAIBaseModel):
     role: str
     content: Optional[str] = None
+    reasoning_content: Optional[str] = None
     tool_calls: List[ToolCall] = Field(default_factory=list)
 
 
@@ -879,6 +888,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
 class DeltaMessage(OpenAIBaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    reasoning_content: Optional[str] = None
     tool_calls: List[DeltaToolCall] = Field(default_factory=list)
 
 

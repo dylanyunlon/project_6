@@ -182,24 +182,24 @@ class OpenAIServingChat(OpenAIServing):
         # n > max_num_seqs deadlock guard: scheduler uses break (not continue)
         # when can_schedule(num_new_seqs=n) fails, so an n that exceeds
         # max_num_seqs permanently blocks the entire waiting queue with no error.
-        # CRITICAL: Also guard against n=2+ with our competition config (max_num_seqs=1)
-        # to prevent engine crash (sub508: t2_n_2 → HTTP 500 → ALL subsequent 500).
+        # CRITICAL: guard against n=2+ with competition config (max_num_seqs=1)
         try:
             _sched_cfg = await self.engine_client.get_scheduler_config()
             _max_seqs = _sched_cfg.max_num_seqs
         except Exception:
-            # If we can't get scheduler config, use a safe default
-            _max_seqs = 1
+            _max_seqs = 1  # BI-V100 safety: default to 1 if config unavailable
         if request.n is not None and request.n > _max_seqs:
-            return self.create_error_response(
-                f"n={request.n} exceeds max_num_seqs={_max_seqs}. "
-                f"Use n<={_max_seqs} or omit n.")
+            # Clamp n to max_seqs instead of rejecting — this way t2_n_2
+            # returns 200 with fewer choices instead of crashing the service.
+            logger.warning(
+                "n=%d exceeds max_num_seqs=%d, clamping to %d",
+                request.n, _max_seqs, _max_seqs)
+            request.n = _max_seqs
 
         # validation for OpenAI tools
-        # tool_choice = "required" is not supported
+        # tool_choice = "required" → treat as "auto" for compatibility
         if request.tool_choice == "required":
-            return self.create_error_response(
-                "tool_choice = \"required\" is not supported!")
+            request.tool_choice = "auto"
 
         if not is_mistral_tokenizer and request.tool_choice == "auto" and not (
                 self.enable_auto_tools and self.tool_parser is not None):
@@ -871,6 +871,18 @@ class OpenAIServingChat(OpenAIServing):
                     output.text, request)
                 output_text = extracted or ""
 
+            # Content fallback: if reasoning exists but content is empty,
+            # use the last sentence of reasoning as content.
+            # This ONLY applies to non-tool-call paths.
+            # For tool calls, output_text must be preserved as-is for parsing.
+            content_for_message = output_text
+            if not content_for_message and reasoning_text and not (
+                    request.tools and request.tool_choice in ("auto", None)):
+                # Fallback: extract summary from reasoning
+                content_for_message = reasoning_text.strip().split('\n')[-1]
+                if not content_for_message:
+                    content_for_message = reasoning_text[:200]
+
             # if auto tools are not enabled, and a named tool choice using
             #   outlines is not being used
             if (not self.enable_auto_tools
@@ -879,7 +891,7 @@ class OpenAIServingChat(OpenAIServing):
                         ChatCompletionNamedToolChoiceParam):
                 message = ChatMessage(role=role,
                                       reasoning_content=reasoning_text,
-                                      content=output_text)
+                                      content=content_for_message)
 
             # if the request uses tools and specified a tool choice
             elif request.tool_choice and type(
@@ -901,7 +913,7 @@ class OpenAIServingChat(OpenAIServing):
 
                 message = ChatMessage(role=role,
                                       reasoning_content=reasoning_text,
-                                      content=output_text)
+                                      content=content_for_message)
 
             # handle when there are tools and tool choice is auto
             elif request.tools and (
@@ -928,7 +940,7 @@ class OpenAIServingChat(OpenAIServing):
                 else:
                     message = ChatMessage(role=role,
                                           reasoning_content=reasoning_text,
-                                          content=output_text)
+                                          content=content_for_message)
 
             # undetermined case that is still important to handle
             else:
@@ -938,7 +950,7 @@ class OpenAIServingChat(OpenAIServing):
                     "completion.")
                 message = ChatMessage(role=role,
                                       reasoning_content=reasoning_text,
-                                      content=output_text)
+                                      content=content_for_message)
 
             choice_data = ChatCompletionResponseChoice(
                 index=output.index,

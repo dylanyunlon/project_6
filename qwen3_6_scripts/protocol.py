@@ -184,6 +184,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     top_p: Optional[float] = 1.0
     tools: Optional[List[ChatCompletionToolsParam]] = None
     tool_choice: Optional[Union[Literal["none"], Literal["auto"],
+                                Literal["required"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
 
     # NOTE this will be ignored by VLLM -- the model determines the behavior
@@ -426,18 +427,29 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if n_val is not None and isinstance(n_val, int) and n_val > 1:
             data["n"] = 1
 
-        # Map thinking={enable:true/false} → chat_template_kwargs.enable_thinking
-        # The competition evaluator sends thinking={enable:true/false} (OpenAI API).
+        # Map thinking parameter → chat_template_kwargs.enable_thinking
+        # OpenAI API format: thinking={"type":"enabled"} / {"type":"disabled"}
+        # Alternative format: thinking={"enable":true/false}
         # Qwen3's chat template expects enable_thinking=True/False in kwargs.
         thinking = data.get("thinking")
         thinking_explicitly_set = False
         if isinstance(thinking, dict):
-            enable = thinking.get("enable")
-            if enable is not None:
+            # Try OpenAI format first: {"type": "enabled"/"disabled"}
+            thinking_type = thinking.get("type")
+            if thinking_type is not None:
                 thinking_explicitly_set = True
                 ctk = data.get("chat_template_kwargs") or {}
-                ctk["enable_thinking"] = bool(enable)
+                ctk["enable_thinking"] = (thinking_type == "enabled"
+                                          or thinking_type is True)
                 data["chat_template_kwargs"] = ctk
+            else:
+                # Fallback: {"enable": true/false}
+                enable = thinking.get("enable")
+                if enable is not None:
+                    thinking_explicitly_set = True
+                    ctk = data.get("chat_template_kwargs") or {}
+                    ctk["enable_thinking"] = bool(enable)
+                    data["chat_template_kwargs"] = ctk
 
         # CRITICAL: When tools are present with tool_choice=auto and thinking
         # is NOT explicitly requested, disable thinking to preserve token budget
@@ -559,11 +571,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
             # make sure that tool choice is either a named tool
             # OR that it's set to "auto"
-            if data["tool_choice"] != "auto" and not isinstance(
-                    data["tool_choice"], dict):
+            if data["tool_choice"] not in ("auto", "required", "none") \
+                    and not isinstance(data["tool_choice"], dict):
                 raise ValueError(
-                    "`tool_choice` must either be a named tool or \"auto\". "
-                    "`tool_choice=\"none\" is not supported.")
+                    "`tool_choice` must be a named tool, \"auto\", "
+                    "\"required\", or \"none\".")
 
             # ensure that if "tool_choice" is specified as an object,
             # it matches a valid tool

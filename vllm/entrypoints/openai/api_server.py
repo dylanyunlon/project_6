@@ -498,7 +498,8 @@ def init_app_state(
         chat_template=args.chat_template,
         return_tokens_as_token_ids=args.return_tokens_as_token_ids,
         enable_auto_tools=args.enable_auto_tool_choice,
-        tool_parser=args.tool_call_parser)
+        tool_parser=args.tool_call_parser,
+        reasoning_parser=getattr(args, 'reasoning_parser', None))
     state.openai_serving_completion = OpenAIServingCompletion(
         engine_client,
         model_config,

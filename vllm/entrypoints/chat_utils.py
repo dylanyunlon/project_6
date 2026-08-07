@@ -98,6 +98,9 @@ class ConversationMessage(TypedDict, total=False):
     content: Optional[str]
     """The contents of the message"""
 
+    reasoning_content: Optional[str]
+    """Chain-of-thought reasoning (Qwen3 <think>...</think> content)"""
+
     tool_call_id: Optional[str]
     """Tool call that this message is responding to."""
 

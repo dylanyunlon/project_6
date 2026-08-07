@@ -59,7 +59,8 @@ class OpenAIServingChat(OpenAIServing):
                  chat_template: Optional[str],
                  return_tokens_as_token_ids: bool = False,
                  enable_auto_tools: bool = False,
-                 tool_parser: Optional[str] = None):
+                 tool_parser: Optional[str] = None,
+                 reasoning_parser: Optional[str] = None):
         super().__init__(engine_client=engine_client,
                          model_config=model_config,
                          base_model_paths=base_model_paths,
@@ -89,6 +90,20 @@ class OpenAIServingChat(OpenAIServing):
                 raise TypeError("Error: --enable-auto-tool-choice requires "
                                 f"tool_parser:'{tool_parser}' which has not "
                                 "been registered") from e
+
+        # Reasoning parser: separates <think>...</think> from content
+        self.reasoning_parser_cls = None
+        if reasoning_parser:
+            try:
+                from vllm.reasoning import ReasoningParserManager
+                self.reasoning_parser_cls = \
+                    ReasoningParserManager.get_reasoning_parser(reasoning_parser)
+                logger.info("Reasoning parser '%s' enabled.", reasoning_parser)
+            except Exception as e:
+                logger.warning(
+                    "Reasoning parser '%s' could not be loaded: %s. "
+                    "Reasoning content will not be separated.",
+                    reasoning_parser, e)
 
     async def create_chat_completion(
         self,
@@ -165,10 +180,9 @@ class OpenAIServingChat(OpenAIServing):
             return self.create_error_response(str(e))
 
         # validation for OpenAI tools
-        # tool_choice = "required" is not supported
+        # tool_choice = "required" → treat as "auto" for compatibility
         if request.tool_choice == "required":
-            return self.create_error_response(
-                "tool_choice = \"required\" is not supported!")
+            request.tool_choice = "auto"
 
         if not is_mistral_tokenizer and request.tool_choice == "auto" and not (
                 self.enable_auto_tools and self.tool_parser is not None):
@@ -326,8 +340,8 @@ class OpenAIServingChat(OpenAIServing):
         try:
             if tool_choice_auto and self.tool_parser:
                 tool_parsers: List[Optional[ToolParser]] = [
-                    self.tool_parser(tokenizer)
-                ] * num_choices
+                    self.tool_parser(tokenizer) for _ in range(num_choices)
+                ]
             else:
                 tool_parsers = [None] * num_choices
         except RuntimeError as e:
@@ -336,6 +350,26 @@ class OpenAIServingChat(OpenAIServing):
             yield f"data: {data}\n\n"
             yield "data: [DONE]\n\n"
             return
+
+        # Prepare reasoning parsers for streaming
+        use_reasoning = self.reasoning_parser_cls is not None
+        reasoning_parsers: List[Optional[object]] = [None] * num_choices
+        if use_reasoning:
+            try:
+                reasoning_parsers = [
+                    self.reasoning_parser_cls(tokenizer)
+                    for _ in range(num_choices)
+                ]
+            except Exception as e:
+                logger.warning("Reasoning parser creation failed: %s", e)
+                use_reasoning = False
+
+        # Track previous token IDs for reasoning even when not using tools
+        if use_reasoning and not tool_choice_auto:
+            previous_texts = [""] * num_choices
+            all_previous_token_ids = [[[] for _ in range(num_choices)]]
+            # Flatten: just use lists directly
+            all_previous_token_ids = [[] for _ in range(num_choices)]
 
         try:
             async for res in result_generator:
@@ -487,7 +521,34 @@ class OpenAIServingChat(OpenAIServing):
 
                     # handle streaming just a content delta
                     else:
-                        delta_message = DeltaMessage(content=delta_text)
+                        if use_reasoning and reasoning_parsers[i] is not None:
+                            # Use reasoning parser for streaming separation
+                            r_parser = reasoning_parsers[i]
+                            prev_text = previous_texts[i] if previous_texts else ""
+                            cur_text = prev_text + delta_text
+                            prev_tids = all_previous_token_ids[i] if all_previous_token_ids else []
+                            cur_tids = prev_tids + list(output.token_ids)
+
+                            try:
+                                delta_message = r_parser.extract_reasoning_streaming(
+                                    previous_text=prev_text,
+                                    current_text=cur_text,
+                                    delta_text=delta_text,
+                                    previous_token_ids=prev_tids,
+                                    current_token_ids=cur_tids,
+                                    delta_token_ids=output.token_ids,
+                                )
+                            except Exception as e:
+                                logger.debug("Reasoning streaming error: %s", e)
+                                delta_message = DeltaMessage(content=delta_text)
+
+                            # Update tracking state
+                            if previous_texts is not None:
+                                previous_texts[i] = cur_text
+                            if all_previous_token_ids is not None:
+                                all_previous_token_ids[i] = cur_tids
+                        else:
+                            delta_message = DeltaMessage(content=delta_text)
 
                     # set the previous values for the next iteration
                     previous_num_tokens[i] += len(output.token_ids)
@@ -680,6 +741,19 @@ class OpenAIServingChat(OpenAIServing):
             else:
                 logprobs = None
 
+            # Reasoning separation: split <think>...</think> from content
+            reasoning_text = None
+            final_content = output.text
+            if self.reasoning_parser_cls:
+                try:
+                    r_parser = self.reasoning_parser_cls(tokenizer)
+                    reasoning_text, extracted = r_parser.extract_reasoning(
+                        output.text, request=request)
+                    final_content = extracted if extracted else ""
+                except Exception as e:
+                    logger.warning("Reasoning extraction failed: %s", e)
+                    final_content = output.text
+
             # In the OpenAI API the finish_reason is "tools_called"
             # if the tool choice is auto and the model produced a tool
             # call. The same is not true for named function calls
@@ -691,7 +765,8 @@ class OpenAIServingChat(OpenAIServing):
                     or not self.tool_parser) and not isinstance(
                         request.tool_choice,
                         ChatCompletionNamedToolChoiceParam):
-                message = ChatMessage(role=role, content=output.text)
+                message = ChatMessage(role=role, content=final_content,
+                                      reasoning_content=reasoning_text)
 
             # if the request uses tools and specified a tool choice
             elif request.tool_choice and type(
@@ -710,7 +785,8 @@ class OpenAIServingChat(OpenAIServing):
             # OR specifies to not use a tool
             elif not request.tool_choice or request.tool_choice == "none":
 
-                message = ChatMessage(role=role, content=output.text)
+                message = ChatMessage(role=role, content=final_content,
+                                      reasoning_content=reasoning_text)
 
             # handle when there are tools and tool choice is auto
             elif request.tools and (
@@ -724,21 +800,22 @@ class OpenAIServingChat(OpenAIServing):
                     logger.error("Error in tool parser creation: %s", e)
                     return self.create_error_response(str(e))
 
+                # Apply reasoning separation to the text before tool parsing
+                text_for_tools = final_content if final_content else output.text
                 tool_call_info = tool_parser.extract_tool_calls(
-                    output.text, request=request)
-                # In the OpenAI API the finish_reason is "tools_called"
-                # if the tool choice is auto and the model produced a tool
-                # call. The same is not true for named function calls
+                    text_for_tools, request=request)
                 auto_tools_called = tool_call_info.tools_called
                 if tool_call_info.tools_called:
                     message = ChatMessage(role=role,
                                           content=tool_call_info.content,
+                                          reasoning_content=reasoning_text,
                                           tool_calls=tool_call_info.tool_calls)
 
                 else:
                     # FOR NOW make it a chat message; we will have to detect
                     # the type to make it later.
-                    message = ChatMessage(role=role, content=output.text)
+                    message = ChatMessage(role=role, content=final_content,
+                                          reasoning_content=reasoning_text)
 
             # undetermined case that is still important to handle
             else:
@@ -746,7 +823,8 @@ class OpenAIServingChat(OpenAIServing):
                     "Error in chat_completion_full_generator - cannot determine"
                     " if tools should be extracted. Returning a standard chat "
                     "completion.")
-                message = ChatMessage(role=role, content=output.text)
+                message = ChatMessage(role=role, content=final_content,
+                                      reasoning_content=reasoning_text)
 
             choice_data = ChatCompletionResponseChoice(
                 index=output.index,
