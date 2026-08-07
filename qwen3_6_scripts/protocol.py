@@ -453,7 +453,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if not thinking_explicitly_set:
             has_tools = data.get("tools") is not None and len(data.get("tools", [])) > 0
             tc = data.get("tool_choice")
-            tool_choice_active = (tc == "auto" or (tc is None and has_tools)
+            tool_choice_active = (tc == "auto" or tc == "required"
+                                  or (tc is None and has_tools)
                                   or isinstance(tc, dict))
             if has_tools and tool_choice_active:
                 ctk = data.get("chat_template_kwargs") or {}

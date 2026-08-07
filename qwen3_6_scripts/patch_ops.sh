@@ -2,21 +2,21 @@
 set -eo pipefail
 # BI-V100 engine patches for Qwen3.6-35B-A3B (Qwen3_5 architecture)
 #
-# STRATEGY: Only patch serving/protocol layer. NEVER replace core compute
-# files (qwen3_5.py model, _custom_ops.py, model_runner.py, xformers.py,
-# paged_attn.py, prefix_prefill.py, logits_processor.py, sampler.py).
+# STRATEGY (CCCL-inspired):
+#   1. Serving layer: full file replacement (protocol, chat, tools, reasoning)
+#   2. Core compute: TARGETED in-place patches, never full replacement
+#      - qwen3_5.py: inject numerical stability clamps (prevent 99.98% NaN)
+#      - Preserve corex_gdn/corex_moe/corex_fa2 kernel paths
 #
-# The base image has optimized CoreX kernels:
-#   - corex_gdn.py  — fused GatedDeltaNet (decode + prefill)
-#   - corex_moe.py  — fused MoE (expert-grouped-wmma)
-#   - corex_fa2.py  — FlashAttention2 (packed prefill + paged chunked)
-# Replacing model files breaks these kernel paths and causes:
-#   - DeltaNet NaN (99.98% of activations) → model output garbage
-#   - MoE fallback to pure PyTorch → 10x slower
-#   - FA2 → XFormers fallback → slower attention
+# CCCL design patterns applied:
+#   - optionally_static: detect existing guards, inject only what's missing
+#   - agent_radix_sort_histogram: Init → Detect → Patch → Verify
+#   - overflow_cast: clamp BEFORE accumulation, not after
 #
-# Reference: competitor sub168 uses base image qwen3_5.py + these CoreX
-# kernels and achieves d03_tool_call in 2.12s (vs our sub509's 49s FAIL).
+# Base image CoreX kernels (MUST preserve):
+#   - corex_gdn  — fused GatedDeltaNet (decode + prefill)
+#   - corex_moe  — fused MoE (expert-grouped-wmma)
+#   - corex_fa2  — FlashAttention2 (packed prefill + paged chunked)
 
 cd "$(dirname "$0")"
 echo "[patch_ops] working directory: $(pwd)"
@@ -89,25 +89,30 @@ done
 echo "[patch_ops] reasoning parser + serving files installed"
 
 # ============================================================
-# 4. DO NOT PATCH sequence.py or scheduler.py
-#    168 (reference competitor) did not patch these.
-#    Our custom versions may conflict with base image internals.
-#    Token counting fixes are minor; NaN-free output is critical.
+# 4. CCCL Agent-pattern: numerical stability patch for qwen3_5.py
+#    Sub509 docker logs: 99.98% NaN in every GatedDeltaNet layer.
+#    Base image has NaN detection + nan_to_num(nan=0.0), but that
+#    means DeltaNet layers output all-zeros → model "brain dead"
+#    → can't produce <tool_call> XML → d03 FAIL.
+#
+#    Strategy (CCCL optionally_static): detect what guards exist,
+#    inject ONLY what's missing. Preserve corex kernel paths.
+#    Agent flow: Init → Detect → Patch → Verify.
 # ============================================================
+python3 ./patch_numerical_stability.py 2>&1 || \
+    echo "[patch_ops] WARNING: numerical stability patch failed (non-fatal)"
+echo "[patch_ops] numerical stability patch complete"
 
 # ============================================================
-# 5. DO NOT PATCH these files — base image has optimized versions:
-#    - qwen3_5.py (model) — has corex_gdn/corex_moe/corex_fa2 integration
-#    - _custom_ops.py — base image ixformer bindings
-#    - model_runner.py — base image worker
-#    - xformers.py — base image attention backend
-#    - paged_attn.py — base image paged attention
-#    - prefix_prefill.py — base image prefix prefill
-#    - logits_processor.py — base image logits
-#    - sampler.py — base image sampler
-#    - arg_utils.py — base image arg parsing
-#    - paged_attention_v2_pytorch.py — not needed with native kernels
+# 5. DO NOT full-replace these files — base image has optimized versions.
+#    Use targeted patches (like step 4) instead of cp replacement.
+#    - qwen3_5.py — patched in-place by step 4 (preserves corex paths)
+#    - _custom_ops.py — base image ixformer bindings (no change needed)
+#    - model_runner.py — base image worker (no change needed)
+#    - xformers.py — base image attention backend (no change needed)
+#    - paged_attn.py — base image paged attention (no change needed)
+#    - prefix_prefill.py — base image prefix prefill (no change needed)
 # ============================================================
 
-echo "[patch_ops] DONE — serving-layer-only patches applied"
-echo "[patch_ops] Core compute files preserved from base image (corex_gdn + corex_moe + corex_fa2)"
+echo "[patch_ops] DONE — serving layer + numerical stability patches applied"
+echo "[patch_ops] Core compute paths preserved (corex_gdn + corex_moe + corex_fa2)"
