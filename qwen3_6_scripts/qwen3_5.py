@@ -895,9 +895,14 @@ class Qwen3_5MoeSparseBlock(nn.Module):
             seg_eids = sorted_eids[seg_starts]
 
             # Process each expert segment (contiguous tokens → single F.linear)
-            for seg_i in range(len(seg_starts)):
-                s, e = int(seg_starts[seg_i]), int(seg_ends[seg_i])
-                eid = int(seg_eids[seg_i])
+            # CCCL basic_vector.cu: device→host copy should be batched.
+            # .tolist() does ONE GPU→CPU sync vs int() doing one per element.
+            seg_starts_cpu = seg_starts.tolist()
+            seg_ends_cpu = seg_ends.tolist()
+            seg_eids_cpu = seg_eids.tolist()
+            for seg_i in range(len(seg_starts_cpu)):
+                s, e = seg_starts_cpu[seg_i], seg_ends_cpu[seg_i]
+                eid = seg_eids_cpu[seg_i]
                 tok_ids_seg = sorted_tok_ids[s:e]
                 topk_pos_seg = sorted_topk_pos[s:e]
 
