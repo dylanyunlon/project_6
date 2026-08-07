@@ -36,6 +36,36 @@ if HAS_TRITON:
 #   = ceil(100000 / 160) = 625 → round to 640 (multiple of block_size=16)
 #
 # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
+# ═══════════════════════════════════════════════════════════════════════
+# CCCL GridEvenShare partition sizing (grid_even_share.cuh DispatchInit)
+#
+# CCCL scan benchmark (bench/scan/exclusive/sum.cu) reveals the full
+# parameter space that determines partition performance:
+#   %RANGE% TUNE_ITEMS ipt 7:24:1          — items per thread
+#   %RANGE% TUNE_THREADS tpb 128:1024:32   — threads per block
+#   %RANGE% TUNE_MAGIC_NS ns 0:2048:4      — lookback delay
+#   %RANGE% TUNE_DELAY_CONSTRUCTOR_ID dcid 0:7:1  — delay algorithm
+#   %RANGE% TUNE_L2_WRITE_LATENCY_NS l2w 0:1200:5 — L2 write latency
+#
+# For paged attention partitioned dispatch, _PARTITION_SIZE is the
+# analogue of (tpb * ipt) — it determines how many KV tokens each
+# CTA processes before requiring cross-partition merge (the "second
+# pass" in CCCL dispatch_reduce.cuh terminology).
+#
+# CCCL grid_even_share.cuh teaches:
+#   max_grid_size = sm_occupancy * sm_count * subscription_factor
+#   total_tiles = ceil(num_items / tile_items)
+#   grid_size = min(total_tiles, max_grid_size)
+#
+# BI-V100 hardware (confirmed):
+#   SM count = 16, sm_occupancy ≈ 2 CTAs/SM, subscription = 5
+#   max_grid = 16 * 2 * 5 = 160 CTAs
+#
+# The precompiled .so expects PARTITION_SIZE=512 (baked into the kernel).
+# We cannot change this without recompiling. But we CAN optimize the
+# Python-side dispatch: V1 vs V2 threshold, temp buffer caching, and
+# partition count calculation.
+# ═══════════════════════════════════════════════════════════════════════
 _PARTITION_SIZE = 512
 
 # CCCL-derived constants for BI-V100 (from hardware.cuh + grid_even_share.cuh)
@@ -43,6 +73,14 @@ _BI100_SM_COUNT = 16
 _BI100_SM_OCCUPANCY = 2        # CTAs per SM (conservative)
 _BI100_SUBSCRIPTION = 5        # CCCL util_device.cuh default
 _BI100_MAX_GRID = _BI100_SM_COUNT * _BI100_SM_OCCUPANCY * _BI100_SUBSCRIPTION  # 160
+
+# CCCL reduce benchmark (bench/reduce/base.cuh) teaches:
+# scale_mem_bound adapts tile size to type. For paged_attention:
+#   score type = float32 (4B), query type = float16 (2B)
+#   CCCL would scale: items = nominal * 4 / type_size
+#   With nominal=16 (SM600 default): float32 → items=16, float16 → items=32
+# This means: if we could control the .so, float16 KV cache should use
+# 2x larger partitions than float32 scores. Document for future rebuild.
 
 
 @dataclass

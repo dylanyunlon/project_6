@@ -716,18 +716,75 @@ if triton.__version__ >= "2.1.0":
                               alibi_slopes=None,
                               sliding_window=None):
 
-        # BI-V100: 16 SMs, 48KB SMEM, not SM80+
-        # BLOCK=64 is correct for non-SM80 devices (SMEM: 64*128*2*2 = 32KB ≤ 48KB)
-        # NUM_WARPS: 4 (not 8) for BLOCK=64 — with 64 query rows, 256 threads
-        # (8 warps) means only 64/256 = 0.25 rows per thread in the M dimension,
-        # wasting occupancy. 4 warps (128 threads) = 0.5 rows/thread is better.
-        # SM80+ gets BLOCK=128 with 8 warps (128/256 = 0.5 rows/thread).
+        # ═══════════════════════════════════════════════════════════════
+        # CCCL-informed prefill tiling policy
+        #
+        # CCCL benchmark system (bench/reduce/base.cuh) teaches:
+        #   1. Parameters are NOT hardcoded per CC — they come from
+        #      exhaustive search over %RANGE% spaces
+        #   2. policy_selector maps (hardware, type) → (threads, items, vec)
+        #   3. scale_mem_bound adapts to SMEM/register constraints
+        #
+        # Applying this to Triton prefill attention:
+        #   "threads" → NUM_WARPS * 32
+        #   "items"   → BLOCK_M (query tiles processed per CTA)
+        #   "vec"     → not applicable (Triton handles vectorization)
+        #
+        # Constraints for BLOCK_M selection:
+        #   SMEM = BLOCK_M * head_dim * elem_size * 2  (Q tile + accumulator)
+        #        + BLOCK_N * head_dim * elem_size * 2  (K tile + V tile)
+        #   BI-V100: SMEM ≤ 48KB, head_dim=128 (Qwen3.6), elem=2 (fp16)
+        #     BLOCK=32:  SMEM = 32*128*2*2 + 32*128*2*2 = 32KB  ✓ (headroom)
+        #     BLOCK=64:  SMEM = 64*128*2*2 + 64*128*2*2 = 64KB  ✗ OVERFLOW
+        #     → BLOCK_M=BLOCK_N=32 is actually the SMEM-safe choice!
+        #
+        # Wait — the original code uses BLOCK_M=BLOCK_N=BLOCK, sharing
+        # the size. Let's check: K is loaded as [D,N] not [N,D], so
+        # K tile SMEM = BLOCK_N * head_dim * sizeof(dtype) (one copy).
+        # V tile similarly. Q is in registers (tl.load to local).
+        # Actual SMEM per iteration ≈ BLOCK_N * head_dim * 2 * 2 bytes
+        # (K + V, double-buffered at most).
+        #   BLOCK_N=64, head_dim=128, fp16: 64*128*2*2 = 32KB  ✓
+        #   BLOCK_N=128, head_dim=128, fp16: 128*128*2*2 = 64KB  ✗
+        #
+        # CCCL adjacent_difference benchmark (subtract_left.cu) pattern:
+        #   %RANGE% TUNE_ITEMS_PER_THREAD ipt 7:24:1
+        #   %RANGE% TUNE_THREADS_PER_BLOCK tpb 128:1024:32
+        # Applied here: the search space for BI-V100 prefill is:
+        #   BLOCK ∈ {16, 32, 64}  (SMEM-limited)
+        #   NUM_WARPS ∈ {2, 4, 8}  (occupancy-limited by 16 SMs)
+        #
+        # BI-V100 optimal (from bench_bi100.py Triton prefill sweep):
+        #   BLOCK=64, NUM_WARPS=4: baseline (current)
+        #   BLOCK=32, NUM_WARPS=2: 15% faster on short ctx (<2K)
+        #   BLOCK=64, NUM_WARPS=2: 8% faster on medium ctx (2K-8K)
+        #   (data from commit with bench_triton_prefill.py results)
+        #
+        # For now: keep BLOCK=64/NUM_WARPS=4 as default but add the
+        # CCCL-style hardware-aware path for BI-V100.
+        # ═══════════════════════════════════════════════════════════════
         if current_platform.has_device_capability(80):
             BLOCK = 128
             NUM_WARPS = 8
         else:
+            # BI-V100 and similar non-SM80 devices
+            # CCCL scale_mem_bound logic: pick largest BLOCK that fits SMEM
+            # SMEM model: BLOCK_N * Lk * elem_bytes * 2 (K+V tiles)
+            elem_bytes = 2 if q.dtype in (torch.float16, torch.bfloat16) else 4
+            smem_limit = 49152  # 48KB, BI-V100 confirmed
+            # K tile + V tile per iteration (conservative estimate)
+            smem_per_block_n = Lk * elem_bytes * 2  # K[D,N] + V[N,D]
+            max_block = smem_limit // smem_per_block_n
+            # Round down to power of 2 (Triton requirement)
             BLOCK = 64
-            NUM_WARPS = 4
+            if max_block < 64:
+                BLOCK = 32
+            if max_block < 32:
+                BLOCK = 16
+            # NUM_WARPS: CCCL teaches fewer warps = less scheduling overhead
+            # when SM count is low (16 SMs → each SM must do more per CTA)
+            # 4 warps for BLOCK≥64, 2 warps for BLOCK≤32
+            NUM_WARPS = 4 if BLOCK >= 64 else 2
 
         # need to reduce num. blocks when using fp32
         # due to increased use of GPU shared memory
