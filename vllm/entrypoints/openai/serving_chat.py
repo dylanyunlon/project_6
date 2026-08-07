@@ -147,6 +147,35 @@ class OpenAIServingChat(OpenAIServing):
 
             prompt: Union[str, List[int]]
             is_mistral_tokenizer = isinstance(tokenizer, MistralTokenizer)
+
+            # Build effective chat_template_kwargs.
+            # When tools are active (tool_choice != "none"), disable thinking
+            # to prevent the model from wasting tokens on <think>...</think>
+            # before emitting tool call XML.  This is the key fix for d03_tool_call.
+            effective_chat_template_kwargs = dict(
+                request.chat_template_kwargs or {})
+
+            _tool_call_active = (
+                tool_dicts is not None
+                and request.tool_choice not in (None, "none"))
+            if _tool_call_active:
+                if "enable_thinking" not in effective_chat_template_kwargs:
+                    effective_chat_template_kwargs["enable_thinking"] = False
+                    logger.info(
+                        "Tool call detected (tool_choice=%s) — injecting "
+                        "enable_thinking=False into chat_template_kwargs",
+                        request.tool_choice)
+
+            # Respect OpenAI-style `thinking` request field
+            if hasattr(request, 'thinking') and request.thinking:
+                thinking_type = request.thinking.get("type", "enabled")
+                if thinking_type == "disabled":
+                    effective_chat_template_kwargs["enable_thinking"] = False
+                elif thinking_type == "enabled":
+                    if not _tool_call_active:
+                        effective_chat_template_kwargs.setdefault(
+                            "enable_thinking", True)
+
             if is_mistral_tokenizer:
                 prompt = apply_mistral_chat_template(
                     tokenizer,
@@ -156,7 +185,7 @@ class OpenAIServingChat(OpenAIServing):
                     continue_final_message=request.continue_final_message,
                     tools=tool_dicts,
                     documents=request.documents,
-                    **(request.chat_template_kwargs or {}),
+                    **effective_chat_template_kwargs,
                 )
             else:
                 prompt = apply_hf_chat_template(
@@ -167,8 +196,10 @@ class OpenAIServingChat(OpenAIServing):
                     continue_final_message=request.continue_final_message,
                     tools=tool_dicts,
                     documents=request.documents,
-                    **(request.chat_template_kwargs or {}),
+                    **effective_chat_template_kwargs,
                 )
+
+            request.chat_template_kwargs = effective_chat_template_kwargs
         except Exception as e:
             logger.exception("Error in applying chat template from request")
             return self.create_error_response(str(e))
