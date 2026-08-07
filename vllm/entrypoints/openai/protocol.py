@@ -40,8 +40,8 @@ class CustomChatCompletionMessageParam(TypedDict, total=False):
     role: Required[str]
     """The role of the message's author."""
 
-    content: Union[str, List[ChatCompletionContentPartParam]]
-    """The contents of the message."""
+    content: Union[str, List[ChatCompletionContentPartParam], None]
+    """The contents of the message. None for tool_call assistant messages."""
 
     name: str
     """An optional name for the participant.
@@ -160,6 +160,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     logprobs: Optional[bool] = False
     top_logprobs: Optional[int] = 0
     max_tokens: Optional[int] = None
+    # OpenAI newer API sends max_completion_tokens; map to max_tokens
+    # CCCL dispatch_common.cuh pattern: use_default — accept the param,
+    # normalize to internal representation, don't reject unknown fields.
+    max_completion_tokens: Optional[int] = None
     n: Optional[int] = 1
     presence_penalty: Optional[float] = 0.0
     response_format: Optional[ResponseFormat] = None
@@ -176,6 +180,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # NOTE this will be ignored by VLLM -- the model determines the behavior
     parallel_tool_calls: Optional[bool] = False
     user: Optional[str] = None
+
+    # OpenAI reasoning API: thinking field controls chain-of-thought
+    # e.g. {"type": "enabled"} or {"type": "disabled"}
+    # Accepted but not enforced at API layer — model config determines behavior
+    thinking: Optional[Dict[str, Any]] = None
 
     # doc: begin-chat-completion-sampling-params
     best_of: Optional[int] = None
@@ -305,7 +314,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
         )
 
     def to_sampling_params(self, default_max_tokens: int) -> SamplingParams:
+        # CCCL use_default: normalize max_completion_tokens → max_tokens
         max_tokens = self.max_tokens
+        if max_tokens is None and self.max_completion_tokens is not None:
+            max_tokens = self.max_completion_tokens
         if max_tokens is None:
             max_tokens = default_max_tokens
 
