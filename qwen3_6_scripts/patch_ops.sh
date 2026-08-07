@@ -107,19 +107,15 @@ done
 echo "[patch_ops] reasoning parser + serving files installed"
 
 # ============================================================
-# 4. CCCL Agent-pattern: numerical stability patch for qwen3_5.py
-#    Sub509 docker logs: 99.98% NaN in every GatedDeltaNet layer.
-#    Base image has NaN detection + nan_to_num(nan=0.0), but that
-#    means DeltaNet layers output all-zeros → model "brain dead"
-#    → can't produce <tool_call> XML → d03 FAIL.
-#
-#    Strategy (CCCL optionally_static): detect what guards exist,
-#    inject ONLY what's missing. Preserve corex kernel paths.
-#    Agent flow: Init → Detect → Patch → Verify.
+# 4. Numerical stability patch — DISABLED
+#    If corex_gdn loads (which it should without pip install),
+#    the Python _torch_chunk_gated_delta_rule is NEVER called.
+#    Patching qwen3_5.py risks breaking corex import conditions.
+#    Only enable this if docker logs still show NaN after corex fix.
 # ============================================================
-python3 ./patch_numerical_stability.py 2>&1 || \
-    echo "[patch_ops] WARNING: numerical stability patch failed (non-fatal)"
-echo "[patch_ops] numerical stability patch complete"
+# python3 ./patch_numerical_stability.py 2>&1 || \
+#     echo "[patch_ops] WARNING: numerical stability patch failed (non-fatal)"
+echo "[patch_ops] numerical stability patch SKIPPED (corex_gdn handles DeltaNet)"
 
 # ============================================================
 # 5. DO NOT full-replace these files — base image has optimized versions.
