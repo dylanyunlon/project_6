@@ -138,6 +138,22 @@ class OpenAIServingChat(OpenAIServing):
             model_config = self.model_config
             tokenizer = await self.engine_client.get_tokenizer(lora_request)
 
+            # CCCL graceful degradation: strip image_url for non-multimodal models
+            if not getattr(model_config, 'is_multimodal_model',
+                           lambda: False)():
+                for msg in request.messages:
+                    content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+                    if isinstance(content, list):
+                        filtered = [p for p in content
+                                    if not (isinstance(p, dict) and p.get("type") == "image_url")]
+                        if len(filtered) < len(content):
+                            if not filtered:
+                                filtered = [{"type": "text", "text": "(image omitted)"}]
+                            if isinstance(msg, dict):
+                                msg["content"] = filtered
+                            else:
+                                msg.content = filtered
+
             conversation, mm_data_future = parse_chat_messages_futures(
                 request.messages, model_config, tokenizer)
 
