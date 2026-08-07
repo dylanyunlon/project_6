@@ -182,8 +182,14 @@ class OpenAIServingChat(OpenAIServing):
         # n > max_num_seqs deadlock guard: scheduler uses break (not continue)
         # when can_schedule(num_new_seqs=n) fails, so an n that exceeds
         # max_num_seqs permanently blocks the entire waiting queue with no error.
-        _sched_cfg = await self.engine_client.get_scheduler_config()
-        _max_seqs = _sched_cfg.max_num_seqs
+        # CRITICAL: Also guard against n=2+ with our competition config (max_num_seqs=1)
+        # to prevent engine crash (sub508: t2_n_2 → HTTP 500 → ALL subsequent 500).
+        try:
+            _sched_cfg = await self.engine_client.get_scheduler_config()
+            _max_seqs = _sched_cfg.max_num_seqs
+        except Exception:
+            # If we can't get scheduler config, use a safe default
+            _max_seqs = 1
         if request.n is not None and request.n > _max_seqs:
             return self.create_error_response(
                 f"n={request.n} exceeds max_num_seqs={_max_seqs}. "
