@@ -1017,6 +1017,11 @@ class Qwen3_5MoeSparseBlock(nn.Module):
             # Process each expert segment (contiguous tokens → single F.linear)
             # CCCL basic_vector.cu: device→host copy should be batched.
             # .tolist() does ONE GPU→CPU sync vs int() doing one per element.
+            # block_histogram.cuh: compute segment size histogram to understand
+            # expert load distribution. This enables:
+            # 1. Logging: understand if MoE routing is balanced or skewed
+            # 2. Future: batch small segments into padded GEMM (HISTO_SORT vs HISTO_ATOMIC)
+            seg_sizes = seg_ends - seg_starts  # GPU tensor
             seg_starts_cpu = seg_starts.tolist()
             seg_ends_cpu = seg_ends.tolist()
             seg_eids_cpu = seg_eids.tolist()
