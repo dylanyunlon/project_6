@@ -1050,25 +1050,20 @@ class Qwen3_5MoeSparseBlock(nn.Module):
             sorted_tok_ids = flat_tok_ids[sort_idx]
             sorted_topk_pos = flat_topk_pos[sort_idx]
 
-            # Find segment boundaries — CCCL reduce_by_key: identify contiguous runs
-            # This replaces the unique().tolist() + per-expert mask.nonzero() pattern
-            changes = torch.cat([
-                torch.tensor([True], device=sorted_eids.device),
-                sorted_eids[1:] != sorted_eids[:-1],
-            ])
-            seg_starts = changes.nonzero(as_tuple=True)[0]
-            seg_ends = torch.cat([seg_starts[1:],
-                                  torch.tensor([len(sorted_eids)], device=seg_starts.device)])
-            seg_eids = sorted_eids[seg_starts]
+            # thrust/examples/mode.cu complete pipeline translation:
+            #   sort → unique_count → reduce_by_key(data, constant_iterator<1>) → max_element
+            # torch.unique_consecutive = sort's reduce_by_key in one fused call.
+            # Returns (unique_keys, inverse, counts) — mode.cu builds the same from
+            # sort + reduce_by_key(data, constant_iterator<1>, keys, counts).
+            # Replaces: changes detection → nonzero → concat → 3 separate GPU ops.
+            seg_eids, _inv, seg_counts = torch.unique_consecutive(
+                sorted_eids, return_inverse=True, return_counts=True)
+            seg_ends = seg_counts.cumsum(0)
+            seg_starts = torch.cat([
+                torch.zeros(1, dtype=seg_ends.dtype, device=seg_ends.device),
+                seg_ends[:-1]])
 
-            # Process each expert segment (contiguous tokens → single F.linear)
-            # CCCL basic_vector.cu: device→host copy should be batched.
-            # .tolist() does ONE GPU→CPU sync vs int() doing one per element.
-            # block_histogram.cuh: compute segment size histogram to understand
-            # expert load distribution. This enables:
-            # 1. Logging: understand if MoE routing is balanced or skewed
-            # 2. Future: batch small segments into padded GEMM (HISTO_SORT vs HISTO_ATOMIC)
-            seg_sizes = seg_ends - seg_starts  # GPU tensor
+            # Process each expert segment
             seg_starts_cpu = seg_starts.tolist()
             seg_ends_cpu = seg_ends.tolist()
             seg_eids_cpu = seg_eids.tolist()
