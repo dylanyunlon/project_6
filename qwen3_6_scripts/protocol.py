@@ -57,7 +57,10 @@ class CustomChatCompletionMessageParam(TypedDict, total=False):
 
 class OpenAIBaseModel(BaseModel):
     # OpenAI API does not allow extra fields
-    model_config = ConfigDict(extra="forbid")
+    # Real-world clients (replay, third-party SDKs) may send extra fields
+    # like service_tier, store, metadata, reasoning_effort, etc.
+    # "ignore" accepts the request and silently drops unknown fields.
+    model_config = ConfigDict(extra="ignore")
 
 
 class ErrorResponse(OpenAIBaseModel):
@@ -516,6 +519,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
         # if "tool_choice" is specified -- validation
         if "tool_choice" in data:
+
+            # "none" means don't use any tools — valid per OpenAI spec,
+            # just strip tool_choice and let vLLM ignore tools.
+            if data["tool_choice"] == "none":
+                del data["tool_choice"]
+                return data
 
             # ensure that if "tool choice" is specified, tools are present
             if "tools" not in data or data["tools"] is None:
