@@ -830,8 +830,30 @@ def invoke_fused_moe_kernel(
 def topk_softmax(topk_weights: torch.Tensor, topk_ids: torch.Tensor,
                  token_expert_indicies: torch.Tensor,
                  gating_output: float) -> None:
-    ixf_F.vllm_moe_topk_softmax(topk_weights, topk_ids,
-                                  token_expert_indicies, gating_output)
+    # CCCL policy_selector degradation: when one kernel in the chain is
+    # unavailable, replace ONLY that kernel with PyTorch while keeping the
+    # downstream native kernels (moe_align_block_size, invoke_fused_moe_kernel).
+    # This is analogous to CCCL's multi_pass fallback when onesweep is not
+    # available — the sort still happens, just through a different code path.
+    try:
+        ixf_F.vllm_moe_topk_softmax(topk_weights, topk_ids,
+                                      token_expert_indicies, gating_output)
+    except (AttributeError, RuntimeError):
+        # PyTorch fallback: softmax → topk → write in-place
+        # gating_output is already float32 (cast at call site)
+        if isinstance(gating_output, torch.Tensor):
+            probs = torch.softmax(gating_output, dim=-1)
+        else:
+            probs = torch.softmax(gating_output, dim=-1)
+        topk = topk_weights.shape[1]
+        tw, ti = torch.topk(probs, topk, dim=-1)
+        topk_weights.copy_(tw)
+        topk_ids.copy_(ti.to(topk_ids.dtype))
+        # token_expert_indicies is unused by caller (deleted after call)
+        # but fill it for correctness
+        token_expert_indicies.copy_(
+            torch.arange(topk, device=topk_ids.device, dtype=topk_ids.dtype)
+            .unsqueeze(0).expand_as(topk_ids))
 
 
 if supports_moe_ops and hasattr(torch.ops._moe_C, "marlin_gemm_moe"):

@@ -912,20 +912,31 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         #   ixf_F.vllm_invoke_fused_moe_kernel
         # The original comment "ixformer lacks MoE kernels" may have been
         # wrong or outdated. Try native first, catch and fallback if it fails.
+        # CCCL policy_selector pattern: try native fused kernel chain first.
+        # topk_softmax now has PyTorch fallback (see _custom_ops.py), so the
+        # chain topk_softmax→align→invoke may succeed even without the native
+        # topk op. Only permanently disable if align or invoke also fails.
         if not hasattr(self, '_use_native_moe'):
-            self._use_native_moe = True  # optimistic: try native first
+            self._use_native_moe = True
+            self._native_moe_attempts = 0
 
         if self._use_native_moe:
             try:
                 routed_out = self.experts(hidden_states, router_logits)
             except Exception as e:
-                # Native kernel failed — disable permanently for this instance
-                # and fallback to pure PyTorch for all subsequent calls.
-                logger.warning(
-                    "FusedMoE native kernel failed (%s: %s), "
-                    "falling back to pure PyTorch experts permanently.",
-                    type(e).__name__, e)
-                self._use_native_moe = False
+                self._native_moe_attempts += 1
+                if self._native_moe_attempts >= 2:
+                    # Failed twice (first call + retry) — truly no native support
+                    logger.warning(
+                        "FusedMoE native kernel failed %d times (%s: %s), "
+                        "falling back to pure PyTorch experts permanently.",
+                        self._native_moe_attempts, type(e).__name__, e)
+                    self._use_native_moe = False
+                else:
+                    logger.info(
+                        "FusedMoE native kernel failed on attempt %d (%s: %s), "
+                        "will retry next call.",
+                        self._native_moe_attempts, type(e).__name__, e)
                 routed_out = self._pure_pytorch_experts(hidden_states, router_logits)
         else:
             routed_out = self._pure_pytorch_experts(hidden_states, router_logits)
