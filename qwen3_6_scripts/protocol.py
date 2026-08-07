@@ -305,6 +305,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
         max_tokens = self.max_tokens
         if max_tokens is None:
             max_tokens = default_max_tokens
+        if default_max_tokens > 0:
+            max_tokens = min(max_tokens, default_max_tokens)
 
         n = self.n if self.n is not None else 1
         temperature = self.temperature if self.temperature is not None else 0.0
@@ -321,6 +323,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
         max_tokens = self.max_tokens
         if max_tokens is None:
             max_tokens = default_max_tokens
+        # Clamp to available context space so requests with max_tokens ≥
+        # max_model_len don't get rejected with HTTP 400.
+        if default_max_tokens > 0:
+            max_tokens = min(max_tokens, default_max_tokens)
 
         prompt_logprobs = self.prompt_logprobs
         if prompt_logprobs is None and self.echo:
