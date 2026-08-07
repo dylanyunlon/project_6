@@ -921,6 +921,14 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         self.shared_expert_gate = ReplicatedLinear(
             hidden_size, 1, bias=False, quant_config=quant_config)
 
+        # sync_handler.cuh: register resources at init, initialize once.
+        # Pre-declare MoE strategy here (resolved on first forward when device
+        # is known). _use_native_moe is set to None = "not yet decided".
+        # This avoids hasattr() checks in the forward hot path.
+        self._use_native_moe: Optional[bool] = None
+        self._moe_out_buf: Optional[torch.Tensor] = None
+        self._moe_out_buf_key: Optional[tuple] = None
+
     def _pure_pytorch_experts(
         self,
         hidden_states: torch.Tensor,
@@ -1076,9 +1084,9 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         #   ixf_F.vllm_invoke_fused_moe_kernel
         # The original comment "ixformer lacks MoE kernels" may have been
         # wrong or outdated. Try native first, catch and fallback if it fails.
-        # cc_dispatch pattern: _hw_policy detected MoE kernel availability at
-        # module load. Skip native attempt entirely if we know it will fail.
-        if not hasattr(self, '_use_native_moe'):
+        # cc_dispatch + sync_handler: strategy resolved on first call,
+        # pre-registered field checked as None (no hasattr overhead).
+        if self._use_native_moe is None:
             _hw_policy.detect(hidden_states.device)
             # Only try native if at least align+invoke are available
             # (topk_softmax has PyTorch fallback in _custom_ops.py)
