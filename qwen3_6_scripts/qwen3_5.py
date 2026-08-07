@@ -263,16 +263,31 @@ def _torch_chunk_gated_delta_rule(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
         diagonal=1)
 
-    for i in range(total_len // chunk_size):
+    # CCCL block_scan.cuh BLOCK_SCAN_RAKING_MEMOIZE strategy:
+    # Precompute all per-chunk exp values outside the loop, eliminating
+    # redundant exp() inside the sequential cross-chunk scan.
+    # RAKING_MEMOIZE: "preserve upsweep segment values in registers while
+    # performing warp-synchronous scan, allowing downsweep not to re-read."
+    num_chunks = total_len // chunk_size
+    # g shape: (batch, heads, num_chunks, chunk_size)
+    # g_exp_full[i] = exp(g[:,:,i,:]) for attn_inter computation
+    g_exp_full = g.exp()  # (batch, heads, num_chunks, chunk_size)
+    # g_last_exp[i] = exp(g[:,:,i,-1]) for state decay
+    g_last_exp = g_exp_full[:, :, :, -1]  # (batch, heads, num_chunks)
+    # g_diff_exp[i] = exp(g[:,:,i,-1] - g[:,:,i,:]) for k_i weighting
+    g_diff_exp = (g[:, :, :, -1:] - g).exp()  # (batch, heads, num_chunks, chunk_size)
+
+    for i in range(num_chunks):
         q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
         attn_i = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask_upper2, 0)
         v_prime = k_cumdecay[:, :, i] @ last_state
         v_new = v_i - v_prime
-        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_state
+        # Use precomputed exp (MEMOIZE: no redundant exp in loop body)
+        attn_inter = (q_i * g_exp_full[:, :, i, :, None]) @ last_state
         core_out[:, :, i] = attn_inter + attn_i @ v_new
         last_state = (
-            last_state * g[:, :, i, -1, None, None].exp()
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None])
+            last_state * g_last_exp[:, :, i, None, None]
+            + (k_i * g_diff_exp[:, :, i, :, None])
             .transpose(-1, -2) @ v_new
         )
 
