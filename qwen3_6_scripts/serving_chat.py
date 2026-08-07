@@ -303,6 +303,22 @@ class OpenAIServingChat(OpenAIServing):
             sampling_params: Union[SamplingParams, BeamSearchParams]
             default_max_tokens = self.max_model_len - len(
                 prompt_inputs["prompt_token_ids"])
+
+            # CCCL thread_reduce pattern: small request fast path.
+            # For tool_call requests, the expected output is just
+            # <tool_call><function=name><parameter=...>...</tool_call>
+            # which is typically <500 tokens. Capping default_max_tokens
+            # prevents the model from generating 99900 tokens of garbage
+            # when NaN-damaged weights produce non-terminating output.
+            # Only apply when user didn't explicitly set max_tokens.
+            if (_tool_call_active
+                    and request.max_tokens is None
+                    and default_max_tokens > 2048):
+                default_max_tokens = min(default_max_tokens, 2048)
+                logger.info(
+                    "Tool call fast path: capping default_max_tokens to %d",
+                    default_max_tokens)
+
             if request.use_beam_search:
                 sampling_params = request.to_beam_search_params(
                     default_max_tokens)
