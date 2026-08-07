@@ -304,20 +304,18 @@ class OpenAIServingChat(OpenAIServing):
             default_max_tokens = self.max_model_len - len(
                 prompt_inputs["prompt_token_ids"])
 
-            # CCCL thread_reduce pattern: small request fast path.
-            # For tool_call requests, the expected output is just
-            # <tool_call><function=name><parameter=...>...</tool_call>
-            # which is typically <500 tokens. Capping default_max_tokens
-            # prevents the model from generating 99900 tokens of garbage
-            # when NaN-damaged weights produce non-terminating output.
-            # Only apply when user didn't explicitly set max_tokens.
-            if (_tool_call_active
-                    and request.max_tokens is None
-                    and default_max_tokens > 2048):
-                default_max_tokens = min(default_max_tokens, 2048)
-                logger.info(
-                    "Tool call fast path: capping default_max_tokens to %d",
-                    default_max_tokens)
+            # CCCL bench.py timeout pattern: cap default_max_tokens.
+            # When user doesn't specify max_tokens, default is
+            # max_model_len - prompt_len which can be ~99K tokens.
+            # NaN-damaged model generates endless garbage. Competitor
+            # Sub168 generates 139-2497 tokens per request.
+            # Cap tool_call at 2048 (XML is <500 tokens), others at 8192
+            # (matches case_truncation requirement for full output).
+            if request.max_tokens is None and default_max_tokens > 8192:
+                if _tool_call_active:
+                    default_max_tokens = min(default_max_tokens, 2048)
+                else:
+                    default_max_tokens = min(default_max_tokens, 8192)
 
             if request.use_beam_search:
                 sampling_params = request.to_beam_search_params(

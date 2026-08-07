@@ -8,7 +8,7 @@ command:
     - --served-model-name
     - llm
     - --max-model-len
-    - '32768'
+    - '100000'
     - --gpu-memory-utilization
     - '0.90'
     - --trust-remote-code
@@ -16,8 +16,6 @@ command:
     - '4'
     - --max-num-seqs
     - '1'
-    - --max-num-batched-tokens
-    - '4096'
     - --disable-log-requests
     - --disable-frontend-multiprocessing
     - --enforce-eager
@@ -27,7 +25,6 @@ command:
     - --reasoning-parser
     - qwen3
     - --enable-prefix-caching
-    - --enable-chunked-prefill
     - --dtype
     - half
 env:
