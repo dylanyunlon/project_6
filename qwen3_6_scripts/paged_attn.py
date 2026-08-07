@@ -576,7 +576,9 @@ class PagedAttention:
             #     tile_sz=256  → 24 MB (safe)
             #   For decode (q_len=1): tile_sz=4096 → only 96 KB (always safe)
             # ================================================================
-            _SMEM_BUDGET_BYTES = 96 * 1024 * 1024  # 96 MB score tensor budget
+            _SMEM_BUDGET_BYTES = 256 * 1024 * 1024  # 256 MB score tensor budget
+            # CCCL GridEvenShare: fewer tiles = fewer iterations = less overhead
+            # BI-V100 has 32 GB HBM per card; 256 MB temporary is safe.
 
             batch_size   = seq_lens_tensor.shape[0]
             num_q_heads  = query.shape[1]
