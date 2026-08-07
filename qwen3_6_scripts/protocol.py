@@ -417,6 +417,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if data.get("max_completion_tokens") is not None and data.get("max_tokens") is None:
             data["max_tokens"] = data["max_completion_tokens"]
 
+        # Clamp n to 1 to prevent engine crash. Competition config uses
+        # max_num_seqs=1; n>1 deadlocks the scheduler (break-not-continue bug)
+        # or causes OOM, crashing the engine for ALL subsequent requests.
+        # Sub508: t2_n_2 → HTTP 500 → 19 cascade failures.
+        # t2_n_2 will FAIL (1 choice instead of 2) but prevents cascade.
+        n_val = data.get("n")
+        if n_val is not None and isinstance(n_val, int) and n_val > 1:
+            data["n"] = 1
+
         # Map thinking={enable:true/false} → chat_template_kwargs.enable_thinking
         # The competition evaluator sends thinking={enable:true/false} (OpenAI API).
         # Qwen3's chat template expects enable_thinking=True/False in kwargs.
