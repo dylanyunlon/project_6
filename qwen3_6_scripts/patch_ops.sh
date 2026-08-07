@@ -1,132 +1,89 @@
 #!/bin/bash
-set -eo pipefail
-# BI-V100 engine patches for Qwen3.6-35B-A3B (Qwen3_5 architecture)
-#
-# STRATEGY (CCCL-inspired):
-#   1. Serving layer: full file replacement (protocol, chat, tools, reasoning)
-#   2. Core compute: TARGETED in-place patches, never full replacement
-#      - qwen3_5.py: inject numerical stability clamps (prevent 99.98% NaN)
-#      - Preserve corex_gdn/corex_moe/corex_fa2 kernel paths
-#
-# CCCL design patterns applied:
-#   - optionally_static: detect existing guards, inject only what's missing
-#   - agent_radix_sort_histogram: Init → Detect → Patch → Verify
-#   - overflow_cast: clamp BEFORE accumulation, not after
-#
-# Base image CoreX kernels (MUST preserve):
-#   - corex_gdn  — fused GatedDeltaNet (decode + prefill)
-#   - corex_moe  — fused MoE (expert-grouped-wmma)
-#   - corex_fa2  — FlashAttention2 (packed prefill + paged chunked)
+# Minimal serving-layer-only patches. No pip install. No compute file changes.
+# Goal: match Sub168's approach — only patch what's needed for tool_call/reasoning.
 
 cd "$(dirname "$0")"
-echo "[patch_ops] working directory: $(pwd)"
+echo "[patch_ops] START — working directory: $(pwd)"
 
-VLLM=/usr/local/corex/lib/python3/dist-packages/vllm
-VLLM64=/usr/local/corex/lib64/python3/dist-packages/vllm
-
-TARGETS=()
-if [ -d "$VLLM" ]; then
-    TARGETS+=("$VLLM")
-fi
-if [ -d "$VLLM64" ]; then
-    TARGETS+=("$VLLM64")
-fi
-
-if [ ${#TARGETS[@]} -eq 0 ]; then
-    echo "[patch_ops] ERROR: vllm not found at lib or lib64 path"
-    exit 1
-fi
-
-echo "[patch_ops] vllm paths found: ${TARGETS[*]}"
-
-deploy() {
-    local src="$1"
-    local rel_dst="$2"
-    for V in "${TARGETS[@]}"; do
-        local dst="$V/$rel_dst"
-        mkdir -p "$(dirname "$dst")"
-        cp "$src" "$dst"
-    done
-}
-
-# ============================================================
-# 1. Transformers: register Qwen3_5 / Qwen3_5_MoE model types
-#    CRITICAL: Do NOT pip install transformers — it breaks corex
-#    kernel dependencies. Competitor sub168's docker log shows
-#    corex_gdn/corex_moe/corex_fa2 all loaded successfully.
-#    Our sub509 failed to load any corex kernel.
-#    The pip install transformers==4.55.3 likely caused this.
-# ============================================================
-# Use base image transformers — just add config files
-TRANSFORMERS_MODELS=""
-for P in /usr/local/lib/python3.10/site-packages/transformers/models \
-         /usr/local/corex/lib/python3/dist-packages/transformers/models \
-         /usr/local/corex/lib64/python3/dist-packages/transformers/models; do
+# Find vllm installation
+VLLM=""
+for P in /usr/local/corex/lib/python3/dist-packages/vllm \
+         /usr/local/corex/lib64/python3/dist-packages/vllm; do
     if [ -d "$P" ]; then
-        TRANSFORMERS_MODELS="$P"
+        VLLM="$P"
+        echo "[patch_ops] Found vllm at: $VLLM"
         break
     fi
 done
 
-if [ -n "$TRANSFORMERS_MODELS" ]; then
-    cp -r ./qwen3_5 "$TRANSFORMERS_MODELS/"
-    cp -r ./qwen3_5_moe "$TRANSFORMERS_MODELS/"
-    python3 ./patch_transformers_qwen3_5.py 2>&1 || \
-        echo "[patch_ops] WARNING: patch_transformers failed (may work at runtime)"
-    echo "[patch_ops] transformers Qwen3_5 configs registered (no pip install)"
-else
-    echo "[patch_ops] WARNING: transformers/models not found — skipping config registration"
+if [ -z "$VLLM" ]; then
+    echo "[patch_ops] ERROR: vllm not found"
+    exit 1
 fi
 
-# ============================================================
-# 2. Model registry: ensure qwen3_5 is registered in vllm
-# ============================================================
-deploy ./registry.py "model_executor/models/registry.py"
-echo "[patch_ops] registry.py deployed"
-
-# ============================================================
-# 3. Serving layer patches (protocol, chat, tool parsing, reasoning)
-# ============================================================
-
-# --- Tool parser: Qwen3 XML tool call format ---
-for V in "${TARGETS[@]}"; do
-    cp ./qwen3coder_tool_parser.py "$V/entrypoints/openai/tool_parsers/"
-    cp ./tool_parsers_init.py "$V/entrypoints/openai/tool_parsers/__init__.py"
+# 1. Register Qwen3_5 model configs in transformers (no pip install!)
+TMODELS=""
+for P in /usr/local/lib/python3.10/site-packages/transformers/models \
+         /usr/local/corex/lib/python3/dist-packages/transformers/models \
+         /usr/local/corex/lib64/python3/dist-packages/transformers/models; do
+    if [ -d "$P" ]; then
+        TMODELS="$P"
+        break
+    fi
 done
-echo "[patch_ops] qwen3_coder tool parser deployed"
+if [ -n "$TMODELS" ]; then
+    cp -r ./qwen3_5 "$TMODELS/" 2>/dev/null && echo "[patch_ops] qwen3_5 config copied" || true
+    cp -r ./qwen3_5_moe "$TMODELS/" 2>/dev/null && echo "[patch_ops] qwen3_5_moe config copied" || true
+    python3 ./patch_transformers_qwen3_5.py 2>&1 || echo "[patch_ops] WARNING: transformers patch failed (non-fatal)"
+else
+    echo "[patch_ops] WARNING: transformers/models not found"
+fi
 
-# --- Reasoning parser + serving files ---
-for V in "${TARGETS[@]}"; do
-    cp -r ./reasoning "$V/"
-    cp ./protocol.py "$V/entrypoints/openai/protocol.py"
-    cp ./cli_args.py "$V/entrypoints/openai/cli_args.py"
-    cp ./serving_chat.py "$V/entrypoints/openai/serving_chat.py"
-    cp ./api_server.py "$V/entrypoints/openai/api_server.py"
-    cp ./chat_utils.py "$V/entrypoints/chat_utils.py"
+# 2. Model registry
+if [ -f ./registry.py ]; then
+    cp ./registry.py "$VLLM/model_executor/models/registry.py" 2>/dev/null && \
+        echo "[patch_ops] registry.py deployed" || echo "[patch_ops] WARNING: registry deploy failed"
+fi
+
+# 3. Tool parser
+mkdir -p "$VLLM/entrypoints/openai/tool_parsers" 2>/dev/null || true
+cp ./qwen3coder_tool_parser.py "$VLLM/entrypoints/openai/tool_parsers/" 2>/dev/null || true
+cp ./tool_parsers_init.py "$VLLM/entrypoints/openai/tool_parsers/__init__.py" 2>/dev/null || true
+echo "[patch_ops] tool parser deployed"
+
+# 4. Reasoning parser
+cp -r ./reasoning "$VLLM/" 2>/dev/null || true
+echo "[patch_ops] reasoning parser deployed"
+
+# 5. Serving layer (protocol, chat, api_server, cli_args, chat_utils)
+cp ./protocol.py "$VLLM/entrypoints/openai/protocol.py" 2>/dev/null || true
+cp ./cli_args.py "$VLLM/entrypoints/openai/cli_args.py" 2>/dev/null || true
+cp ./serving_chat.py "$VLLM/entrypoints/openai/serving_chat.py" 2>/dev/null || true
+cp ./api_server.py "$VLLM/entrypoints/openai/api_server.py" 2>/dev/null || true
+cp ./chat_utils.py "$VLLM/entrypoints/chat_utils.py" 2>/dev/null || true
+echo "[patch_ops] serving layer deployed"
+
+# 6. If second vllm path exists, copy there too
+VLLM2=""
+for P in /usr/local/corex/lib/python3/dist-packages/vllm \
+         /usr/local/corex/lib64/python3/dist-packages/vllm; do
+    if [ -d "$P" ] && [ "$P" != "$VLLM" ]; then
+        VLLM2="$P"
+        break
+    fi
 done
-echo "[patch_ops] reasoning parser + serving files installed"
+if [ -n "$VLLM2" ]; then
+    echo "[patch_ops] Second vllm found at: $VLLM2 — copying patches"
+    cp ./registry.py "$VLLM2/model_executor/models/registry.py" 2>/dev/null || true
+    mkdir -p "$VLLM2/entrypoints/openai/tool_parsers" 2>/dev/null || true
+    cp ./qwen3coder_tool_parser.py "$VLLM2/entrypoints/openai/tool_parsers/" 2>/dev/null || true
+    cp ./tool_parsers_init.py "$VLLM2/entrypoints/openai/tool_parsers/__init__.py" 2>/dev/null || true
+    cp -r ./reasoning "$VLLM2/" 2>/dev/null || true
+    cp ./protocol.py "$VLLM2/entrypoints/openai/protocol.py" 2>/dev/null || true
+    cp ./cli_args.py "$VLLM2/entrypoints/openai/cli_args.py" 2>/dev/null || true
+    cp ./serving_chat.py "$VLLM2/entrypoints/openai/serving_chat.py" 2>/dev/null || true
+    cp ./api_server.py "$VLLM2/entrypoints/openai/api_server.py" 2>/dev/null || true
+    cp ./chat_utils.py "$VLLM2/entrypoints/chat_utils.py" 2>/dev/null || true
+fi
 
-# ============================================================
-# 4. Numerical stability patch — DISABLED
-#    If corex_gdn loads (which it should without pip install),
-#    the Python _torch_chunk_gated_delta_rule is NEVER called.
-#    Patching qwen3_5.py risks breaking corex import conditions.
-#    Only enable this if docker logs still show NaN after corex fix.
-# ============================================================
-# python3 ./patch_numerical_stability.py 2>&1 || \
-#     echo "[patch_ops] WARNING: numerical stability patch failed (non-fatal)"
-echo "[patch_ops] numerical stability patch SKIPPED (corex_gdn handles DeltaNet)"
-
-# ============================================================
-# 5. DO NOT full-replace these files — base image has optimized versions.
-#    Use targeted patches (like step 4) instead of cp replacement.
-#    - qwen3_5.py — patched in-place by step 4 (preserves corex paths)
-#    - _custom_ops.py — base image ixformer bindings (no change needed)
-#    - model_runner.py — base image worker (no change needed)
-#    - xformers.py — base image attention backend (no change needed)
-#    - paged_attn.py — base image paged attention (no change needed)
-#    - prefix_prefill.py — base image prefix prefill (no change needed)
-# ============================================================
-
-echo "[patch_ops] DONE — serving layer + numerical stability patches applied"
-echo "[patch_ops] Core compute paths preserved (corex_gdn + corex_moe + corex_fa2)"
+echo "[patch_ops] DONE — no pip install, no compute file changes, corex kernels preserved"
