@@ -43,6 +43,94 @@ logger = init_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Hardware-aware policy dispatch (translated from CCCL cc_dispatch.cuh)
+#
+# cc_dispatch.cuh's design:
+#   1. Runtime: detect device compute capability
+#   2. policy_selector(cc) → returns kernel config (threads, items, algorithm)
+#   3. lowest_cc_resolver: merge CCs with identical policies → fewer instantiations
+#   4. dispatch_compute_cap: bridge runtime detection → compile-time specialization
+#
+# Translation to Python/PyTorch:
+#   1. Runtime: detect BI-V100 capabilities (SMEM, cuSOLVER, MoE kernels)
+#   2. _hw_policy → returns DeltaNet chunk_size, MoE strategy, solve method
+#   3. Capabilities detected once at module load, cached globally
+#   4. All kernel code reads from _hw_policy instead of hardcoded constants
+# ---------------------------------------------------------------------------
+
+class _HardwarePolicy:
+    """CCCL cc_dispatch equivalent: detect hardware once, select policies."""
+
+    def __init__(self):
+        self._detected = False
+        # Defaults (safe for any hardware)
+        self.deltanet_chunk_size = 64
+        self.deltanet_prefill_chunk = 4096
+        self.solve_triangular_available = False
+        self.moe_native_topk = False
+        self.moe_native_align = False
+        self.moe_native_invoke = False
+        self.smem_bytes = 49152  # 48KB default for BI-V100
+
+    def detect(self, device: torch.device = None):
+        """Run once to probe hardware capabilities. CCCL: policy_selector(cc)."""
+        if self._detected:
+            return
+        self._detected = True
+
+        if device is None:
+            if not torch.cuda.is_available():
+                return
+            device = torch.device("cuda:0")
+
+        # Probe SMEM (CCCL: compute_capability → SMEM size)
+        try:
+            idx = device.index if device.index is not None else 0
+            props = torch.cuda.get_device_properties(idx)
+            self.smem_bytes = props.total_memory  # not SMEM, but available
+            # BI-V100: 48KB confirmed via ixsmi
+            self.smem_bytes = 49152
+        except Exception:
+            pass
+
+        # Probe cuSOLVER/cuBLAS trsm (CCCL: check if kernel exists for this CC)
+        try:
+            test_A = torch.eye(4, device=device, dtype=torch.float32)
+            test_b = torch.ones(4, 2, device=device, dtype=torch.float32)
+            torch.linalg.solve_triangular(test_A, test_b, upper=False)
+            self.solve_triangular_available = True
+            # With solve_triangular, larger chunks are better (one kernel call)
+            self.deltanet_chunk_size = 64
+        except RuntimeError:
+            self.solve_triangular_available = False
+            # Without it, smaller chunks = fewer Python loop iterations
+            self.deltanet_chunk_size = 32
+
+        # Probe MoE native kernels (CCCL: check op availability per CC)
+        try:
+            import ixformer.functions as ixf_F
+            self.moe_native_topk = hasattr(ixf_F, 'vllm_moe_topk_softmax')
+            self.moe_native_align = hasattr(ixf_F, 'vllm_moe_align_block_size')
+            self.moe_native_invoke = hasattr(ixf_F, 'vllm_invoke_fused_moe_kernel')
+        except ImportError:
+            pass
+
+        # Log detected policy (CCCL: policy is logged/printed for debugging)
+        logger.info(
+            "HardwarePolicy detected: chunk=%d solve_tri=%s "
+            "moe_native=[topk=%s align=%s invoke=%s]",
+            self.deltanet_chunk_size,
+            self.solve_triangular_available,
+            self.moe_native_topk,
+            self.moe_native_align,
+            self.moe_native_invoke)
+
+
+# Global singleton (CCCL: policies are constexpr globals)
+_hw_policy = _HardwarePolicy()
+
+
+# ---------------------------------------------------------------------------
 # Pure-PyTorch DeltaNet kernels (fallbacks from transformers 5.2.0)
 # ---------------------------------------------------------------------------
 
@@ -74,12 +162,16 @@ def _torch_chunk_gated_delta_rule(
     value: torch.Tensor,   # (batch, seq, num_heads, head_v_dim)
     g: torch.Tensor,       # (batch, seq, num_heads)
     beta: torch.Tensor,    # (batch, seq, num_heads)
-    chunk_size: int = 64,
+    chunk_size: int = 0,  # 0 = use _hw_policy.deltanet_chunk_size
     initial_state: Optional[torch.Tensor] = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     initial_dtype = query.dtype
+    # cc_dispatch: resolve chunk_size from hardware policy
+    if chunk_size <= 0:
+        _hw_policy.detect(query.device)
+        chunk_size = _hw_policy.deltanet_chunk_size
     if use_qk_l2norm_in_kernel:
         query = _l2norm(query)
         key = _l2norm(key)
@@ -136,27 +228,19 @@ def _torch_chunk_gated_delta_rule(
     # This avoids cuSOLVER entirely — only needs basic matmul and indexing.
 
     def _forward_sub_lower(A_lower, rhs):
-        """Solve (I - A_lower) @ X = RHS via forward substitution.
-        A_lower: (..., C, C) strictly lower-triangular
-        rhs: (..., C, D)
-        Returns X: (..., C, D)
-
-        CCCL block_scan_raking.cuh insight: sequential scan over C elements
-        is the bottleneck. torch.linalg.solve_triangular delegates to
-        cuBLAS trsm which is O(C²) but fully GPU-parallel, vs our Python
-        loop which is O(C²) but with C sequential kernel launches.
+        """Solve (I - A_lower) @ X = RHS.
+        
+        cc_dispatch pattern: _hw_policy.solve_triangular_available was probed
+        once at startup. No per-call try/except overhead.
         """
         C = rhs.shape[-2]
-        # Build (I - A_lower) which is unit lower-triangular
-        eye = torch.eye(C, dtype=A_lower.dtype, device=A_lower.device)
-        IminusA = eye - A_lower
-        try:
-            # cuBLAS trsm: solve IminusA @ X = rhs for X
-            # unitriangular=True tells solver diagonal is all 1s (skip division)
+        if _hw_policy.solve_triangular_available:
+            eye = torch.eye(C, dtype=A_lower.dtype, device=A_lower.device)
+            IminusA = eye - A_lower
             return torch.linalg.solve_triangular(
                 IminusA, rhs, upper=False, unitriangular=True)
-        except RuntimeError:
-            # BI-V100 may lack cuSOLVER — fall back to row-by-row
+        else:
+            # Python forward substitution fallback
             x = torch.zeros_like(rhs)
             x[..., 0, :] = rhs[..., 0, :]
             for i in range(1, C):
@@ -432,7 +516,8 @@ class GatedDeltaNet(nn.Module):
                 # Full 18K: tensors [1,6,282,64,64]=220 MB each → ~990 MB/call.
                 # With _DNN_CHUNK=4096: [1,6,64,64,64]=6 MB each → ~137 MB/call.
                 # State is chained via initial_state / output_final_state.
-                _DNN_CHUNK = 4096
+                _hw_policy.detect(hidden_states.device)
+                _DNN_CHUNK = _hw_policy.deltanet_prefill_chunk
                 cur_state = temporal_state[si:si + 1].clone()
                 core_out_parts = []
                 for sc_start in range(0, seq_len, _DNN_CHUNK):
@@ -931,31 +1016,29 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         #   ixf_F.vllm_invoke_fused_moe_kernel
         # The original comment "ixformer lacks MoE kernels" may have been
         # wrong or outdated. Try native first, catch and fallback if it fails.
-        # CCCL policy_selector pattern: try native fused kernel chain first.
-        # topk_softmax now has PyTorch fallback (see _custom_ops.py), so the
-        # chain topk_softmax→align→invoke may succeed even without the native
-        # topk op. Only permanently disable if align or invoke also fails.
+        # cc_dispatch pattern: _hw_policy detected MoE kernel availability at
+        # module load. Skip native attempt entirely if we know it will fail.
         if not hasattr(self, '_use_native_moe'):
-            self._use_native_moe = True
-            self._native_moe_attempts = 0
+            _hw_policy.detect(hidden_states.device)
+            # Only try native if at least align+invoke are available
+            # (topk_softmax has PyTorch fallback in _custom_ops.py)
+            self._use_native_moe = (
+                _hw_policy.moe_native_align and _hw_policy.moe_native_invoke)
+            if not self._use_native_moe:
+                logger.info(
+                    "HardwarePolicy: MoE native kernels unavailable "
+                    "(align=%s invoke=%s), using PyTorch experts.",
+                    _hw_policy.moe_native_align, _hw_policy.moe_native_invoke)
 
         if self._use_native_moe:
             try:
                 routed_out = self.experts(hidden_states, router_logits)
             except Exception as e:
-                self._native_moe_attempts += 1
-                if self._native_moe_attempts >= 2:
-                    # Failed twice (first call + retry) — truly no native support
-                    logger.warning(
-                        "FusedMoE native kernel failed %d times (%s: %s), "
-                        "falling back to pure PyTorch experts permanently.",
-                        self._native_moe_attempts, type(e).__name__, e)
-                    self._use_native_moe = False
-                else:
-                    logger.info(
-                        "FusedMoE native kernel failed on attempt %d (%s: %s), "
-                        "will retry next call.",
-                        self._native_moe_attempts, type(e).__name__, e)
+                logger.warning(
+                    "FusedMoE native kernel failed (%s: %s), "
+                    "falling back to pure PyTorch experts permanently.",
+                    type(e).__name__, e)
+                self._use_native_moe = False
                 routed_out = self._pure_pytorch_experts(hidden_states, router_logits)
         else:
             routed_out = self._pure_pytorch_experts(hidden_states, router_logits)
