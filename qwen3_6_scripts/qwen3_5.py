@@ -1006,7 +1006,17 @@ class Qwen3_5MoeSparseBlock(nn.Module):
                 tok_ids_seg = sorted_tok_ids[s:e]
                 topk_pos_seg = sorted_topk_pos[s:e]
 
-                tokens = hidden_states[tok_ids_seg]            # (n, H) — contiguous gather
+                # dispatch_copy_mdspan.cuh: check if data is exhaustive (contiguous).
+                # If token IDs form a contiguous range, use slice (zero-copy)
+                # instead of fancy indexing (allocates new tensor).
+                n_seg = e - s
+                first_tok = int(tok_ids_seg[0])
+                if n_seg > 1 and int(tok_ids_seg[-1]) == first_tok + n_seg - 1:
+                    # Fast path: contiguous slice (no copy)
+                    tokens = hidden_states[first_tok:first_tok + n_seg]
+                else:
+                    # Slow path: gather by index
+                    tokens = hidden_states[tok_ids_seg]
                 gate_up = F.linear(tokens, w13[eid])           # (n, 2*I)
                 gate, up = gate_up.chunk(2, dim=-1)
                 act = F.silu(gate) * up                        # (n, I)
