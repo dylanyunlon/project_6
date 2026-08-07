@@ -1,4 +1,5 @@
 #!/bin/bash
+set -eo pipefail
 # BI-V100 engine patches for Qwen3.6-35B-A3B (Qwen3_5 architecture)
 #
 # All modifications are FULL FILE REPLACEMENTS — no AST patch scripts.
@@ -7,6 +8,11 @@
 #
 # Base image: git.modelhub.org.cn:9443/enginex-iluvatar/bi100-3.2.3-x86-ubuntu20.04-py3.10-poc-llm-infer:v1.2.3
 # vllm install path: /usr/local/corex/lib/python3/dist-packages/vllm/
+
+# CRITICAL: cd into this script's directory so all ./relative paths work
+# regardless of WORKDIR in Dockerfile or caller's cwd.
+cd "$(dirname "$0")"
+echo "[patch_ops] working directory: $(pwd)"
 
 VLLM=/usr/local/corex/lib/python3/dist-packages/vllm
 VLLM64=/usr/local/corex/lib64/python3/dist-packages/vllm
