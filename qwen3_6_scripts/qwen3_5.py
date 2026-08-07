@@ -988,7 +988,17 @@ class Qwen3_5MoeSparseBlock(nn.Module):
             # to enable batched GEMM across expert groups (CCCL segmented_reduce pattern).
             # TODO: implement when we have benchmark data showing this path is hot.
 
-            out = torch.zeros_like(hidden_states)
+            # smem_resource_raw.cuh: reuse buffer across calls.
+            # CCCL manages SMEM as multi-stage ping-pong: same memory, different
+            # stages. We do the same: keep a class-level buffer, resize only if
+            # shape changes, zero in-place instead of allocating.
+            _buf_key = (T, hidden_states.shape[-1])
+            if not hasattr(self, '_moe_out_buf') or self._moe_out_buf_key != _buf_key:
+                self._moe_out_buf = torch.zeros_like(hidden_states)
+                self._moe_out_buf_key = _buf_key
+            else:
+                self._moe_out_buf.zero_()
+            out = self._moe_out_buf
 
             # Flatten all (token, expert) assignments: (T*top_k,) pairs
             flat_eids = topk_ids.view(-1)                      # (T*K,)
