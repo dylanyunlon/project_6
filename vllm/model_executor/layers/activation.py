@@ -97,7 +97,22 @@ class GeluAndMul(CustomOp):
 
         d = x.shape[-1] // 2
         output_shape = (x.shape[:-1] + (d, ))
-        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        # ═══════════════════════════════════════════════════════════════
+        # CCCL dispatch_transform.cuh CacheAsyncConfiguration pattern:
+        #   Output tensor shape is deterministic from input shape.
+        #   During decode, shapes are stable → cache to avoid cudaMalloc.
+        #   CCCL: "This computation MUST NOT depend on runtime state ...
+        #          since the result will be cached."
+        # ═══════════════════════════════════════════════════════════════
+        _cache_key = (output_shape, x.dtype, x.device)
+        _cached = getattr(self, '_out_cache', {}).get(_cache_key)
+        if _cached is not None and _cached.shape == output_shape:
+            out = _cached
+        else:
+            out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+            if not hasattr(self, '_out_cache'):
+                self._out_cache = {}
+            self._out_cache[_cache_key] = out
         if self.approximate == "none":
             ops.gelu_and_mul(out, x)
         elif self.approximate == "tanh":

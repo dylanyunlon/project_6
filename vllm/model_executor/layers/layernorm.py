@@ -85,7 +85,28 @@ class RMSNorm(CustomOp):
                 residual_alpha,
             )
             return x, residual
-        out = torch.empty_like(x)
+        # ═══════════════════════════════════════════════════════════════
+        # CCCL dispatch_transform.cuh CacheAsyncConfiguration pattern:
+        #   Element-wise transforms have deterministic output shapes.
+        #   During decode, input shape is stable (num_seqs × hidden_dim).
+        #   Cache the output tensor to avoid cudaMalloc on every step.
+        #
+        #   CCCL: "This computation MUST NOT depend on runtime state ...
+        #          since the result will be cached."
+        #
+        #   RMSNorm is called 64× per forward pass (Qwen3.6 has 64 layers).
+        #   Each call was doing torch.empty_like → cudaMalloc.
+        #   With caching: 64 cudaMalloc calls → 0 per decode step.
+        # ═══════════════════════════════════════════════════════════════
+        _cache_key = (x.shape, x.dtype, x.device)
+        _cached = getattr(self, '_out_cache', {}).get(_cache_key)
+        if _cached is not None and _cached.shape == x.shape:
+            out = _cached
+        else:
+            out = torch.empty_like(x)
+            if not hasattr(self, '_out_cache'):
+                self._out_cache = {}
+            self._out_cache[_cache_key] = out
         ops.rms_norm(
             out,
             x,
