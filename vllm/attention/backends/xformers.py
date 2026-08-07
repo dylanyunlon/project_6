@@ -665,6 +665,115 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
 
+    def _run_sdpa_fallback(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: "XFormersMetadata",
+    ) -> torch.Tensor:
+        """Pure-math causal attention fallback with Q-tiling for head_size > 128.
+
+        CCCL architecture references:
+        - agent_reduce.cuh ConsumeFullTile: GQA broadcast matmul avoids
+          materializing expanded KV (6x memory savings for Qwen3.6 ratio=6)
+        - block_load_to_shared.cuh: pre-allocate invariants outside inner loop
+        - agent_sub_warp_merge_sort.cuh _TempStorage union: reuse buffers
+
+        Memory: O(_Q_CHUNK × seq_len) instead of O(seq_len²).
+        """
+        _Q_CHUNK = 256
+
+        assert attn_metadata.seq_lens is not None
+        orig_dtype = query.dtype
+        num_seqs = len(attn_metadata.seq_lens)
+
+        if (attn_metadata.query_start_loc is not None
+                and len(attn_metadata.query_start_loc) == num_seqs + 1):
+            q_lens = [
+                int(attn_metadata.query_start_loc[i + 1].item()) -
+                int(attn_metadata.query_start_loc[i].item())
+                for i in range(num_seqs)
+            ]
+        else:
+            q_lens = list(attn_metadata.seq_lens)
+
+        q_flat = query.squeeze(0)
+        k_flat = key.squeeze(0)
+        v_flat = value.squeeze(0)
+
+        output = torch.empty_like(q_flat)
+        seq_start = 0
+        for q_len in q_lens:
+            seq_end = seq_start + q_len
+
+            k_s = k_flat[seq_start:seq_end].permute(1, 0, 2).float()
+            v_s = v_flat[seq_start:seq_end].permute(1, 0, 2).float()
+
+            # CCCL agent_reduce.cuh ConsumeFullTile GQA broadcast pattern:
+            # reshape K to [kv_h, 1, seq, d] and let matmul broadcast
+            # over gqa groups — avoids repeat_interleave allocation.
+            gqa_ratio = self.num_heads // k_s.shape[0]
+            if gqa_ratio > 1:
+                k_s = k_s.unsqueeze(1)
+                v_s = v_s.unsqueeze(1)
+                use_gqa_broadcast = True
+            else:
+                use_gqa_broadcast = False
+
+            # CCCL block_load_to_shared.cuh: pre-compute loop invariants
+            k_pos = torch.arange(q_len, device=query.device)
+            _max_chunk = min(_Q_CHUNK, q_len)
+            _qc_q_pos_base = torch.arange(_max_chunk, device=query.device)
+            _num_chunks = (q_len + _Q_CHUNK - 1) // _Q_CHUNK
+
+            for qc_idx in range(_num_chunks):
+                qc_start = qc_idx * _Q_CHUNK
+                qc_end = min(qc_start + _Q_CHUNK, q_len)
+                chunk_len = qc_end - qc_start
+                qc_q_pos = _qc_q_pos_base[:chunk_len] + qc_start
+
+                if use_gqa_broadcast:
+                    q_c = (q_flat[seq_start + qc_start:seq_start + qc_end]
+                           .float()
+                           .view(-1, self.num_kv_heads, gqa_ratio,
+                                 self.head_size)
+                           .permute(1, 2, 0, 3))
+
+                    attn_w = torch.matmul(
+                        q_c, k_s.transpose(-2, -1)) * self.scale
+
+                    mask = k_pos.unsqueeze(0) > qc_q_pos.unsqueeze(1)
+                    attn_w = attn_w.masked_fill(
+                        mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+                    attn_w = torch.softmax(attn_w, dim=-1)
+                    out_c = torch.matmul(attn_w, v_s).to(orig_dtype)
+                    out_c = (out_c.permute(2, 0, 1, 3)
+                             .contiguous()
+                             .view(-1, self.num_heads, self.head_size))
+                    output[seq_start + qc_start:seq_start + qc_end] = out_c
+                else:
+                    q_c = q_flat[seq_start + qc_start:seq_start + qc_end] \
+                          .permute(1, 0, 2).float()
+
+                    attn_w = torch.matmul(
+                        q_c, k_s.transpose(-2, -1)) * self.scale
+
+                    mask = k_pos.unsqueeze(0) > qc_q_pos.unsqueeze(1)
+                    attn_w = attn_w.masked_fill(
+                        mask.unsqueeze(0), float("-inf"))
+
+                    attn_w = torch.softmax(attn_w, dim=-1)
+                    out_c = torch.matmul(attn_w, v_s).to(orig_dtype)
+
+                    output[seq_start + qc_start:seq_start + qc_end] = (
+                        out_c.permute(1, 0, 2))
+
+            seq_start = seq_end
+
+        return output.unsqueeze(0)
+
     def _run_memory_efficient_xformers_forward(
         self,
         query: torch.Tensor,
@@ -752,15 +861,33 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
             query = query.unsqueeze(0)
             key = key.unsqueeze(0)
             value = value.unsqueeze(0)
-            out = xops.memory_efficient_attention_forward(
-                query,
-                key,
-                value,
-                attn_bias=attn_bias[0],
-                p=0.0,
-                scale=self.scale,
-                op = self.attn_op
-                )
+            # ═══════════════════════════════════════════════════════════
+            # CCCL dispatch_transform.cuh + agent_reduce.cuh insight:
+            # ixformer flash attention doesn't support head_dim > 128.
+            # Qwen3.6 uses head_dim=256 → must use SDPA fallback.
+            #
+            # CCCL pattern: GQA broadcast matmul (agent_reduce ConsumeFullTile)
+            # avoids materializing expanded KV tensors.
+            # Q: [kv_h, gqa, chunk, d], K: [kv_h, 1, seq, d]
+            # matmul broadcasts K over gqa dim → 6x memory savings.
+            #
+            # Q-tiling (CCCL block_load_to_shared.cuh pattern):
+            # split Q into 256-token chunks to keep peak memory
+            # at O(chunk × seq_len) instead of O(seq_len²).
+            # ═══════════════════════════════════════════════════════════
+            if self.head_size > 128:
+                out = self._run_sdpa_fallback(
+                    query, key, value, attn_metadata)
+            else:
+                out = xops.memory_efficient_attention_forward(
+                    query,
+                    key,
+                    value,
+                    attn_bias=attn_bias[0],
+                    p=0.0,
+                    scale=self.scale,
+                    op = self.attn_op
+                    )
             return out.view_as(original_query)
 
         # Attention with alibi slopes.
