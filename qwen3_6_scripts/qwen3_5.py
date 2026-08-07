@@ -140,14 +140,28 @@ def _torch_chunk_gated_delta_rule(
         A_lower: (..., C, C) strictly lower-triangular
         rhs: (..., C, D)
         Returns X: (..., C, D)
+
+        CCCL block_scan_raking.cuh insight: sequential scan over C elements
+        is the bottleneck. torch.linalg.solve_triangular delegates to
+        cuBLAS trsm which is O(C²) but fully GPU-parallel, vs our Python
+        loop which is O(C²) but with C sequential kernel launches.
         """
         C = rhs.shape[-2]
-        x = torch.zeros_like(rhs)
-        x[..., 0, :] = rhs[..., 0, :]
-        for i in range(1, C):
-            # x[i] = rhs[i] + A[i, :i] @ x[:i]
-            x[..., i, :] = rhs[..., i, :] + (A_lower[..., i, :i].unsqueeze(-2) @ x[..., :i, :]).squeeze(-2)
-        return x
+        # Build (I - A_lower) which is unit lower-triangular
+        eye = torch.eye(C, dtype=A_lower.dtype, device=A_lower.device)
+        IminusA = eye - A_lower
+        try:
+            # cuBLAS trsm: solve IminusA @ X = rhs for X
+            # unitriangular=True tells solver diagonal is all 1s (skip division)
+            return torch.linalg.solve_triangular(
+                IminusA, rhs, upper=False, unitriangular=True)
+        except RuntimeError:
+            # BI-V100 may lack cuSOLVER — fall back to row-by-row
+            x = torch.zeros_like(rhs)
+            x[..., 0, :] = rhs[..., 0, :]
+            for i in range(1, C):
+                x[..., i, :] = rhs[..., i, :] + (A_lower[..., i, :i].unsqueeze(-2) @ x[..., :i, :]).squeeze(-2)
+            return x
 
     value = _forward_sub_lower(A, v_beta)
 
