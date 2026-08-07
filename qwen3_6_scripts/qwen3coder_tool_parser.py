@@ -77,6 +77,28 @@ class Qwen3CoderToolParser(ToolParser):
         logger.debug("vLLM Successfully imported tool parser %s !",
                      self.__class__.__name__)
 
+    def adjust_request(
+            self, request: "ChatCompletionRequest") -> "ChatCompletionRequest":
+        """Disable thinking when tools are active with auto choice.
+
+        On BI-V100 hardware, the model's <think>...</think> phase can consume
+        the entire max_tokens budget, leaving no room for the <tool_call> XML.
+        Competition reference (sub168) completes d03_tool_call in 2.12s with
+        tools=1; our sub509 took 49s with tools=0 because thinking ate the
+        budget.  Disabling thinking for tool-call requests ensures the model
+        emits tool XML within the token budget.
+        """
+        if (request.tools and request.tool_choice in ("auto", None)
+                and not isinstance(request.tool_choice,
+                                   type(None).__class__)):
+            # Only override if thinking was not explicitly requested
+            ctk = request.chat_template_kwargs or {}
+            if "enable_thinking" not in ctk:
+                ctk = dict(ctk)  # shallow copy
+                ctk["enable_thinking"] = False
+                request.chat_template_kwargs = ctk
+        return request
+
 
     def _generate_tool_call_id(self) -> str:
         return f"call_{uuid.uuid4().hex[:24]}"

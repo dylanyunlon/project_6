@@ -19,13 +19,10 @@ vllm:
   max_model_len: 100000
   gpu_memory_utilization: 0.90
   tensor_parallel: 4
-  max_num_seqs: 2
-  max_num_batched_tokens: 4096
-  max_seq_len_to_capture: 32768
+  max_num_seqs: 1
   trust_remote_code: true
   disable_log_requests: true
   disable_frontend_multiprocessing: true
-  enable_chunked_prefill: true
   enable_auto_tool_choice: true
   tool_call_parser: qwen3_coder
   reasoning_parser: qwen3

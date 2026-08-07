@@ -421,11 +421,28 @@ class ChatCompletionRequest(OpenAIBaseModel):
         # The competition evaluator sends thinking={enable:true/false} (OpenAI API).
         # Qwen3's chat template expects enable_thinking=True/False in kwargs.
         thinking = data.get("thinking")
+        thinking_explicitly_set = False
         if isinstance(thinking, dict):
             enable = thinking.get("enable")
             if enable is not None:
+                thinking_explicitly_set = True
                 ctk = data.get("chat_template_kwargs") or {}
                 ctk["enable_thinking"] = bool(enable)
+                data["chat_template_kwargs"] = ctk
+
+        # CRITICAL: When tools are present with tool_choice=auto and thinking
+        # is NOT explicitly requested, disable thinking to preserve token budget
+        # for tool call XML generation. Without this, the model spends all
+        # tokens on <think>...</think> and finishes before emitting <tool_call>.
+        # This matches the competition reference (sub168: d03 in 2.12s).
+        if not thinking_explicitly_set:
+            has_tools = data.get("tools") is not None and len(data.get("tools", [])) > 0
+            tc = data.get("tool_choice")
+            tool_choice_active = (tc == "auto" or (tc is None and has_tools)
+                                  or isinstance(tc, dict))
+            if has_tools and tool_choice_active:
+                ctk = data.get("chat_template_kwargs") or {}
+                ctk["enable_thinking"] = False
                 data["chat_template_kwargs"] = ctk
 
         messages = data.get("messages")
