@@ -401,7 +401,11 @@ class GatedDeltaNet(nn.Module):
                 v = v.reshape(1, seq_len, local_num_v, self.head_v_dim)
 
                 beta = b_all[s:e].sigmoid().unsqueeze(0)  # (1, seq_len, local_num_v)
-                g = (-self.A_log.float().exp()
+                # CCCL overflow_cast pattern: clamp before exp to prevent
+                # overflow → NaN cascade. A_log.exp() can exceed float32 range
+                # when A_log > ~88; clamping to [-20,20] keeps exp in safe range.
+                _A_safe = self.A_log.float().clamp(-20.0, 20.0)
+                g = (-_A_safe.exp()
                      * F.softplus(a_all[s:e].float() + self.dt_bias)
                      ).unsqueeze(0)  # (1, seq_len, local_num_v)
 
@@ -476,7 +480,9 @@ class GatedDeltaNet(nn.Module):
             v = v.reshape(num_seqs, 1, local_num_v, self.head_v_dim)
 
             beta = b_all.sigmoid().unsqueeze(1)  # (num_seqs, 1, local_num_v)
-            g = (-self.A_log.float().exp()
+            # CCCL overflow_cast pattern: clamp before exp (same as prefill path)
+            _A_safe = self.A_log.float().clamp(-20.0, 20.0)
+            g = (-_A_safe.exp()
                  * F.softplus(a_all.float() + self.dt_bias)
                  ).unsqueeze(1)  # (num_seqs, 1, local_num_v)
 
@@ -494,7 +500,7 @@ class GatedDeltaNet(nn.Module):
             q_t = _l2norm(q.squeeze(1)).float() * _scale   # (B, H_v, k_dim)
             k_t = _l2norm(k.squeeze(1)).float()             # (B, H_v, k_dim)
             v_t = v.squeeze(1).float()                      # (B, H_v, v_dim)
-            g_t = g.squeeze(1).float().exp_()               # (B, H_v)
+            g_t = g.squeeze(1).float().clamp_(-20.0, 20.0).exp_()  # (B, H_v) overflow_cast
             bt  = beta.squeeze(1).float()                   # (B, H_v)
 
             # Decay state in-place: (B, H_v, k_dim, v_dim) *= scalar per head

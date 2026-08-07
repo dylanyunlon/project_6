@@ -1720,16 +1720,34 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_end = torch.cuda.Event(enable_timing=True)
             model_forward_start.record()
 
-        with set_forward_context(model_input.attn_metadata):
-            hidden_or_intermediate_states = model_executable(
-                input_ids=model_input.input_tokens,
-                positions=model_input.input_positions,
-                kv_caches=kv_caches,
-                attn_metadata=model_input.attn_metadata,
-                intermediate_tensors=intermediate_tensors,
-                **MultiModalInputs.as_kwargs(multi_modal_kwargs,
-                                             device=self.device),
-                **seqlen_agnostic_kwargs)
+        # CCCL checked_allocator pattern (c2h/checked_allocator.cuh):
+        # Wrap forward pass in OOM recovery. On CUDA OOM, clear cache and
+        # retry once. If retry also OOMs, re-raise — the engine will abort
+        # this request but NOT die, keeping the server alive for subsequent
+        # requests. This is the key difference vs competitor Sub168 which
+        # died permanently on OOM during replay.
+        def _run_forward():
+            with set_forward_context(model_input.attn_metadata):
+                return model_executable(
+                    input_ids=model_input.input_tokens,
+                    positions=model_input.input_positions,
+                    kv_caches=kv_caches,
+                    attn_metadata=model_input.attn_metadata,
+                    intermediate_tensors=intermediate_tensors,
+                    **MultiModalInputs.as_kwargs(multi_modal_kwargs,
+                                                 device=self.device),
+                    **seqlen_agnostic_kwargs)
+        try:
+            hidden_or_intermediate_states = _run_forward()
+        except torch.cuda.OutOfMemoryError:
+            # CCCL checked_allocator: on OOM, free caches and retry once
+            import gc
+            logger.warning(
+                "CUDA OOM in model forward — clearing cache and retrying "
+                "(CCCL checked_allocator recovery pattern)")
+            torch.cuda.empty_cache()
+            gc.collect()
+            hidden_or_intermediate_states = _run_forward()
 
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time):
