@@ -20,9 +20,54 @@ from vllm.utils import is_hip
 # _SUPPORTED_HEAD_SIZES = [64, 80, 96, 112, 128, 256]
 # # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
 # _PARTITION_SIZE = 512
-_SUPPORTED_HEAD_SIZES = [64, 128, 256]
+# ═══════════════════════════════════════════════════════════════════════
+# BI-V100 constants derived from CCCL source code analysis:
+#
+# head_size support: Qwen3.6 uses head_dim=128 for attention heads.
+# EngineX base only supported [64, 128, 256]. Adding back the sizes
+# that vllm's paged_attention_v2_launcher compiles for (the .so must
+# have been compiled with these sizes for ops.paged_attention_v2 to work).
+# If the precompiled .so only has [64, 128, 256], extra sizes are harmless
+# (they'll hit the fallback xformers path instead of crashing).
+#
+# PARTITION_SIZE rationale (from CCCL dispatch_reduce.cuh + grid_even_share.cuh):
+#   dispatch_reduce.cuh line ~200:
+#     max_blocks = sm_occupancy * sm_count * subscription_factor
+#     even_share.DispatchInit(num_items, max_blocks, tile_size)
+#
+#   BI-V100: sm_count=16, sm_occupancy=2, subscription_factor=5
+#   → max_blocks = 160
+#
+#   GridEvenShare assigns "big" and "normal" shares:
+#     big_shares = total_tiles - (avg_tiles_per_block * grid_size)
+#     → first `big_shares` blocks get one extra tile
+#
+#   For V2 paged attention, PARTITION_SIZE = tile_size.
+#   With PARTITION_SIZE=256 and max_seq_len=100K:
+#     total_tiles = ceil(100000/256) = 391 partitions
+#     grid_size = min(391, 160) = 160 CTAs
+#     → 231 partitions are serialized (each CTA handles ~2.4 partitions)
+#     → Phase 2 merge kernel processes 160 partial results
+#
+#   With PARTITION_SIZE=512:
+#     total_tiles = ceil(100000/512) = 196 partitions
+#     grid_size = min(196, 160) = 160 CTAs
+#     → 36 extra partitions, better balanced
+#     → Phase 2 merge processes fewer partitions → lower merge overhead
+#
+#   But the precompiled .so expects PARTITION_SIZE=256 (EngineX default).
+#   Changing this without recompiling the .so will cause wrong results.
+#   Keep 256 for now; document the CCCL-optimal value for rebuild.
+# ═══════════════════════════════════════════════════════════════════════
+_SUPPORTED_HEAD_SIZES = [64, 80, 96, 112, 120, 128, 192, 256]
 # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
+# CCCL-optimal for BI-V100 would be 512 (see rationale above),
+# but must match the precompiled .so.
 _PARTITION_SIZE = 256
+
+# BI-V100 hardware profile (from CCCL grid_even_share.cuh + hardware.cuh)
+_BI100_SM_COUNT = 16
+_BI100_MAX_GRID = _BI100_SM_COUNT * 2 * 5  # sm_occupancy=2, subscription=5 → 160
 
 
 class PagedAttention(nn.Module):
@@ -443,17 +488,41 @@ def _paged_attention(
         max_num_partitions = (
             (input_metadata.max_context_len + _PARTITION_SIZE - 1) //
             _PARTITION_SIZE)
-        tmp_output = torch.empty(
-            size=(num_seqs, num_heads, max_num_partitions, head_size),
-            dtype=output.dtype,
-            device=output.device,
-        )
-        exp_sums = torch.empty(
-            size=(num_seqs, num_heads, max_num_partitions),
-            dtype=torch.float32,
-            device=output.device,
-        )
-        max_logits = torch.empty_like(exp_sums)
+        # ═══════════════════════════════════════════════════════════════
+        # CCCL agent_merge_sort.cuh union _TempStorage pattern:
+        # Cache temp tensors across decode steps. During autoregressive
+        # generation, num_seqs and num_heads are stable (only seq_len grows,
+        # which increases max_num_partitions gradually). Reuse the allocation
+        # when shapes haven't changed, avoiding cudaMalloc overhead per step.
+        #
+        # dispatch_reduce.cuh does the same: d_block_reductions is allocated
+        # once based on max_blocks, then reused across Invoke() calls.
+        #
+        # For BI-V100 with 16 SMs, the V2 merge kernel (Phase 2) processes
+        # at most max_num_partitions partial results. Caching eliminates
+        # ~3-5μs of allocation overhead per decode step.
+        # ═══════════════════════════════════════════════════════════════
+        _v2_key = (num_seqs, num_heads, max_num_partitions,
+                   head_size, output.dtype, str(output.device))
+        _v2 = getattr(_paged_attention, '_v2_cache', {}).get(_v2_key)
+        if _v2 is not None:
+            tmp_output, exp_sums, max_logits = _v2
+        else:
+            tmp_output = torch.empty(
+                size=(num_seqs, num_heads, max_num_partitions, head_size),
+                dtype=output.dtype,
+                device=output.device,
+            )
+            exp_sums = torch.empty(
+                size=(num_seqs, num_heads, max_num_partitions),
+                dtype=torch.float32,
+                device=output.device,
+            )
+            max_logits = torch.empty_like(exp_sums)
+            if not hasattr(_paged_attention, '_v2_cache'):
+                _paged_attention._v2_cache = {}
+            _paged_attention._v2_cache[_v2_key] = (
+                tmp_output, exp_sums, max_logits)
         ops.paged_attention_v2(
             output,
             exp_sums,
