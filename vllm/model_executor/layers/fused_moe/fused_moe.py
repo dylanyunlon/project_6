@@ -389,35 +389,45 @@ def get_default_config(
             'GROUP_SIZE_M': 1
         }
     numel = M * topk
-    # CCCL kernel_transform_tile.cuh principle: assume_divisible<16> enables
-    # LDG.E.128 vectorized loads by guaranteeing num_items % 16 == 0.
-    # Applied here: BLOCK_SIZE_M must always be a multiple of 16 so that
-    # moe_align_block_size produces token counts divisible by 16.
+
+    # CCCL GridEvenShare dispatch (grid_even_share.cuh + dispatch_batch_memcpy.cuh):
     #
-    # CCCL partition_view from kernel_transform_tile.cuh:
-    #   partition_view{span, shape<TileSize>} auto-partitions 1D data into tiles.
-    # Our equivalent: moe_align_block_size pads token counts to BLOCK_SIZE_M.
-    # Smaller BLOCK_SIZE_M = more tiles but less wasted padding per tile.
+    # dispatch_batch_memcpy uses two-level dispatch:
+    #   - Small buffers: one CTA handles multiple buffers (warp-level copy)
+    #   - Large buffers: multiple CTAs collaborate on one buffer (block-level)
     #
-    # GridEvenShare (grid_even_share.cuh) for BI-V100:
+    # Applied to MoE: "buffers" = per-expert token groups after routing.
+    # Qwen3.6: 256 experts, top-8 → ~8 tokens per expert during decode (M=1).
+    # During prefill (M=4096): 4096×8/256 = 128 tokens per expert average.
+    #
+    # CCCL GridEvenShare formula:
     #   max_blocks = sm_count × subscription_factor = 16 × 5 = 80
-    #   For numel=8 (decode), we want exactly 1 tile per expert-group.
-    #   For numel=4096 (prefill), we want ~80 tiles to saturate 16 SMs.
+    #   optimal_block_m = ceil(numel / max_blocks)
+    #   block_m = clamp(round_up(optimal_block_m, 16), 16, 256)
     #
-    # ixformer only reads BLOCK_SIZE_M — N/K/GROUP are internal.
+    # ixformer only reads BLOCK_SIZE_M for token padding alignment.
+    # Smaller BLOCK_SIZE_M = less wasted padding, more tiles.
+    # Larger BLOCK_SIZE_M = fewer tiles, less launch overhead.
+    _BI100_MAX_BLOCKS = 80  # 16 SMs × 5 subscription (CCCL default)
+
     if numel <= 16:
         config['BLOCK_SIZE_M'] = 16
-    elif numel <= 64:
-        config['BLOCK_SIZE_M'] = 32
-    elif numel <= 256:
+    elif numel <= _BI100_MAX_BLOCKS * 16:
+        # Small problem: want ~1 tile per expert-group
+        # BLOCK_SIZE_M = 16 gives numel/16 tiles, enough to fill SMs
+        config['BLOCK_SIZE_M'] = 16
+    elif numel <= _BI100_MAX_BLOCKS * 64:
+        # Medium: target ~80 tiles for full SM saturation
+        # ceil(numel / 80) ≈ 64 → use 64
         config['BLOCK_SIZE_M'] = 64
-    elif numel <= 1024:
-        # CCCL spread_out_items: items = ceil_div(num_items, sm*threads*occ)
-        # Target ~80 tiles: numel/BLOCK_M ≈ 80 → BLOCK_M ≈ numel/80
-        # For numel=1024: BLOCK_M = 1024/80 ≈ 16, but 64 is minimum for matmul
-        config['BLOCK_SIZE_M'] = 64
+    elif numel <= _BI100_MAX_BLOCKS * 128:
+        config['BLOCK_SIZE_M'] = 128
     else:
         # Large prefill: 256 to amortize launch overhead
+        # CCCL dispatch_batch_memcpy MultiBlockBatchMemcpyKernel:
+        # large buffers use TILE_SIZE = BLOCK_THREADS × ITEMS_PER_THREAD
+        # with do-while loop over tiles. Same pattern: large BLOCK_SIZE_M
+        # means each CTA does more work per iteration.
         config['BLOCK_SIZE_M'] = 256
     return config
 
