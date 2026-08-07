@@ -397,11 +397,36 @@ class PagedAttention:
         # Original heuristic (before hardcode): V1 when max_seq_len ≤ 8192 OR
         # when batch×heads already saturates the GPU (num_seqs*num_heads > 512).
         # Restored with BI-V100 SM count awareness.
+        # ──── CCCL GridEvenShare dispatch (from dispatch_reduce.cuh) ────
+        # CCCL formula: max_blocks = sm_occupancy × sm_count × subscription_factor
+        # Then: grid_size = min(total_tiles, max_blocks)
+        # If grid_size == 1 → single-tile (V1). If grid_size > 1 → multi-tile (V2).
+        #
+        # BI-V100 hardware (confirmed):
+        #   sm_count = 16, sm_occupancy ≈ 1 CTA/SM (conservative for attention),
+        #   subscription_factor = 5 (CCCL default from util_arch.cuh)
+        #
+        # Tile size = _PARTITION_SIZE (512 tokens per partition)
+        # total_tiles = ceil_div(max_seq_len, _PARTITION_SIZE)
+        # max_blocks = 1 × 16 × 5 = 80
+        #
+        # This replaces the ad-hoc "num_seqs * num_heads > 512" heuristic
+        # with CCCL's precise GridEvenShare work distribution.
         bi100_sm_count = 16
-        bi100_saturation = bi100_sm_count * 32  # ~512 concurrent warps
-        use_v1 = (max_num_partitions == 1
-                  or max_seq_len <= 8192
-                  or num_seqs * num_heads > bi100_saturation)
+        bi100_sm_occupancy = 1  # conservative: 1 attention CTA per SM
+        bi100_subscription = 5  # CCCL default subscription_factor
+        bi100_max_blocks = bi100_sm_occupancy * bi100_sm_count * bi100_subscription  # 80
+        
+        total_tiles = (max_seq_len + _PARTITION_SIZE - 1) // _PARTITION_SIZE
+        grid_size = min(total_tiles, bi100_max_blocks)
+        
+        # CCCL single-tile vs multi-tile decision:
+        # V1 (single-tile) when problem fits in one CTA's work,
+        # OR when sequence×head parallelism already saturates the GPU
+        # (no benefit from partitioning — each sequence already has its own CTA)
+        seq_head_parallelism = num_seqs * num_heads
+        use_v1 = (grid_size == 1
+                  or seq_head_parallelism >= bi100_max_blocks)
         if use_v1:
             # Run PagedAttention V1.
             ops.paged_attention_v1(
