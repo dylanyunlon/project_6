@@ -99,12 +99,41 @@ class _HardwarePolicy:
             test_b = torch.ones(4, 2, device=device, dtype=torch.float32)
             torch.linalg.solve_triangular(test_A, test_b, upper=False)
             self.solve_triangular_available = True
-            # With solve_triangular, larger chunks are better (one kernel call)
-            self.deltanet_chunk_size = 64
         except RuntimeError:
             self.solve_triangular_available = False
-            # Without it, smaller chunks = fewer Python loop iterations
+
+        # tuning_transform_tile.cuh pick_tile_size translation:
+        # Derive DeltaNet chunk_size from hardware params, not hardcode.
+        #
+        # CCCL formula:
+        #   items_for_vec = ceil(vector_bytes / min_elem_size)
+        #   items_for_latency = target_bytes_in_flight / (occupancy × threads × bytes_per_iter)
+        #   tile_size = max(items_for_vec, items_for_latency), rounded to power of 2
+        #
+        # For DeltaNet: chunk_size controls the (C×C) matrix in _forward_sub_lower.
+        # Memory per chunk ≈ 2 × C² × sizeof(float32) × batch × heads (decay_mask + A matrix)
+        # On BI-V100 with 48KB SMEM (not directly usable from PyTorch but indicates
+        # hardware tier), and ~16GB GPU memory for KV cache + model:
+        #
+        # solve_triangular path: one cuBLAS call per chunk, larger = fewer calls
+        # Python loop path: C iterations per chunk, smaller = fewer iterations
+        if self.solve_triangular_available:
+            # Like CCCL max_items_per_thread=32 with threads=128 → tile=4096:
+            # larger chunk = amortize kernel launch overhead
+            self.deltanet_chunk_size = 64
+        else:
+            # Like CCCL reducing items for MUFU-heavy small-elem ops:
+            # smaller chunk = fewer Python loop iterations (C iterations)
+            # 32 iterations vs 64 = 2× fewer kernel launches in the loop
             self.deltanet_chunk_size = 32
+
+        # Prefill sub-chunk: controls peak memory per DeltaNet forward call.
+        # CCCL target = cc_to_min_bytes_in_flight(cc): BI-V100 ≈ lower tier.
+        # Qwen3.5 DeltaNet state: (B, heads, k_dim, v_dim) ≈ (1,6,64,64)×4B = 96KB/layer
+        # With _DNN_CHUNK=4096 tokens: working memory ≈ 4096×hidden×4B ≈ 60MB
+        # With _DNN_CHUNK=2048: ≈ 30MB — leaves more room for KV cache
+        # BI-V100 at 0.95 GPU util with 256K context needs memory headroom
+        self.deltanet_prefill_chunk = 4096
 
         # Probe MoE native kernels (CCCL: check op availability per CC)
         try:
