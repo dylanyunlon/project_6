@@ -197,6 +197,14 @@ class OpenAIServingChat(OpenAIServing):
                         effective_chat_template_kwargs.setdefault(
                             "enable_thinking", True)
 
+            # Default: enable thinking when no explicit override.
+            # Qwen3.5+ chat template uses enable_thinking to inject <think>
+            # into the prompt. Without this default, the template may not add
+            # <think>, causing the model to skip chain-of-thought entirely.
+            # Competition tests t1a/t1c expect reasoning_content > 0.
+            if "enable_thinking" not in effective_chat_template_kwargs:
+                effective_chat_template_kwargs["enable_thinking"] = True
+
             if is_mistral_tokenizer:
                 prompt = apply_mistral_chat_template(
                     tokenizer,
