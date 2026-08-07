@@ -16,8 +16,8 @@
 vllm:
   model_path: /model
   served_model_name: llm
-  max_model_len: 256000
-  gpu_memory_utilization: 0.95
+  max_model_len: 100000
+  gpu_memory_utilization: 0.90
   tensor_parallel: 4
   max_num_seqs: 2
   max_num_batched_tokens: 4096
