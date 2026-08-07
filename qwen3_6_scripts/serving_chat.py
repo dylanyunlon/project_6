@@ -348,7 +348,7 @@ class OpenAIServingChat(OpenAIServing):
         # parsing and reasoning parsing (both require full-history context).
         if tool_choice_auto or use_reasoning:
             previous_texts = [""] * num_choices
-            all_previous_token_ids = [[]] * num_choices
+            all_previous_token_ids = [[] for _ in range(num_choices)]
         else:
             previous_texts, all_previous_token_ids = None, None
 
@@ -357,7 +357,8 @@ class OpenAIServingChat(OpenAIServing):
             if tool_choice_auto and self.tool_parser:
                 tool_parsers: List[Optional[ToolParser]] = [
                     self.tool_parser(tokenizer)
-                ] * num_choices
+                    for _ in range(num_choices)
+                ]
             else:
                 tool_parsers = [None] * num_choices
         except RuntimeError as e:
