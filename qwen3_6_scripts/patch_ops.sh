@@ -51,14 +51,32 @@ deploy() {
 
 # ============================================================
 # 1. Transformers: register Qwen3_5 / Qwen3_5_MoE model types
+#    CRITICAL: Do NOT pip install transformers — it breaks corex
+#    kernel dependencies. Competitor sub168's docker log shows
+#    corex_gdn/corex_moe/corex_fa2 all loaded successfully.
+#    Our sub509 failed to load any corex kernel.
+#    The pip install transformers==4.55.3 likely caused this.
 # ============================================================
-pip install transformers==4.55.3 -i https://pypi.tuna.tsinghua.edu.cn/simple 2>/dev/null || \
-pip install transformers==4.55.3 2>/dev/null || \
-echo "[patch_ops] WARNING: pip install transformers failed, using pre-installed version"
-cp -r ./qwen3_5 /usr/local/lib/python3.10/site-packages/transformers/models/
-cp -r ./qwen3_5_moe /usr/local/lib/python3.10/site-packages/transformers/models/
-python3 ./patch_transformers_qwen3_5.py
-echo "[patch_ops] transformers Qwen3_5 models installed"
+# Use base image transformers — just add config files
+TRANSFORMERS_MODELS=""
+for P in /usr/local/lib/python3.10/site-packages/transformers/models \
+         /usr/local/corex/lib/python3/dist-packages/transformers/models \
+         /usr/local/corex/lib64/python3/dist-packages/transformers/models; do
+    if [ -d "$P" ]; then
+        TRANSFORMERS_MODELS="$P"
+        break
+    fi
+done
+
+if [ -n "$TRANSFORMERS_MODELS" ]; then
+    cp -r ./qwen3_5 "$TRANSFORMERS_MODELS/"
+    cp -r ./qwen3_5_moe "$TRANSFORMERS_MODELS/"
+    python3 ./patch_transformers_qwen3_5.py 2>&1 || \
+        echo "[patch_ops] WARNING: patch_transformers failed (may work at runtime)"
+    echo "[patch_ops] transformers Qwen3_5 configs registered (no pip install)"
+else
+    echo "[patch_ops] WARNING: transformers/models not found — skipping config registration"
+fi
 
 # ============================================================
 # 2. Model registry: ensure qwen3_5 is registered in vllm
