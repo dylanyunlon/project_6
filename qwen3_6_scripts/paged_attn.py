@@ -325,10 +325,13 @@ class PagedAttention:
     # custom epilogue — this is what FlashAttention-2/3 does at the CUDA level.
     # ================================================================
 
-    # paged_attention_v1 on BI-V100 fails for long contexts.
-    # Route on actual sequence length (seq_lens.max()), not the max_seq_len
-    # parameter which is inflated to max_model_len in CUDA graph mode.
-    _PYTORCH_DECODE_THRESHOLD = 32768
+    # paged_attention_v1 on BI-V100: ixformer native kernel handles long contexts.
+    # PyTorch fallback is only for emergency (kernel crash at extreme lengths).
+    # CCCL GridEvenShare principle: each work unit (decode step) must complete
+    # within bounded time — Python fallback is too slow for seq_len > 32K
+    # (causes HTTP timeout → service crash). Native V1 kernel is O(1) per step.
+    # Threshold raised to avoid fallback during normal operation.
+    _PYTORCH_DECODE_THRESHOLD = 999999
 
     @staticmethod
     def forward_decode(

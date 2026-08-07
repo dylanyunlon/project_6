@@ -328,7 +328,7 @@ class PagedAttention:
     # paged_attention_v1 on BI-V100 fails for long contexts.
     # Route on actual sequence length (seq_lens.max()), not the max_seq_len
     # parameter which is inflated to max_model_len in CUDA graph mode.
-    _PYTORCH_DECODE_THRESHOLD = 32768
+    _PYTORCH_DECODE_THRESHOLD = 999999
 
     @staticmethod
     def forward_decode(
