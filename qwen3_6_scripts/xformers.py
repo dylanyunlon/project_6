@@ -672,16 +672,39 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         value: torch.Tensor,
         attn_metadata: "XFormersMetadata",
     ) -> torch.Tensor:
-        """Pure-math causal attention fallback with Q-tiling memory optimization.
+        """Pure-math causal attention with Q-tiling + KV-tiling + online softmax.
 
         Called when: kv_cache.numel()==0 (profiling) AND head_size > 128.
         No KV cache prefix in this path — KV length == query length.
 
-        Memory optimization (Q-tiling, same principle as Flash Attention):
-          Split Q into _Q_CHUNK-sized sub-blocks, compute per-block,
-          peak memory O(_Q_CHUNK × q_len) instead of O(q_len²).
+        Architecture — ported from CCCL summary_statistics.cu transform_reduce:
+          CCCL packs {n, min, max, mean, M2, M3, M4} into one accumulator and
+          computes ALL statistics in a single pass via transform_reduce.
+          The binary_op merges two partial results (Welford parallel algorithm).
 
-        Softmax computed in float32 to prevent float16 overflow.
+          Online softmax is structurally identical:
+            accumulator = {m (running max), l (running sum_exp), o (running output)}
+            unary_op: score_tile → {max(tile), sum(exp(tile-max)), exp(tile-max) @ V}
+            binary_op: merge two accumulators with correction factor
+              m_new  = max(m_old, m_tile)
+              corr   = exp(m_old - m_new)
+              l_new  = l_old * corr + l_tile
+              o_new  = o_old * corr + tile_exp @ V
+
+        Tiling strategy — ported from CCCL GridEvenShare + spread_out_items:
+          Q-tiling: split Q into _Q_CHUNK blocks (controls peak memory per Q row)
+          KV-tiling: split K/V into _KV_CHUNK blocks (eliminates O(q×kv) attention matrix)
+          Peak memory: O(_Q_CHUNK × _KV_CHUNK) instead of O(_Q_CHUNK × seq_len)
+
+          CCCL GridEvenShare.DispatchInit formula:
+            total_tiles = ceil_div(num_items, tile_items)
+            grid_size = min(total_tiles, max_grid_size)
+          Our KV tile size is set so score tensor fits in ~48 MB budget.
+
+        Previous version (Q-tiling only) had O(q_chunk × seq_len) memory per chunk.
+        For seq_len=100K, q_chunk=256, kv_h=4, gqa=6:
+          attn_w = [4, 6, 256, 100000] fp32 = 2.4 GB — OOM.
+        This version tiles BOTH dimensions: O(q_chunk × kv_chunk) ≈ 24 MB.
 
         Args:
             query : [1, total_query_tokens, num_heads,    head_dim]
@@ -691,6 +714,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
             [1, total_query_tokens, num_heads, head_dim]
         """
         _Q_CHUNK = 256
+        _SCORE_BUDGET_BYTES = 48 * 1024 * 1024  # 48 MB score tensor budget
 
         assert attn_metadata.seq_lens is not None
         orig_dtype = query.dtype
@@ -711,102 +735,121 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         v_flat = value.squeeze(0)
 
         output = torch.empty_like(q_flat)
+        dev = query.device
         seq_start = 0
         for q_len in q_lens:
             seq_end = seq_start + q_len
 
-            k_s = k_flat[seq_start:seq_end].permute(1, 0, 2).float()
-            v_s = v_flat[seq_start:seq_end].permute(1, 0, 2).float()
+            # CCCL agent_reduce.cuh pattern: GQA broadcast avoids 6x memory
+            gqa_ratio = self.num_heads // self.num_kv_heads
+            use_gqa = gqa_ratio > 1
 
-            # CCCL agent_reduce.cuh ConsumeFullTile pattern: avoid
-            # materializing expanded data. Instead of repeat_interleave
-            # (which allocates 6x memory for GQA ratio=6), reshape to
-            # [kv_h, 1, seq, d] and let matmul broadcast over gqa groups.
-            #
-            # CCCL DeviceFind::FindIf tuning pattern: policy_selector
-            # injects block_size externally via cuda::execution::tune().
-            # We inject the GQA-aware reshape here instead of hardcoding
-            # repeat_interleave expansion.
-            gqa_ratio = self.num_heads // k_s.shape[0]
-            if gqa_ratio > 1:
-                # k_s: [kv_h, seq, d] → [kv_h, 1, seq, d] for broadcast
-                k_s = k_s.unsqueeze(1)  # [kv_h, 1, seq, d]
-                v_s = v_s.unsqueeze(1)  # [kv_h, 1, seq, d]
-                # q_c will be [kv_h, gqa, chunk, d] after reshape
-                use_gqa_broadcast = True
+            # CCCL GridEvenShare adaptive KV tile sizing:
+            # score tensor per tile = kv_h × gqa × q_chunk × kv_chunk × 4 bytes
+            # Solve for kv_chunk: kv_chunk = budget / (kv_h × gqa × q_chunk × 4)
+            score_row_bytes = self.num_kv_heads * gqa_ratio * min(_Q_CHUNK, q_len) * 4
+            if score_row_bytes > 0:
+                _KV_CHUNK = _SCORE_BUDGET_BYTES // score_row_bytes
             else:
-                use_gqa_broadcast = False
+                _KV_CHUNK = q_len
+            _KV_CHUNK = max(64, min(_KV_CHUNK, q_len))
 
-            # CCCL block_load_to_shared.cuh pattern: pre-compute invariants
-            # outside the inner loop. BlockLoadToShared does one mbarrier_init
-            # before all CopyAsync calls, not per-copy. Similarly, k_pos is
-            # invariant across Q chunks for the same sequence.
-            k_pos = torch.arange(q_len, device=query.device)
+            # CCCL block_load_to_shared.cuh: pre-compute invariants outside loops
+            _max_qc = min(_Q_CHUNK, q_len)
+            _qc_q_pos_base = torch.arange(_max_qc, device=dev)
 
-            # CCCL agent_sub_warp_merge_sort.cuh _TempStorage union pattern:
-            # Pre-allocate qc_q_pos at max chunk size, reuse via slicing.
-            # Avoids torch.arange allocation inside the inner loop.
-            # The union insight: load_keys/sort/store_keys share SMEM because
-            # they're sequential. Similarly, qc_q_pos is reused each iteration.
-            _max_chunk = min(_Q_CHUNK, q_len)
-            _qc_q_pos_base = torch.arange(_max_chunk, device=query.device)
-
-            # CCCL agent_sub_warp_merge_sort.cuh ShortCircuit pattern:
-            # segment_size < 3 → single-thread direct copy, skip sort.
-            # Here: q_len <= _Q_CHUNK → one chunk, skip the tiling loop.
-            _num_chunks = (q_len + _Q_CHUNK - 1) // _Q_CHUNK
-
-            for qc_idx in range(_num_chunks):
+            # Outer loop: Q tiles
+            _num_q_chunks = (q_len + _Q_CHUNK - 1) // _Q_CHUNK
+            for qc_idx in range(_num_q_chunks):
                 qc_start = qc_idx * _Q_CHUNK
                 qc_end = min(qc_start + _Q_CHUNK, q_len)
                 chunk_len = qc_end - qc_start
-
-                # Reuse pre-allocated base + offset (union pattern)
                 qc_q_pos = _qc_q_pos_base[:chunk_len] + qc_start
 
-                if use_gqa_broadcast:
-                    # GQA broadcast path — CCCL agent_reduce.cuh pattern:
-                    # Q: [kv_h, gqa, chunk, d], K: [kv_h, 1, seq, d]
-                    # matmul broadcasts K over gqa dim without materializing.
-                    # Saves 6x memory vs repeat_interleave for Qwen3.6 (ratio=6).
+                # Q for this chunk — prepared once, reused across KV tiles
+                if use_gqa:
                     q_c = (q_flat[seq_start + qc_start:seq_start + qc_end]
                            .float()
                            .view(-1, self.num_kv_heads, gqa_ratio, self.head_size)
-                           .permute(1, 2, 0, 3))  # [kv_h, gqa, chunk, d]
-
-                    # [kv_h, gqa, chunk, seq] via broadcast
-                    attn_w = torch.matmul(
-                        q_c, k_s.transpose(-2, -1)) * self.scale
-
-                    mask = k_pos.unsqueeze(0) > qc_q_pos.unsqueeze(1)
-                    attn_w = attn_w.masked_fill(
-                        mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-
-                    attn_w = torch.softmax(attn_w, dim=-1)
-                    # [kv_h, gqa, chunk, d]
-                    out_c = torch.matmul(attn_w, v_s).to(orig_dtype)
-                    # → [chunk, kv_h * gqa, d] = [chunk, num_heads, d]
-                    out_c = (out_c.permute(2, 0, 1, 3)
-                             .contiguous()
-                             .view(-1, self.num_heads, self.head_size))
-                    output[seq_start + qc_start:seq_start + qc_end] = out_c
+                           .permute(1, 2, 0, 3)
+                           .mul_(self.scale))  # [kv_h, gqa, chunk, d]
                 else:
-                    # Non-GQA path (kv_heads == num_heads)
-                    q_c = q_flat[seq_start + qc_start:seq_start + qc_end] \
-                          .permute(1, 0, 2).float()
+                    q_c = (q_flat[seq_start + qc_start:seq_start + qc_end]
+                           .permute(1, 0, 2).float()
+                           .mul_(self.scale))  # [h, chunk, d]
 
-                    attn_w = torch.matmul(
-                        q_c, k_s.transpose(-2, -1)) * self.scale
+                # Online softmax accumulators — CCCL summary_stats_data pattern
+                if use_gqa:
+                    m = torch.full((self.num_kv_heads, gqa_ratio, chunk_len),
+                                   float('-inf'), dtype=torch.float32, device=dev)
+                    l = torch.zeros_like(m)
+                    o = torch.zeros((self.num_kv_heads, gqa_ratio, chunk_len, self.head_size),
+                                    dtype=torch.float32, device=dev)
+                else:
+                    m = torch.full((self.num_heads, chunk_len),
+                                   float('-inf'), dtype=torch.float32, device=dev)
+                    l = torch.zeros_like(m)
+                    o = torch.zeros((self.num_heads, chunk_len, self.head_size),
+                                    dtype=torch.float32, device=dev)
 
-                    mask = k_pos.unsqueeze(0) > qc_q_pos.unsqueeze(1)
-                    attn_w = attn_w.masked_fill(
-                        mask.unsqueeze(0), float("-inf"))
+                # Inner loop: KV tiles — CCCL AgentReduceImpl::ConsumeFullTileRange
+                # Causal: Q at position qc_start+j sees K at position k only if k ≤ qc_start+j.
+                # Max valid K position = qc_end - 1. So KV tiles beyond qc_end are all-masked.
+                max_kv = qc_end  # causal bound
+                _num_kv_chunks = (max_kv + _KV_CHUNK - 1) // _KV_CHUNK
 
-                    attn_w = torch.softmax(attn_w, dim=-1)
-                    out_c = torch.matmul(attn_w, v_s).to(orig_dtype)
+                for kv_idx in range(_num_kv_chunks):
+                    kv_start = kv_idx * _KV_CHUNK
+                    kv_end = min(kv_start + _KV_CHUNK, max_kv)
+                    kv_len = kv_end - kv_start
 
-                    output[seq_start + qc_start:seq_start + qc_end] = (
-                        out_c.permute(1, 0, 2))
+                    # K/V slice for this tile
+                    k_tile = k_flat[seq_start + kv_start:seq_start + kv_end].float()
+                    v_tile = v_flat[seq_start + kv_start:seq_start + kv_end].float()
+
+                    if use_gqa:
+                        # [kv_h, 1, kv_len, d] for broadcast over gqa
+                        k_t = k_tile.permute(1, 0, 2).unsqueeze(1)  # [kv_h, 1, kv_len, d]
+                        v_t = v_tile.permute(1, 0, 2).unsqueeze(1)
+                    else:
+                        k_t = k_tile.permute(1, 0, 2)  # [h, kv_len, d]
+                        v_t = v_tile.permute(1, 0, 2)
+
+                    # Score: Q @ K^T
+                    s = torch.matmul(q_c, k_t.transpose(-2, -1))  # [.., chunk, kv_len]
+
+                    # Causal mask: K at absolute position kv_start+k must not exceed Q at qc_start+j
+                    k_abs = torch.arange(kv_start, kv_end, device=dev)
+                    mask = k_abs.unsqueeze(0) > qc_q_pos.unsqueeze(1)  # [chunk, kv_len]
+                    if use_gqa:
+                        s.masked_fill_(mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+                    else:
+                        s.masked_fill_(mask.unsqueeze(0), float('-inf'))
+
+                    # Online softmax update — CCCL summary_stats_binary_op pattern
+                    m_tile = s.amax(dim=-1)
+                    m_new = torch.maximum(m, m_tile)
+                    corr = torch.exp(m - m_new)
+                    exp_s = torch.exp(s - m_new.unsqueeze(-1))
+                    del s
+
+                    m.copy_(m_new)
+                    l.mul_(corr).add_(exp_s.sum(dim=-1))
+                    o.mul_(corr.unsqueeze(-1)).add_(torch.matmul(exp_s, v_t))
+                    del exp_s, v_t, k_t, corr, m_new, m_tile
+
+                # Finalize: normalize output by sum_exp
+                o.div_(l.unsqueeze(-1))
+
+                if use_gqa:
+                    out_c = (o.permute(2, 0, 1, 3)
+                             .contiguous()
+                             .view(-1, self.num_heads, self.head_size)
+                             .to(orig_dtype))
+                else:
+                    out_c = o.permute(1, 0, 2).to(orig_dtype)
+
+                output[seq_start + qc_start:seq_start + qc_end] = out_c
 
             seq_start = seq_end
 
