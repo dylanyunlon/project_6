@@ -463,8 +463,46 @@ def _paged_attention(
 ) -> torch.Tensor:
     output = torch.empty_like(query)
 
-    use_v2 = enable_infer_paged_attn is None and key_cache.dim() == 4
-    if not use_v2:
+    # ═══════════════════════════════════════════════════════════════
+    # CCCL dispatch_reduce.cuh single-tile vs two-phase decision:
+    #
+    # kernel_reduce.cuh DeviceReduceSingleTileKernel:
+    #   Single CTA → ConsumeRange(0, num_items) → output
+    #   No temp buffer, no Phase 2 merge, no cross-CTA synchronization
+    #
+    # kernel_reduce.cuh DeviceReduceKernel:
+    #   Multiple CTAs → GridEvenShare → each CTA writes partial result
+    #   → Phase 2: single CTA merges all partials
+    #   OR (StableReductionOrder=false): atomic_ref::fetch_add
+    #
+    # dispatch_reduce.cuh Invoke():
+    #   if (num_items <= threads_per_block * items_per_thread):
+    #       InvokeSingleTile()    # one CTA, no overhead
+    #   else:
+    #       InvokePasses()        # multi-CTA + merge
+    #
+    # For paged attention:
+    #   V1 = SingleTile: one CTA handles entire sequence
+    #   V2 = TwoPasses: sequence partitioned across CTAs + merge
+    #
+    # Decision: V1 when sequence fits in one partition (no merge needed).
+    # The original condition `key_cache.dim() == 4` is unrelated to this
+    # decision — it checks tensor layout, not problem size.
+    #
+    # BI-V100 specifics:
+    #   16 SMs → max ~160 CTAs → V2's Phase 2 merge is cheap
+    #   But for short sequences (decode tokens 1→512), V1 avoids
+    #   the 3-5μs overhead of tmp_output allocation + merge kernel launch
+    # ═══════════════════════════════════════════════════════════════
+    max_num_partitions_check = (
+        (input_metadata.max_context_len + _PARTITION_SIZE - 1) //
+        _PARTITION_SIZE)
+    # V1 when single partition (CCCL InvokeSingleTile equivalent)
+    # V2 when multi-partition (CCCL InvokePasses equivalent)
+    # env override preserved for EngineX compatibility
+    use_v1 = (enable_infer_paged_attn is not None
+              or max_num_partitions_check <= 1)
+    if use_v1:
         block_size = value_cache.shape[3]
         # Run PagedAttention V1.
         ops.paged_attention_v1(
