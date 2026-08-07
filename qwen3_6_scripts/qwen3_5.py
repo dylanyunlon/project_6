@@ -112,6 +112,11 @@ def _torch_chunk_gated_delta_rule(
         diagonal=0)
 
     g = g.cumsum(dim=-1)
+    # Clamp gate logits to prevent exp overflow → NaN cascade.
+    # CCCL dispatch_reduce_deterministic.cuh: numerical stability requires
+    # bounded intermediate values. Gate logit range [-20, 20] keeps exp
+    # in [~2e-9, ~5e8] — safe for float32 accumulation.
+    g = g.clamp(-20.0, 20.0)
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
 
     # Lower-triangular solve WITHOUT libcusolver (not available on BI-V100).
