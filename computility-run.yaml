@@ -8,9 +8,9 @@ command:
     - --served-model-name
     - llm
     - --max-model-len
-    - '256000'
+    - '131072'
     - --gpu-memory-utilization
-    - '0.95'
+    - '0.90'
     - --trust-remote-code
     - -tp
     - '4'
@@ -19,7 +19,7 @@ command:
     - --disable-log-requests
     - --disable-frontend-multiprocessing
     - --max-num-batched-tokens
-    - '4096'
+    - '8192'
     - --enable-chunked-prefill
     - --max-seq-len-to-capture
     - '32768'

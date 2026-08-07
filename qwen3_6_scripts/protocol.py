@@ -408,6 +408,17 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if data.get("max_completion_tokens") is not None and data.get("max_tokens") is None:
             data["max_tokens"] = data["max_completion_tokens"]
 
+        # Map thinking={enable:true/false} → chat_template_kwargs.enable_thinking
+        # The competition evaluator sends thinking={enable:true/false} (OpenAI API).
+        # Qwen3's chat template expects enable_thinking=True/False in kwargs.
+        thinking = data.get("thinking")
+        if isinstance(thinking, dict):
+            enable = thinking.get("enable")
+            if enable is not None:
+                ctk = data.get("chat_template_kwargs") or {}
+                ctk["enable_thinking"] = bool(enable)
+                data["chat_template_kwargs"] = ctk
+
         messages = data.get("messages")
         if not isinstance(messages, list):
             return data
