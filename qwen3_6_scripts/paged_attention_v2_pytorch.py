@@ -97,6 +97,25 @@ def paged_attention_v2_pytorch(
     # Early tokens (seq_len < 1024) hit this fast path every step.
     _SINGLE_TILE_THRESHOLD = _PARTITION_SIZE  # sequences this short skip partitioning
 
+    # ─── CCCL SmemResource pre-allocation (warpspeed/resource/smem_resource.cuh) ──
+    # Instead of torch.full/torch.zeros inside the loop (which allocates new GPU
+    # tensors every decode step → OOM after thousands of steps), pre-allocate
+    # staging buffers sized for the worst case and reuse them via .fill_()/.zero_().
+    # This mirrors CCCL SmemResource's stageCount-based buffer pool pattern.
+    _max_padded = max_num_partitions * _PARTITION_SIZE
+    _staging_scores = torch.full(
+        (num_heads, _max_padded), float('-inf'),
+        dtype=torch.float32, device=query.device)
+    if gqa_ratio > 1:
+        _staging_v_kv = torch.zeros(
+            (num_kv_heads, _max_padded, head_size),
+            dtype=torch.float32, device=query.device)
+    else:
+        _staging_v = torch.zeros(
+            (num_heads, _max_padded, head_size),
+            dtype=torch.float32, device=query.device)
+    # ─── End pre-allocation ──────────────────────────────────────────────────────
+
     for seq_idx in range(num_seqs):
         seq_len = int(seq_lens[seq_idx].item())
         if seq_len == 0:
@@ -216,12 +235,11 @@ def paged_attention_v2_pytorch(
             scores_all = scores_all + alibi_slopes.unsqueeze(1) * positions.unsqueeze(0)
 
         # Pad to exact multiple of _PARTITION_SIZE for clean reshape
+        # CCCL SmemResource: reuse staging buffer instead of allocating
         padded_len = num_partitions * _PARTITION_SIZE
         if padded_len > seq_len:
-            pad_size = padded_len - seq_len
-            scores_padded = torch.full(
-                (num_heads, padded_len), float('-inf'),
-                dtype=scores_all.dtype, device=scores_all.device)
+            scores_padded = _staging_scores[:, :padded_len]
+            scores_padded.fill_(float('-inf'))
             scores_padded[:, :seq_len] = scores_all
         else:
             scores_padded = scores_all
@@ -251,10 +269,10 @@ def paged_attention_v2_pytorch(
         if gqa_ratio > 1:
             se_grouped = scores_exp.view(num_kv_heads, gqa_ratio, num_partitions, _PARTITION_SIZE)
             # V: pad and reshape to [kv_h, P, part_sz, d]
+            # CCCL SmemResource: reuse staging buffer
             if padded_len > seq_len:
-                v_padded_kv = torch.zeros(
-                    (num_kv_heads, padded_len, head_size),
-                    dtype=v_kv.dtype, device=v_kv.device)
+                v_padded_kv = _staging_v_kv[:, :padded_len, :]
+                v_padded_kv.zero_()
                 v_padded_kv[:, :seq_len, :] = v_kv
             else:
                 v_padded_kv = v_kv
@@ -268,10 +286,10 @@ def paged_attention_v2_pytorch(
             part_out = part_out_grouped.reshape(num_heads, num_partitions, head_size)
         else:
             # Non-GQA: v_perm is [H, seq_len, d], pad and reshape normally
+            # CCCL SmemResource: reuse staging buffer
             if padded_len > seq_len:
-                v_padded = torch.zeros(
-                    (num_heads, padded_len, head_size),
-                    dtype=v_perm.dtype, device=v_perm.device)
+                v_padded = _staging_v[:, :padded_len, :]
+                v_padded.zero_()
                 v_padded[:, :seq_len, :] = v_perm
             else:
                 v_padded = v_perm
