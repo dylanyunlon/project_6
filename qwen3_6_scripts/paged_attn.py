@@ -96,30 +96,10 @@ class PagedAttention:
     ) -> torch.Tensor:
         """Pure-PyTorch decode attention for long contexts (no hardware kernel).
 
-        Architecture mirrors CCCL's three-layer reduce:
-          dispatch_reduce.cuh  →  kernel_reduce.cuh  →  agent_reduce.cuh
-          (work distribution)     (kernel entry)         (tile consumption)
-
-        CCCL agent_reduce.cuh has two key patterns we translate here:
-
-        1. ConsumeFullTile vectorized path: data loaded as VectorT in striped
-           access (no BlockLoad staging → no SMEM for data, only for BlockReduce
-           scratch). PyTorch equivalent: single reshape+view without .contiguous()
-           when possible; fall back to one .contiguous() per K/V gather.
-
-        2. ConsumeTiles with GridEvenShare STRIP_MINE: each CTA strides across
-           the input with stride = grid_size * tile_items. For decode (q_len=1),
-           we tile over KV blocks with adaptive tile_sz per the same
-           GridEvenShare formula: max_tiles = sm_count * subscription_factor.
-
-        3. summary_statistics.cu compound reduce: accumulator = {m, l, o}.
-           unary_op: score_tile → (max, sum_exp, weighted_V).
-           binary_op: online softmax merge with correction factor.
-           This is the Flash Attention online softmax — identical structure.
-
-        For decode, q_len=1 per sequence. The attention weight is [H, 1, seq_len]
-        which is small (~5 MB at 50K tokens). We tile over KV blocks to control
-        peak memory and apply online softmax (Flash Attention Algorithm 1) per tile.
+        paged_attention_v1 hangs on BI-V100 when max_seq_len > ~32K due to
+        shared memory limits. For decode, q_len=1 per sequence so no Q-tiling
+        is needed — the attention weight tensor is [H, 1, seq_len] which is
+        trivially small (~5 MB at 50K).
 
         Shapes
         ------
@@ -134,166 +114,44 @@ class PagedAttention:
         block_size = value_cache.shape[3]
         gqa_ratio = num_heads // num_kv_heads
         orig_dtype = query.dtype
-        dev = query.device
 
         output = torch.empty_like(query)
-
-        # ================================================================
-        # CCCL spread_out_items_per_thread adaptive tile sizing for decode
-        #
-        # Ported from dispatch_transform.cuh::spread_out_items_per_thread
-        # and dispatch_reduce.cuh::InvokePasses GridEvenShare.
-        #
-        # CCCL formula (dispatch_transform.cuh line 183):
-        #   items = min(max_items,
-        #               ceil_div(num_items, sm_count * threads * max_occupancy))
-        #   items = clamp(items, min_items, max_items)
-        #
-        # Our translation for PyTorch decode:
-        #   "items" = KV blocks per tile (how much work per matmul call)
-        #   "num_items" = total KV blocks in the sequence
-        #   "sm_count * max_occupancy" = target number of tiles (~4-8)
-        #   Fewer tiles = fewer Python loop iterations = less launch overhead
-        #
-        # For decode (q_len=1), score tensor per tile is tiny:
-        #   kv_h × gqa × 1 × (tile_blocks × block_size) × 4 bytes
-        #   = 4 × 6 × 1 × 16384 × 4 = 1.5 MB  (even at kv_h=4, safe)
-        # So the constraint is NOT memory — it's minimizing loop iterations.
-        #
-        # CCCL grid_even_share.cuh DispatchInit logic:
-        #   total_tiles = ceil_div(num_items, tile_size)
-        #   grid_size = min(total_tiles, max_grid_size)
-        #   big_shares = total_tiles - (avg_tiles * grid_size)
-        # Our target: ~4 tiles max (Python overhead >> kernel launch overhead)
-        # ================================================================
-        # CCCL GridEvenShare: max_blocks = sm_occupancy * sm_count * subscription_factor
-        # BI-V100: 1 * 16 * 5 = 80 max CTAs for CUDA kernels.
-        # But this is Python (PyTorch ops), not CUDA launches — Python loop
-        # overhead dominates. Each iteration = 1 torch.matmul launch + online
-        # softmax update. Target 2 iterations (not 4): the matmul itself is
-        # already parallelized across SMs, so fewer Python loops = less overhead.
-        # For seq_len=100K with block_size=16: 6250 blocks / 2 = 3125 blocks/tile.
-        # Score tensor: 4 kv_heads × 6 gqa × 1 × 50000 × 4B = 4.8 MB — fits.
-        _BI100_TARGET_TILES = 2   # 2 iterations: minimize Python loop overhead
-        _MIN_TILE_BLOCKS = 128    # floor: ensure matmul is large enough to saturate 16 SMs
-        _MAX_TILE_BLOCKS = 8192   # ceiling: 8192 × 16 = 128K tokens per tile — fits in memory
 
         try:
             for i in range(num_seqs):
                 seq_len = int(seq_lens[i].item())
-                if seq_len == 0:
-                    output[i].zero_()
-                    continue
+                num_blocks = (seq_len + block_size - 1) // block_size
+                blk_ids = block_tables[i, :num_blocks]
 
-                num_blocks_i = (seq_len + block_size - 1) // block_size
-                blk_ids = block_tables[i, :num_blocks_i]
+                # Gather K: [kv_h, head_dim, seq_len] fp32 — no GQA expansion.
+                # With kv_h=1 and seq_len=100K this is 98 MB vs 586 MB if expanded.
+                k_t = (key_cache[blk_ids]
+                       .permute(0, 3, 1, 2, 4)
+                       .contiguous()
+                       .view(-1, num_kv_heads, head_dim))[:seq_len] \
+                      .permute(1, 2, 0).contiguous().float()  # [kv_h, d, seq_len]
 
-                # Q reshaped once: [kv_h, gqa, 1, d] fp32 — tiny for decode
+                # Gather V: [kv_h, seq_len, head_dim] fp32
+                v_t = (value_cache[blk_ids]
+                       .permute(0, 3, 1, 2)
+                       .contiguous()
+                       .view(-1, num_kv_heads, head_dim))[:seq_len] \
+                      .permute(1, 0, 2).contiguous().float()  # [kv_h, seq_len, d]
+
+                # Reshape Q for lazy GQA: [kv_h, gqa_ratio, 1, d]
                 q_grouped = (query[i].float()
                              .view(num_kv_heads, gqa_ratio, head_dim)
-                             .unsqueeze(2)
-                             .mul_(scale))
+                             .unsqueeze(2))
 
-                # Online softmax accumulators (CCCL summary_stats_data pattern)
-                # accumulator = {m (running max), l (running sum_exp), o (running output)}
-                m = torch.full((num_kv_heads, gqa_ratio, 1),
-                               float('-inf'), dtype=torch.float32, device=dev)
-                l = torch.zeros_like(m)
-                o = torch.zeros((num_kv_heads, gqa_ratio, 1, head_dim),
-                                dtype=torch.float32, device=dev)
+                # [kv_h, gqa_ratio, 1, seq_len]
+                attn_w = torch.matmul(
+                    q_grouped * scale,       # [kv_h, gqa, 1, d]
+                    k_t.unsqueeze(1))        # [kv_h, 1, d, seq_len]
+                attn_w = torch.softmax(attn_w, dim=-1)
 
-                # Tile over KV blocks — CCCL spread_out_items_per_thread pattern
-                # Adaptive: tile_blocks = ceil(num_blocks / target_tiles)
-                # clamped to [_MIN_TILE_BLOCKS, _MAX_TILE_BLOCKS]
-                tile_blocks = max(_MIN_TILE_BLOCKS,
-                                  min(_MAX_TILE_BLOCKS,
-                                      (num_blocks_i + _BI100_TARGET_TILES - 1)
-                                      // _BI100_TARGET_TILES))
-                for tile_start in range(0, num_blocks_i, tile_blocks):
-                    tile_end = min(tile_start + tile_blocks, num_blocks_i)
-                    tile_blk_ids = blk_ids[tile_start:tile_end]
-
-                    # Valid tokens in this tile
-                    tile_token_start = tile_start * block_size
-                    tile_token_end = min(tile_end * block_size, seq_len)
-                    valid_tokens = tile_token_end - tile_token_start
-
-                    # --------------------------------------------------------
-                    # KV gather — agent_reduce.cuh ConsumeFullTile pattern
-                    #
-                    # agent_reduce loads VectorT in striped access when possible.
-                    # PyTorch equivalent: reshape the 5D cache layout to 3D in
-                    # one permute+contiguous, avoiding the double-contiguous
-                    # pattern of the old code.
-                    #
-                    # key_cache shape: [num_blocks, kv_h, d//x, blk_sz, x]
-                    # Target: [kv_h, d, valid_tokens] for Q@K^T
-                    #
-                    # Optimized path: permute(1,2,4,0,3) → [kv_h, d//x, x, n_blk, blk_sz]
-                    # → reshape to [kv_h, d, n_blk*blk_sz] → slice [:valid_tokens]
-                    # This is ONE contiguous() call instead of TWO.
-                    # --------------------------------------------------------
-                    k_gathered = key_cache[tile_blk_ids]  # [n, kv_h, d//x, blk_sz, x]
-                    k_t = (k_gathered
-                           .permute(1, 2, 4, 0, 3)       # [kv_h, d//x, x, n, blk_sz]
-                           .contiguous()
-                           .view(num_kv_heads, head_dim, -1)  # [kv_h, d, n*blk_sz]
-                           [:, :, :valid_tokens]
-                           .unsqueeze(1)                  # [kv_h, 1, d, valid]
-                           .float())
-                    del k_gathered
-
-                    v_gathered = value_cache[tile_blk_ids]  # [n, kv_h, d, blk_sz]
-                    v_t = (v_gathered
-                           .permute(1, 2, 0, 3)           # [kv_h, d, n, blk_sz]
-                           .contiguous()
-                           .view(num_kv_heads, head_dim, -1)  # [kv_h, d, n*blk_sz]
-                           [:, :, :valid_tokens]
-                           .transpose(1, 2)               # [kv_h, valid, d]
-                           .unsqueeze(1)                  # [kv_h, 1, valid, d]
-                           .float())
-                    del v_gathered
-
-                    # --------------------------------------------------------
-                    # Scores + online softmax — summary_statistics.cu pattern
-                    #
-                    # unary_op: score_tile → (max, sum_exp, weighted_V)
-                    # binary_op: merge with correction factor
-                    #
-                    # CCCL summary_stats_binary_op merges:
-                    #   result.mean = x.mean + delta * y.n / n
-                    #   result.M2  = x.M2 + y.M2 + delta² * x.n * y.n / n
-                    #
-                    # Online softmax merge:
-                    #   m_new  = max(m_old, m_tile)
-                    #   corr   = exp(m_old - m_new)        ← rescale factor
-                    #   l_new  = l_old * corr + l_tile
-                    #   o_new  = o_old * corr + tile_exp @ V
-                    #
-                    # Structurally identical: m↔max, l↔n, o↔mean×n.
-                    # --------------------------------------------------------
-
-                    # [kv_h, gqa, 1, valid_tokens]
-                    s = torch.matmul(q_grouped, k_t)
-                    del k_t
-
-                    # Online softmax update (Flash Attention Algorithm 1)
-                    m_tile = s.amax(dim=-1, keepdim=True)    # [kv_h, gqa, 1, 1]
-                    m_new = torch.maximum(m, m_tile.squeeze(-1))
-                    corr = torch.exp(m - m_new)              # rescale old accum
-
-                    exp_s = torch.exp(s - m_new.unsqueeze(-1))
-                    del s
-
-                    m.copy_(m_new)
-                    l.mul_(corr).add_(exp_s.sum(dim=-1))
-                    o.mul_(corr.unsqueeze(-1)).add_(torch.matmul(exp_s, v_t))
-                    del exp_s, v_t, corr, m_new, m_tile
-
-                # Finalize: normalize
-                o.div_(l.unsqueeze(-1))
-                output[i] = (o.view(num_heads, head_dim)
-                              .to(orig_dtype))
+                # [kv_h, gqa_ratio, 1, d] → [num_heads, head_dim]
+                out_i = torch.matmul(attn_w, v_t.unsqueeze(1))
+                output[i] = out_i.view(num_heads, head_dim).to(orig_dtype)
 
         except Exception as e:
             print(f"[decode_pytorch ERROR] {type(e).__name__}: {e}",
@@ -303,35 +161,10 @@ class PagedAttention:
 
         return output
 
-    # ================================================================
-    # CCCL Design Pattern: summary_statistics.cu transform_reduce
-    #
-    # CCCL packs {n, min, max, mean, M2, M3, M4} into one struct and
-    # computes ALL statistics in a single pass via transform_reduce.
-    # The binary_op merges two partial results (Welford parallel algo).
-    #
-    # Our online softmax is the same pattern:
-    #   accumulator = {m (running max), l (running sum_exp), o (running output)}
-    #   unary_op: score_tile → {max(tile), sum(exp(tile-max)), exp(tile-max) @ V}
-    #   binary_op: merge two accumulators with correction factor
-    #
-    # Key insight: kv_heads are INDEPENDENT — no cross-head dependency.
-    # Current code already batches via [kv_h, gqa, q_len, tile_sz] tensor ops.
-    # The CCCL pattern validates this is optimal: one matmul per tile across
-    # all heads simultaneously, not per-head iteration.
-    #
-    # Future optimization: if we ever get Triton/CUDA access, the binary_op
-    # merge step ({m,l,o} update) could be fused with the matmul via a
-    # custom epilogue — this is what FlashAttention-2/3 does at the CUDA level.
-    # ================================================================
-
-    # paged_attention_v1 on BI-V100: ixformer native kernel handles long contexts.
-    # PyTorch fallback is only for emergency (kernel crash at extreme lengths).
-    # CCCL GridEvenShare principle: each work unit (decode step) must complete
-    # within bounded time — Python fallback is too slow for seq_len > 32K
-    # (causes HTTP timeout → service crash). Native V1 kernel is O(1) per step.
-    # Threshold raised to avoid fallback during normal operation.
-    _PYTORCH_DECODE_THRESHOLD = 999999
+    # paged_attention_v1 on BI-V100 fails for long contexts.
+    # Route on actual sequence length (seq_lens.max()), not the max_seq_len
+    # parameter which is inflated to max_model_len in CUDA graph mode.
+    _PYTORCH_DECODE_THRESHOLD = 32768
 
     @staticmethod
     def forward_decode(
@@ -378,33 +211,9 @@ class PagedAttention:
         # to parallelize.
         # TODO(woosuk): Tune this heuristic.
         # For context len > 8192, use V2 kernel to avoid shared memory shortage.
-        # CCCL dispatch_reduce.cuh two-path dispatch architecture:
-        #   single-tile:  num_items ≤ threads × items  →  one CTA, zero temp buffer
-        #   multi-tile:   GridEvenShare partitions across sm_count × occupancy CTAs
-        #
-        # Paged attention equivalent:
-        #   V1 = single-pass: one CTA iterates ALL KV blocks (like DeviceReduceSingleTileKernel)
-        #   V2 = partitioned: KV blocks split into PARTITION_SIZE chunks across CTAs,
-        #        then a second kernel merges partition results (like InvokePasses two-phase)
-        #
-        # V1 is optimal when seq_len fits in one CTA's tile (small context).
-        # V2 is optimal when seq_len >> PARTITION_SIZE (long context) — parallelism
-        # across partitions compensates for the merge overhead.
-        #
-        # CCCL's GridEvenShare formula:
-        #   max_blocks = sm_occupancy × sm_count × subscription_factor
-        #   BI-V100: ~1 × 16 × 5 = 80 max blocks
-        #   V2 becomes worthwhile when max_num_partitions > 1 AND the partition
-        #   parallelism exceeds the sequence×head parallelism.
-        #
-        # Original heuristic (before hardcode): V1 when max_seq_len ≤ 8192 OR
-        # when batch×heads already saturates the GPU (num_seqs*num_heads > 512).
-        # Restored with BI-V100 SM count awareness.
-        bi100_sm_count = 16
-        bi100_saturation = bi100_sm_count * 32  # ~512 concurrent warps
-        use_v1 = (max_num_partitions == 1
-                  or max_seq_len <= 8192
-                  or num_seqs * num_heads > bi100_saturation)
+        use_v1 = (max_seq_len <= 8192
+                  and (max_num_partitions == 1 or num_seqs * num_heads > 512))
+        use_v1 = True
         if use_v1:
             # Run PagedAttention V1.
             ops.paged_attention_v1(
@@ -423,33 +232,17 @@ class PagedAttention:
         else:
             # Run PagedAttention V2.
             assert _PARTITION_SIZE % block_size == 0
-            # CCCL agent_merge_sort.cuh union _TempStorage pattern:
-            # agent_merge_sort shares a single SMEM allocation across
-            # load_keys, load_items, store_keys, and block_merge ops
-            # (they don't execute concurrently, so one buffer suffices).
-            # Our equivalent: cache V2 temp tensors across decode steps.
-            # For max_num_seqs=1 (competition config), these shapes are
-            # stable across all decode steps for the same sequence.
-            _v2_key = ("v2_tmp", num_seqs, num_heads, max_num_partitions,
-                       head_size, output.dtype, output.device)
-            _v2_cached = getattr(PagedAttention, '_v2_cache', {}).get(_v2_key)
-            if _v2_cached is not None:
-                tmp_output, exp_sums, max_logits = _v2_cached
-            else:
-                tmp_output = torch.empty(
-                    size=(num_seqs, num_heads, max_num_partitions, head_size),
-                    dtype=output.dtype,
-                    device=output.device,
-                )
-                exp_sums = torch.empty(
-                    size=(num_seqs, num_heads, max_num_partitions),
-                    dtype=torch.float32,
-                    device=output.device,
-                )
-                max_logits = torch.empty_like(exp_sums)
-                if not hasattr(PagedAttention, '_v2_cache'):
-                    PagedAttention._v2_cache = {}
-                PagedAttention._v2_cache[_v2_key] = (tmp_output, exp_sums, max_logits)
+            tmp_output = torch.empty(
+                size=(num_seqs, num_heads, max_num_partitions, head_size),
+                dtype=output.dtype,
+                device=output.device,
+            )
+            exp_sums = torch.empty(
+                size=(num_seqs, num_heads, max_num_partitions),
+                dtype=torch.float32,
+                device=output.device,
+            )
+            max_logits = torch.empty_like(exp_sums)
             ops.paged_attention_v2(
                 output,
                 exp_sums,
@@ -547,38 +340,11 @@ class PagedAttention:
         context_lens   : [batch_size]  tokens already in KV cache
         """
         try:
-            # ================================================================
-            # Tile sizing strategy — ported from CCCL dispatch_reduce.cuh
-            #
-            # CCCL's GridEvenShare computes:
-            #   max_blocks = sm_occupancy × sm_count × subscription_factor
-            #   tile_size  = num_items / max_blocks  (evenly distributed)
-            #
-            # For BI-V100 (16 SMs), fixed _BLOCKS_PER_TILE=32 wastes memory
-            # on short contexts and underutilizes on long ones.
-            #
-            # Key insight from kernel_reduce.cuh:
-            #   StableReductionOrder=false uses atomicAdd → single kernel pass.
-            #   For online softmax (our case), we accumulate (m, l, o) per tile
-            #   then merge — this IS a multi-pass reduce. Larger tiles = fewer
-            #   merge steps = less numerical drift + less Python loop overhead.
-            #
-            # CCCL subscription_factor = CUB_SUBSCRIPTION_FACTOR(0) = 5
-            # Effective: 16 SM × 1 CTA/SM × 5 = 80 concurrent tiles max.
-            # But Python loop overhead dominates, so we want FEWER, LARGER tiles.
-            #
-            # Strategy: target ~4-8 tiles per context phase.
-            #   Fewer tiles → fewer matmul calls → less launch overhead.
-            #   SMEM constraint: score tensor [kv_h, gqa, q_len, tile_sz] fp32
-            #     must not cause OOM. With q_len=4096, kv_h=1, gqa=6:
-            #     tile_sz=1024 → 1×6×4096×1024×4 = 96 MB (too much)
-            #     tile_sz=512  → 48 MB (borderline)
-            #     tile_sz=256  → 24 MB (safe)
-            #   For decode (q_len=1): tile_sz=4096 → only 96 KB (always safe)
-            # ================================================================
-            _SMEM_BUDGET_BYTES = 256 * 1024 * 1024  # 256 MB score tensor budget
-            # CCCL GridEvenShare: fewer tiles = fewer iterations = less overhead
-            # BI-V100 has 32 GB HBM per card; 256 MB temporary is safe.
+            # Paged-block tiles for context phase.
+            # tile_sz = _BLOCKS_PER_TILE × block_size  (e.g. 16×16 = 256 tokens).
+            # Score tensor [kv_h, gqa, q_len, tile_sz] fp32 = 24 MB per tile.
+            # Same tile size reused for the current-chunk phase.
+            _BLOCKS_PER_TILE = 32
 
             batch_size   = seq_lens_tensor.shape[0]
             num_q_heads  = query.shape[1]
@@ -586,6 +352,7 @@ class PagedAttention:
             head_dim     = query.shape[2]
             gqa_ratio    = num_q_heads // num_kv_heads
             block_size   = value_cache.shape[3]
+            tile_sz      = _BLOCKS_PER_TILE * block_size
             scale        = head_dim ** -0.5
             orig_dtype   = query.dtype
             output       = torch.empty_like(query)
@@ -600,36 +367,6 @@ class PagedAttention:
                 q_i = query[q_start:q_end]   # [q_len, q_h,  d]
                 k_i = key  [q_start:q_end]   # [q_len, kv_h, d]
                 v_i = value[q_start:q_end]
-
-                # CCCL spread_out_items_per_thread adaptive tile sizing.
-                #
-                # Two constraints compete:
-                # 1. Memory: score tensor [kv_h, gqa, q_len, tile_sz] × 4 ≤ budget
-                # 2. Iteration count: want ~4-8 tiles to minimize Python overhead
-                #
-                # CCCL dispatch_transform.cuh::spread_out_items_per_thread:
-                #   items = ceil_div(num_items, sm_count * threads * occupancy)
-                #   items = clamp(items, min_items, max_items)
-                #
-                # Our translation: tile_sz = max context tokens / target_tiles,
-                # then clamp by memory budget.
-                score_row_bytes = num_kv_heads * gqa_ratio * q_len * 4
-                if score_row_bytes > 0:
-                    mem_max_tokens = _SMEM_BUDGET_BYTES // score_row_bytes
-                    mem_max_tokens = (mem_max_tokens // block_size) * block_size
-                else:
-                    mem_max_tokens = block_size * 256
-
-                total_kv_tokens = ctx_len + q_len
-                # spread_out: target 4 tiles for context, 4 for current chunk
-                spread_tile = max(block_size,
-                                  (total_kv_tokens + 3) // 4)
-                # Round to block_size
-                spread_tile = (spread_tile // block_size) * block_size
-                spread_tile = max(spread_tile, block_size)
-                # Clamp by memory budget
-                tile_sz = min(spread_tile, mem_max_tokens)
-                tile_sz = max(tile_sz, block_size)  # floor
 
                 # Q reshaped and scaled once; held for all K-tiles.
                 # [kv_h, gqa, q_len, d] fp32  —  24 MB for q_len=4096, d=256
@@ -654,11 +391,14 @@ class PagedAttention:
                 # query has position ≥ ctx_len.  k_pos < q_pos is always True
                 # → no causal mask needed for pure context tiles.
                 # --------------------------------------------------------------
-                # Convert token-based tile_sz to block count for iteration
-                blocks_per_tile = tile_sz // block_size
-
                 if ctx_len > 0:
                     num_ctx_blocks = (ctx_len + block_size - 1) // block_size
+                    # Safety: if block_tables is too narrow this indicates a
+                    # prefix_cache_hit + chunked-prefill bug in model_runner.py
+                    # (Case 1 leaves prefix_cache_hit=True but block_table is
+                    # only computed_block_nums, not the full context blocks).
+                    # patch_model_runner.py fixes the root cause; this guard
+                    # prevents a zero-dim amax() crash if it still slips through.
                     if num_ctx_blocks > block_tables.shape[1]:
                         print(
                             f"[paged_attn WARNING] seq {i}: num_ctx_blocks={num_ctx_blocks} "
@@ -667,8 +407,8 @@ class PagedAttention:
                             "Capping context to available blocks — attention may be incorrect.",
                             file=sys.stderr, flush=True)
                         num_ctx_blocks = block_tables.shape[1]
-                    for tile_blk in range(0, num_ctx_blocks, blocks_per_tile):
-                        blk_end = min(tile_blk + blocks_per_tile, num_ctx_blocks)
+                    for tile_blk in range(0, num_ctx_blocks, _BLOCKS_PER_TILE):
+                        blk_end = min(tile_blk + _BLOCKS_PER_TILE, num_ctx_blocks)
                         blk_ids = block_tables[i, tile_blk:blk_end]
 
                         # Gather K/V for this tile.

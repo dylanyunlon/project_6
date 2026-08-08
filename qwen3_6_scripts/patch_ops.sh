@@ -68,8 +68,22 @@ fi
 # but the actual module file may be missing (causes ModuleNotFoundError
 # on startup: "No module named 'vllm.model_executor.models.qwen3_5'").
 # Deploy our qwen3_5.py so the module can be imported.
-cp ./qwen3_5.py "$VLLM/model_executor/models/qwen3_5.py" 2>/dev/null && \
-    echo "[patch_ops] qwen3_5.py deployed (model module)" || true
+# CCCL JIT pattern: check if image already has a working qwen3_5.py
+# (Sub168's image had one with corex_gdn/corex_moe integration).
+# Only deploy ours if the image's version is missing or broken.
+_NATIVE_QW="$VLLM/model_executor/models/qwen3_5.py"
+if [ -f "$_NATIVE_QW" ]; then
+    _SZ=$(wc -c < "$_NATIVE_QW" 2>/dev/null || echo 0)
+    if [ "$_SZ" -gt 1000 ]; then
+        echo "[patch_ops] qwen3_5.py EXISTS in image ($_SZ bytes) — NOT overwriting (corex native)"
+    else
+        cp ./qwen3_5.py "$_NATIVE_QW" 2>/dev/null && \
+            echo "[patch_ops] qwen3_5.py deployed (image version too small: $_SZ bytes)" || true
+    fi
+else
+    cp ./qwen3_5.py "$VLLM/model_executor/models/qwen3_5.py" 2>/dev/null && \
+        echo "[patch_ops] qwen3_5.py deployed (not found in image)" || true
+fi
 
 # 2b. Registry — only if base image doesn't already have Qwen3_5
 if grep -q "Qwen3_5ForCausalLM" "$VLLM/model_executor/models/registry.py" 2>/dev/null; then
@@ -79,10 +93,37 @@ else
         echo "[patch_ops] registry.py deployed" || true
 fi
 
+# 2c. paged_attn.py — CRITICAL: Triton context_attention_fwd hangs BI-V100.
+# Base engine comment: "The Triton context_attention_fwd kernel hangs BI-V100
+# GPUs permanently. Our paged_attn.py bypasses it via _forward_prefix_pytorch."
+cp ./paged_attn.py "$VLLM/attention/ops/paged_attn.py" 2>/dev/null && \
+    echo "[patch_ops] paged_attn.py deployed (Triton hang bypass)" || true
+
+# 2d. patch_model_runner.py — fix prefix_cache_hit in chunked-prefill chunk 2+
+python3 ./patch_model_runner.py 2>&1 || echo "[patch_ops] WARNING: model_runner patch failed (non-fatal)"
+
+# 2e. mamba_cache.py — required for GatedDeltaNet state management
+cp ./mamba_cache.py "$VLLM/model_executor/models/mamba_cache.py" 2>/dev/null && \
+    echo "[patch_ops] mamba_cache.py deployed" || true
+
+# 2f. sequence.py — fix completion_tokens inflation under chunked prefill
+cp ./sequence.py "$VLLM/sequence.py" 2>/dev/null && \
+    echo "[patch_ops] sequence.py deployed (token count fix)" || true
+
+# 2g. scheduler.py — record num_cached_tokens in RequestMetrics
+cp ./scheduler.py "$VLLM/core/scheduler.py" 2>/dev/null && \
+    echo "[patch_ops] scheduler.py deployed (cache metrics)" || true
+
+# 2h. xformers — bypass cudnnFlashAttn (head_dim=256 > 128 limit)
+python3 ./patch_xformers_sdpa_seq.py 2>&1 || echo "[patch_ops] WARNING: xformers seq patch failed"
+python3 ./patch_xformers_sdpa_batch.py 2>&1 || echo "[patch_ops] WARNING: xformers batch patch failed"
+echo "[patch_ops] xformers patches applied"
+
 # 3. Tool parser
 mkdir -p "$VLLM/entrypoints/openai/tool_parsers" 2>/dev/null || true
 cp ./qwen3coder_tool_parser.py "$VLLM/entrypoints/openai/tool_parsers/" 2>/dev/null || true
 cp ./tool_parsers_init.py "$VLLM/entrypoints/openai/tool_parsers/__init__.py" 2>/dev/null || true
+python3 ./patch_vllm_tool_parser.py 2>&1 || echo "[patch_ops] WARNING: tool parser registry patch failed"
 echo "[patch_ops] tool parser deployed"
 
 # 4. Reasoning parser
@@ -108,7 +149,17 @@ for P in /usr/local/corex/lib/python3/dist-packages/vllm \
 done
 if [ -n "$VLLM2" ]; then
     echo "[patch_ops] Second vllm at: $VLLM2"
-    cp ./qwen3_5.py "$VLLM2/model_executor/models/qwen3_5.py" 2>/dev/null || true
+    _NATIVE_QW2="$VLLM2/model_executor/models/qwen3_5.py"
+    if [ -f "$_NATIVE_QW2" ]; then
+        _SZ2=$(wc -c < "$_NATIVE_QW2" 2>/dev/null || echo 0)
+        if [ "$_SZ2" -gt 1000 ]; then
+            echo "[patch_ops] VLLM2 qwen3_5.py EXISTS ($_SZ2 bytes) — NOT overwriting"
+        else
+            cp ./qwen3_5.py "$_NATIVE_QW2" 2>/dev/null || true
+        fi
+    else
+        cp ./qwen3_5.py "$_NATIVE_QW2" 2>/dev/null || true
+    fi
     if ! grep -q "Qwen3_5ForCausalLM" "$VLLM2/model_executor/models/registry.py" 2>/dev/null; then
         cp ./registry.py "$VLLM2/model_executor/models/registry.py" 2>/dev/null || true
     fi
