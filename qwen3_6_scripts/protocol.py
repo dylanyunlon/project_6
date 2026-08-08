@@ -471,14 +471,27 @@ class ChatCompletionRequest(OpenAIBaseModel):
         messages = data.get("messages")
         if not isinstance(messages, list):
             return data
+
+        # CCCL agent_for.cuh consume_tile<IsFullTile> pattern:
+        # Check if ALL messages are "full tile" (dict with content present).
+        # If so, skip per-element boundary checks entirely — fast path.
+        is_full_tile = all(
+            isinstance(m, dict) and m.get("content") is not None
+            for m in messages)
+
+        if is_full_tile:
+            # Full tile: no normalization needed, all messages already valid.
+            # This is the common case for standard chat requests.
+            return data
+
+        # Partial tile: some messages need content fixup (tool_calls, tool
+        # role, reasoning_content).  Process each with boundary checks.
         normalized = []
         for msg in messages:
             if not isinstance(msg, dict):
                 normalized.append(msg)
                 continue
             if msg.get("content") is None:
-                # Allow tool_calls messages and tool-role messages without content.
-                # CCCL namespace pattern: accept valid alternate message formats.
                 if msg.get("reasoning_content") is not None:
                     msg = {**msg, "content": ""}
                 elif msg.get("tool_calls") is not None:
@@ -489,7 +502,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     raise ValueError(
                         "Each message must have at least one of 'content', "
                         "'reasoning_content', or 'tool_calls'.")
-                    
             normalized.append(msg)
         data = {**data, "messages": normalized}
         return data
