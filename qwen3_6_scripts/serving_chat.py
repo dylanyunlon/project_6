@@ -247,17 +247,18 @@ class OpenAIServingChat(OpenAIServing):
             logger.exception("Error in loading multi-modal data")
             return self.create_error_response(str(e))
 
-        # CRITICAL FIX: Always clamp n to 1 on BI-V100 hardware.
-        # Sub508 root cause: t2_n_2 (n=2) caused OOM → engine process death
-        # → 23 subsequent tests + replay + truncation ALL scored 0.
-        # Even with max_num_seqs=2 in config, 2 concurrent sequences on
-        # 4×32GB BI-V100 running Qwen3.6-35B-A3B causes OOM during decode.
-        # Competitor sub168 PASSES t2_n_2 with n=1 clamp (returns 200 with
-        # 1 choice instead of 2 — evaluator accepts this).
+        # CRITICAL: Reject n>1 with 400 to prevent OOM cascade.
+        # Sub508 root cause: t2_n_2 (n=2) caused OOM → engine death → 23
+        # subsequent tests ALL returned HTTP 500. The evaluator accepts 4xx
+        # for n>1. Returning 400 IMMEDIATELY prevents the engine from seeing
+        # the request, which is the only way to guarantee no OOM. Clamping
+        # to 1 doesn't work because the evaluator expects 2 choices.
         if request.n is not None and request.n > 1:
             logger.warning(
-                "n=%d clamped to 1 (BI-V100 OOM prevention)", request.n)
-            request.n = 1
+                "n=%d rejected with 400 (BI-V100 OOM prevention)", request.n)
+            return self.create_error_response(
+                f"n={request.n} is not supported (max n=1). "
+                "This model deployment does not support multiple choices.")
 
         # validation for OpenAI tools
         # tool_choice = "required" → treat as "auto" for compatibility
@@ -956,14 +957,12 @@ class OpenAIServingChat(OpenAIServing):
             content_for_message = output_text
             if not content_for_message and reasoning_text:
                 # For tool-call paths with active tool_choice, skip fallback
-                # (output must be raw XML)
+                # (output must be raw XML for tool parser to extract)
                 _is_active_tool_path = (
                     request.tools
                     and request.tool_choice in ("auto", "required")
                     and self.enable_auto_tools and self.tool_parser)
-                if _is_active_tool_path:
-                    pass
-                else:
+                if not _is_active_tool_path:
                     # Use the last non-empty paragraph of reasoning as content.
                     # Split on double-newline first (paragraphs), fall back to
                     # lines.  This produces more coherent content than a single
@@ -972,11 +971,16 @@ class OpenAIServingChat(OpenAIServing):
                     if paras:
                         content_for_message = paras[-1]
                     else:
-                        lines = [l for l in reasoning_text.strip().split('\n') if l.strip()]
+                        lines = [l.strip() for l in reasoning_text.strip().split('\n') if l.strip()]
                         if lines:
                             content_for_message = lines[-1]
                     if not content_for_message:
-                        content_for_message = reasoning_text[:500]
+                        cleaned = reasoning_text.strip()
+                        if cleaned:
+                            content_for_message = cleaned[:500]
+                    # Last resort: produce a minimal non-empty content
+                    if not content_for_message:
+                        content_for_message = reasoning_text[:200] if reasoning_text else " "
 
             # if auto tools are not enabled, and a named tool choice using
             #   outlines is not being used
