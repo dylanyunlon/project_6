@@ -1,0 +1,17 @@
+# Exclude everything not needed for the Docker image
+cccl_upstream/
+vllm/
+muh/
+docs/
+optimizations/
+vllm_adapter/
+*.zip
+*.txt
+*.md
+*.json
+*.muh
+.git/
+.gitignore
+__pycache__/
+*.pyc
+# Keep: qwen3_6_scripts/, computility-run.yaml, Dockerfile, launch_service
