@@ -177,6 +177,6 @@ if [ -n "$VLLM2" ]; then
     cp ./chat_utils.py "$VLLM2/entrypoints/chat_utils.py" 2>/dev/null || true
 fi
 
-echo "[patch_ops] DONE — serving layer + qwen3_5.py model module deployed"
-echo "[patch_ops] Deployed: qwen3_5.py (model module, required for registry import)"
-echo "[patch_ops] NOT deployed (base image native): model_runner.py, _custom_ops.py, sampler.py, scheduler.py, sequence.py, xformers.py, paged_attn.py, prefix_prefill.py, logits_processor.py, mamba_cache.py, arg_utils.py"
+echo "[patch_ops] DONE — full base engine patches + serving layer deployed"
+echo "[patch_ops] Deployed: qwen3_5.py, paged_attn.py, mamba_cache.py, sequence.py, scheduler.py, xformers patches, serving layer"
+echo "[patch_ops] NOT deployed (base image native): model_runner.py, _custom_ops.py, sampler.py, logits_processor.py, arg_utils.py"
