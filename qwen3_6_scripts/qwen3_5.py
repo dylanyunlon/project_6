@@ -144,6 +144,9 @@ def _torch_chunk_gated_delta_rule(
         diagonal=0)
 
     g = g.cumsum(dim=-1)
+    # Numerical stability: clamp cumulative decay to prevent exp() → inf → NaN
+    # CCCL pattern: block_scan overflow guard. Max safe float32 exp input ~88.
+    g = g.clamp(-80.0, 80.0)
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
     attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask_upper, 0)
     for i in range(1, chunk_size):
@@ -152,7 +155,7 @@ def _torch_chunk_gated_delta_rule(
         attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
     attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
     value = attn @ v_beta
-    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+    k_cumdecay = attn @ (k_beta * g.clamp(-80, 80).exp().unsqueeze(-1))
 
     last_state = (
         torch.zeros(batch, num_heads, k_dim, v_dim, dtype=value.dtype, device=value.device)
@@ -169,11 +172,11 @@ def _torch_chunk_gated_delta_rule(
         attn_i = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask_upper2, 0)
         v_prime = k_cumdecay[:, :, i] @ last_state
         v_new = v_i - v_prime
-        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_state
+        attn_inter = (q_i * g[:, :, i, :, None].clamp(-80, 80).exp()) @ last_state
         core_out[:, :, i] = attn_inter + attn_i @ v_new
         last_state = (
-            last_state * g[:, :, i, -1, None, None].exp()
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None])
+            last_state * g[:, :, i, -1, None, None].clamp(-80, 80).exp()
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).clamp(-80, 80).exp()[..., None])
             .transpose(-1, -2) @ v_new
         )
 
