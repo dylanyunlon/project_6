@@ -84,3 +84,22 @@ CCCL三级分发：compute_capability → sm_tuning → benchmark参数
 | d04 reasoning | 17.78s | 1192 | 67 |
 | d07 reasoning+content | 61.11s | 4451 | 72.8 |
 | replay avg | - | - | 11.86 |
+
+## CCCL agent_rle.cuh → streaming SSE 映射
+
+| CCCL agent_rle | serving_chat.py |
+|---------------|----------------|
+| streaming_context.num_uniques() | reasoning_token_counts[i] |
+| streaming_context.base_offset() | previous_num_tokens[i] |
+| BlockDiscontinuity (值变化检测) | reasoning_end_arr[i] (</think>检测) |
+| per-partition isolated state | per-choice state arrays |
+| ScatterDirect (压缩输出) | delta_message分发 |
+
+## CCCL adjacent_difference → streaming delta 映射
+
+| CCCL adjacent_diff | serving_chat.py |
+|-------------------|----------------|
+| SubtractLeftCopy | delta_text = output.text (保留原始+输出差值) |
+| previous element | previous_texts[i] |
+| current = prev + delta | current_text = previous_text + delta_text |
+| update prev = current | previous_texts[i] = current_text |
