@@ -44,16 +44,33 @@ from vllm.model_executor.models.interfaces import HasInnerState, SupportsLoRA
 logger = init_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# CoreX dispatch probe (CCCL env_dispatch pattern)
+# ixformer hardware acceleration (BI-V100 native ops)
 #
-# The base Docker image contains fused CUDA kernels for BI-V100:
-#   corex_gdn.py  — GatedDeltaNet fused prefill/decode
-#   corex_moe.py  — MoE fused prefill/decode (expert-grouped-wmma)
-# These are loaded from .so files specified by env vars:
-#   VLLM_COREX_GDN_LIBRARY, VLLM_COREX_MOE_LIBRARY
+# Confirmed available on BI-V100 via SSH probe (Aug 8 2026):
+#   ixformer.matmul(input, other, out=None, transa=False, transb=False, alpha=1.0, beta=0.0)
+#   ixformer.softmax(input, dim=None)
+#   ixformer.rms_norm(input, weight, output=None, eps=1e-6)
+#   ixformer.fused_add_rms_norm(input, residual, weight, eps=1e-5, scale=1.0)
+#   ixformer.silu_and_mul(input, output=None)
+#   ixformer.conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1)
+#   ixformer.flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False)
+#   ixformer.gemv(x, A)
 #
-# If import fails, we fall back to pure PyTorch (10x slower but correct).
+# No topk/moe/expert/gate ops available — MoE stays pure PyTorch.
+# No fused GDN scan kernel — GDN loop stays, but individual ops inside are accelerated.
 # ---------------------------------------------------------------------------
+_ix = None
+_ix_available = False
+
+try:
+    import ixformer as _ix
+    _ix_available = True
+    logger.info("ixformer loaded — BI-V100 hardware acceleration available")
+except ImportError:
+    logger.warning("ixformer not found — using pure PyTorch (no hardware acceleration)")
+
+# corex_gdn/corex_moe: these are custom modules that teams package into their
+# Docker image. If present, they provide fused GDN/MoE kernels.
 _corex_gdn_module = None
 _corex_moe_module = None
 _corex_gdn_available = False
@@ -62,20 +79,52 @@ _corex_moe_available = False
 try:
     from vllm.model_executor.models import corex_gdn as _corex_gdn_module
     _corex_gdn_available = True
-    logger.info("CoreX GDN module imported successfully — fused GDN kernels available")
+    logger.info("CoreX GDN module found — fused GDN kernels available")
 except ImportError:
-    logger.warning("CoreX GDN module not found — using pure PyTorch GDN (slower)")
+    pass  # expected if not packaged; ixformer ops used instead
 
 try:
     from vllm.model_executor.models import corex_moe as _corex_moe_module
     _corex_moe_available = True
-    logger.info("CoreX MoE module imported successfully — fused MoE kernels available")
+    logger.info("CoreX MoE module found — fused MoE kernels available")
 except ImportError:
-    logger.warning("CoreX MoE module not found — using pure PyTorch MoE (slower)")
+    pass  # expected; MoE uses PyTorch loop
 
 
 # ---------------------------------------------------------------------------
-# Pure-PyTorch DeltaNet kernels (fallbacks from transformers 5.2.0)
+# ixformer-accelerated ops (drop-in replacements for torch ops)
+# ---------------------------------------------------------------------------
+
+def _ix_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """BI-V100 accelerated matmul via ixformer, fallback to torch."""
+    if _ix_available:
+        try:
+            return _ix.matmul(a, b)
+        except Exception:
+            pass
+    return torch.matmul(a, b)
+
+def _ix_bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Batched matmul — ixformer.matmul handles batched inputs."""
+    if _ix_available:
+        try:
+            return _ix.matmul(a, b)
+        except Exception:
+            pass
+    return torch.matmul(a, b)
+
+def _ix_softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """BI-V100 accelerated softmax via ixformer."""
+    if _ix_available:
+        try:
+            return _ix.softmax(x, dim=dim)
+        except Exception:
+            pass
+    return torch.softmax(x, dim=dim)
+
+
+# ---------------------------------------------------------------------------
+# Pure-PyTorch DeltaNet kernels (with ixformer acceleration where possible)
 # ---------------------------------------------------------------------------
 
 def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
