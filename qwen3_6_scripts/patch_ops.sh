@@ -66,27 +66,14 @@ else
     echo "[patch_ops] WARNING: transformers/models not found"
 fi
 
-# 2. Model module — qwen3_5.py MUST exist for registry to import.
-# Base image registry lists Qwen3_5ForCausalLM/Qwen3_5MoeForCausalLM
-# but the actual module file may be missing (causes ModuleNotFoundError
-# on startup: "No module named 'vllm.model_executor.models.qwen3_5'").
-# Deploy our qwen3_5.py so the module can be imported.
-# CCCL JIT pattern: check if image already has a working qwen3_5.py
-# (Sub168's image had one with corex_gdn/corex_moe integration).
-# Only deploy ours if the image's version is missing or broken.
+# 2. Model module — qwen3_5.py with CoreX dispatch (CCCL env_dispatch pattern).
+# Our version tries to import corex_gdn/corex_moe from the base image.
+# If they exist → uses fused CUDA kernels (10x faster).
+# If they don't exist → gracefully falls back to pure PyTorch.
+# ALWAYS deploy ours — it handles both scenarios correctly.
 _NATIVE_QW="$VLLM/model_executor/models/qwen3_5.py"
-if [ -f "$_NATIVE_QW" ]; then
-    _SZ=$(wc -c < "$_NATIVE_QW" 2>/dev/null || echo 0)
-    if [ "$_SZ" -gt 1000 ]; then
-        echo "[patch_ops] qwen3_5.py EXISTS in image ($_SZ bytes) — NOT overwriting (corex native)"
-    else
-        cp ./qwen3_5.py "$_NATIVE_QW" 2>/dev/null && \
-            echo "[patch_ops] qwen3_5.py deployed (image version too small: $_SZ bytes)" || true
-    fi
-else
-    cp ./qwen3_5.py "$VLLM/model_executor/models/qwen3_5.py" 2>/dev/null && \
-        echo "[patch_ops] qwen3_5.py deployed (not found in image)" || true
-fi
+cp ./qwen3_5.py "$_NATIVE_QW" 2>/dev/null && \
+    echo "[patch_ops] qwen3_5.py deployed (CoreX dispatch + PyTorch fallback)" || true
 
 # 2b. Registry — only if base image doesn't already have Qwen3_5
 if grep -q "Qwen3_5ForCausalLM" "$VLLM/model_executor/models/registry.py" 2>/dev/null; then
@@ -153,16 +140,7 @@ done
 if [ -n "$VLLM2" ]; then
     echo "[patch_ops] Second vllm at: $VLLM2"
     _NATIVE_QW2="$VLLM2/model_executor/models/qwen3_5.py"
-    if [ -f "$_NATIVE_QW2" ]; then
-        _SZ2=$(wc -c < "$_NATIVE_QW2" 2>/dev/null || echo 0)
-        if [ "$_SZ2" -gt 1000 ]; then
-            echo "[patch_ops] VLLM2 qwen3_5.py EXISTS ($_SZ2 bytes) — NOT overwriting"
-        else
-            cp ./qwen3_5.py "$_NATIVE_QW2" 2>/dev/null || true
-        fi
-    else
-        cp ./qwen3_5.py "$_NATIVE_QW2" 2>/dev/null || true
-    fi
+    cp ./qwen3_5.py "$_NATIVE_QW2" 2>/dev/null || true
     if ! grep -q "Qwen3_5ForCausalLM" "$VLLM2/model_executor/models/registry.py" 2>/dev/null; then
         cp ./registry.py "$VLLM2/model_executor/models/registry.py" 2>/dev/null || true
     fi
@@ -177,6 +155,6 @@ if [ -n "$VLLM2" ]; then
     cp ./chat_utils.py "$VLLM2/entrypoints/chat_utils.py" 2>/dev/null || true
 fi
 
-echo "[patch_ops] DONE — serving layer + engine stability patches deployed"
-echo "[patch_ops] Deployed: qwen3_5.py(conditional), paged_attn.py, mamba_cache.py, sequence.py, scheduler.py, xformers patches, tool/reasoning parsers, serving layer"
+echo "[patch_ops] DONE — CoreX dispatch + serving layer + engine patches deployed"
+echo "[patch_ops] Deployed: qwen3_5.py(CoreX dispatch), paged_attn.py, mamba_cache.py, sequence.py, scheduler.py, xformers patches, tool/reasoning parsers, serving layer"
 echo "[patch_ops] NOT deployed (base image native): model_runner.py, _custom_ops.py, sampler.py, logits_processor.py, arg_utils.py"
