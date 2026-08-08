@@ -118,14 +118,14 @@ class _HardwarePolicy:
         # solve_triangular path: one cuBLAS call per chunk, larger = fewer calls
         # Python loop path: C iterations per chunk, smaller = fewer iterations
         if self.solve_triangular_available:
-            # Like CCCL max_items_per_thread=32 with threads=128 → tile=4096:
-            # larger chunk = amortize kernel launch overhead
+            # cuBLAS trsm: larger chunk = amortize kernel launch overhead
             self.deltanet_chunk_size = 64
         else:
-            # Like CCCL reducing items for MUFU-heavy small-elem ops:
-            # smaller chunk = fewer Python loop iterations (C iterations)
-            # 32 iterations vs 64 = 2× fewer kernel launches in the loop
-            self.deltanet_chunk_size = 32
+            # Python forward substitution fallback: each chunk costs C iterations.
+            # CCCL block_reduce_warp_reductions: when sequential path dominates,
+            # reduce per-unit work (fewer iterations) even at cost of more units
+            # (more chunks). 16 iterations × more chunks beats 32 iterations × fewer.
+            self.deltanet_chunk_size = 16
 
         # Prefill sub-chunk: controls peak memory per DeltaNet forward call.
         # CCCL target = cc_to_min_bytes_in_flight(cc): BI-V100 ≈ lower tier.
@@ -1561,6 +1561,8 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name not in params_dict:
+                    logger.warning("Skipped weight %s (not in params_dict, "
+                                   "shape=%s)", name, loaded_weight.shape)
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
@@ -1706,6 +1708,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 break
             else:
                 if name not in params_dict:
+                    logger.warning("MoE: Skipped weight %s (not in params_dict, "
+                                   "shape=%s)", name, loaded_weight.shape)
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
