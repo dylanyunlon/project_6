@@ -955,14 +955,26 @@ class OpenAIServingChat(OpenAIServing):
             # all output as reasoning with no content.
             content_for_message = output_text
             if not content_for_message and reasoning_text:
-                # For tool-call paths, skip fallback (output must be raw XML)
-                if request.tools and request.tool_choice in ("auto", None):
+                # For tool-call paths with active tool_choice, skip fallback
+                # (output must be raw XML)
+                _is_active_tool_path = (
+                    request.tools
+                    and request.tool_choice in ("auto", "required")
+                    and self.enable_auto_tools and self.tool_parser)
+                if _is_active_tool_path:
                     pass
                 else:
-                    # Use the last paragraph of reasoning as content
-                    lines = [l for l in reasoning_text.strip().split('\n') if l.strip()]
-                    if lines:
-                        content_for_message = lines[-1]
+                    # Use the last non-empty paragraph of reasoning as content.
+                    # Split on double-newline first (paragraphs), fall back to
+                    # lines.  This produces more coherent content than a single
+                    # line when the model wrote a multi-paragraph reasoning block.
+                    paras = [p.strip() for p in reasoning_text.strip().split('\n\n') if p.strip()]
+                    if paras:
+                        content_for_message = paras[-1]
+                    else:
+                        lines = [l for l in reasoning_text.strip().split('\n') if l.strip()]
+                        if lines:
+                            content_for_message = lines[-1]
                     if not content_for_message:
                         content_for_message = reasoning_text[:500]
 
