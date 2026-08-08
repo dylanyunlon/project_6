@@ -66,6 +66,14 @@ else
     echo "[patch_ops] WARNING: transformers/models not found"
 fi
 
+# 1b. CoreX API probe — MUST run BEFORE deploying our qwen3_5.py
+# Discovers corex_gdn.py, corex_moe.py, corex_fa2.py interfaces from base image.
+# Also inspects native qwen3_5.py before we overwrite it.
+# Results go to /workspace/corex_probe_result.json + build log.
+echo "[patch_ops] Running CoreX API probe..."
+python3 ./probe_corex_api.py 2>&1
+echo "[patch_ops] CoreX probe done (see above for results)"
+
 # 2. Model module — qwen3_5.py with CoreX dispatch (CCCL env_dispatch pattern).
 # Our version tries to import corex_gdn/corex_moe from the base image.
 # If they exist → uses fused CUDA kernels (10x faster).
