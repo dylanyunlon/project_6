@@ -18,9 +18,10 @@
 #   - d01: 95.87s, d03_tool_call: FAIL in 49s
 #
 # CONCLUSION: Sub168 succeeds by using BASE IMAGE native model code.
-# Our custom qwen3_5.py/model_runner/etc BREAKS CoreX acceleration.
+# qwen3_5.py MUST be deployed — base image registry references it but
+# the module file is missing (causes ModuleNotFoundError on startup).
 #
-# DO NOT deploy: qwen3_5.py, model_runner.py, _custom_ops.py,
+# DO NOT deploy: model_runner.py, _custom_ops.py,
 #   sampler.py, scheduler.py, sequence.py, xformers.py, paged_attn.py,
 #   prefix_prefill.py, logits_processor.py, mamba_cache.py, arg_utils.py
 # ==========================================================================
@@ -62,7 +63,15 @@ else
     echo "[patch_ops] WARNING: transformers/models not found"
 fi
 
-# 2. Registry — only if base image doesn't already have Qwen3_5
+# 2. Model module — qwen3_5.py MUST exist for registry to import.
+# Base image registry lists Qwen3_5ForCausalLM/Qwen3_5MoeForCausalLM
+# but the actual module file may be missing (causes ModuleNotFoundError
+# on startup: "No module named 'vllm.model_executor.models.qwen3_5'").
+# Deploy our qwen3_5.py so the module can be imported.
+cp ./qwen3_5.py "$VLLM/model_executor/models/qwen3_5.py" 2>/dev/null && \
+    echo "[patch_ops] qwen3_5.py deployed (model module)" || true
+
+# 2b. Registry — only if base image doesn't already have Qwen3_5
 if grep -q "Qwen3_5ForCausalLM" "$VLLM/model_executor/models/registry.py" 2>/dev/null; then
     echo "[patch_ops] registry already has Qwen3_5 — NOT overwriting"
 else
@@ -99,6 +108,7 @@ for P in /usr/local/corex/lib/python3/dist-packages/vllm \
 done
 if [ -n "$VLLM2" ]; then
     echo "[patch_ops] Second vllm at: $VLLM2"
+    cp ./qwen3_5.py "$VLLM2/model_executor/models/qwen3_5.py" 2>/dev/null || true
     if ! grep -q "Qwen3_5ForCausalLM" "$VLLM2/model_executor/models/registry.py" 2>/dev/null; then
         cp ./registry.py "$VLLM2/model_executor/models/registry.py" 2>/dev/null || true
     fi
@@ -113,5 +123,6 @@ if [ -n "$VLLM2" ]; then
     cp ./chat_utils.py "$VLLM2/entrypoints/chat_utils.py" 2>/dev/null || true
 fi
 
-echo "[patch_ops] DONE — serving-only patches, CoreX native model PRESERVED"
-echo "[patch_ops] NOT deployed (base image native): qwen3_5.py, model_runner.py, _custom_ops.py, sampler.py, scheduler.py, sequence.py, xformers.py, paged_attn.py, prefix_prefill.py, logits_processor.py, mamba_cache.py, arg_utils.py"
+echo "[patch_ops] DONE — serving layer + qwen3_5.py model module deployed"
+echo "[patch_ops] Deployed: qwen3_5.py (model module, required for registry import)"
+echo "[patch_ops] NOT deployed (base image native): model_runner.py, _custom_ops.py, sampler.py, scheduler.py, sequence.py, xformers.py, paged_attn.py, prefix_prefill.py, logits_processor.py, mamba_cache.py, arg_utils.py"
