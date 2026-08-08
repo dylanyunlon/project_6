@@ -104,21 +104,33 @@ class Qwen3CoderToolParser(ToolParser):
         return f"call_{uuid.uuid4().hex[:24]}"
 
     def _reset_streaming_state(self) -> None:
+        """CCCL agent_radix_sort_downsweep union TempStorage pattern:
+        Streaming parse state is organized in phases like CUDA shared memory
+        that gets reused across load/rank/scatter phases.  Each tool call
+        transitions through phases: DETECT → HEADER → PARAMS → CLOSE.
+        Reset all phase state at once (like clearing the union on new tile)."""
+        # Phase: DETECT (looking for <tool_call>)
         self.current_tool_index = 0
         self.is_tool_call_started = False
+        self.accumulated_text: str = ""
+        self.streaming_request: Optional[ChatCompletionRequest] = None
+
+        # Phase: HEADER (parsing <function=name>)
         self.header_sent = False
         self.current_tool_id = None
         self.current_function_name: Optional[str] = None
+
+        # Phase: PARAMS (parsing <parameter=key>value</parameter>)
         self.current_param_name: Optional[str] = None
         self.current_param_value: str = ""
         self.param_count = 0
         self.in_param = False
         self.in_function = False
-        self.accumulated_text: str = ""
+        self.accumulated_params: Dict[str, Any] = {}
+
+        # Phase: CLOSE (emitting JSON and transitioning to next tool)
         self.json_started = False
         self.json_closed = False
-        self.accumulated_params: Dict[str, Any] = {}
-        self.streaming_request: Optional[ChatCompletionRequest] = None
 
     def _get_arguments_config(
             self, func_name: str,
