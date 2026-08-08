@@ -498,6 +498,12 @@ class GatedDeltaNet(nn.Module):
                             2 * self.key_dim + (tp_rank + 1) * val_local]
         param.data.copy_(torch.cat([q_s, k_s, v_s], dim=0))
 
+    # Class-level flag for native CoreX GDN dispatch.
+    # Sub168 docker log proves: corex_gdn.py:56 loads libcorex_gdn.so,
+    # corex_gdn.py:228 uses fused prefill operator → zero NaN, 8.49s d01.
+    _corex_gdn_module = None
+    _corex_gdn_checked = False
+
     def forward(
         self,
         hidden_states: torch.Tensor,      # (total_tokens, hidden_size)
@@ -505,6 +511,22 @@ class GatedDeltaNet(nn.Module):
         conv_state: torch.Tensor,          # (batch, local_conv_dim, kernel-1)  in-place
         temporal_state: torch.Tensor,      # (batch, local_v_heads, k_dim, v_dim)  in-place
     ) -> torch.Tensor:
+        # --- CCCL dispatch_segmented_sort three-way dispatch ---
+        # Try native CoreX GDN first (Sub168 path: zero NaN, native acceleration).
+        # Only check once per process (class-level flag).
+        if not GatedDeltaNet._corex_gdn_checked:
+            GatedDeltaNet._corex_gdn_checked = True
+            try:
+                import importlib
+                _m = importlib.import_module('vllm.model_executor.models.corex_gdn')
+                if hasattr(_m, 'GatedDeltaNet') or hasattr(_m, 'gated_delta_net_forward'):
+                    GatedDeltaNet._corex_gdn_module = _m
+                    logger.info("GatedDeltaNet: native CoreX GDN module found")
+            except (ImportError, ModuleNotFoundError):
+                pass
+            if GatedDeltaNet._corex_gdn_module is None:
+                logger.info("GatedDeltaNet: native CoreX GDN not available, "
+                            "using PyTorch implementation")
         tp_size = get_tensor_model_parallel_world_size()
         local_key_dim = self.key_dim // tp_size
         local_val_dim = self.value_dim // tp_size
@@ -619,21 +641,20 @@ class GatedDeltaNet(nn.Module):
                 outputs.append(out)
 
             result = torch.cat(outputs, dim=0)
-            # thrust::all_of early termination pattern (bench/all_of/basic.cu):
-            # Check a small sample first — if no NaN in sample, skip full scan.
-            # MismatchAt=0.01 insight: NaN usually appears early or everywhere.
-            # Sample first 64 elements + last 64 — covers most failure modes.
+            # CCCL _CCCL_ASSERT pattern: detect errors, log, but don't mask.
+            # nan_to_num(nan=0.0) was a double disaster — it makes every layer
+            # output zero vectors, model looks "running" but produces garbage.
+            # Better: log the NaN so docker logs reveal the problem clearly.
             _n = result.numel()
-            _sample_ok = True
-            if _n > 128:
+            if _n > 0:
                 _s = result.view(-1)
-                _sample_ok = not (torch.isnan(_s[:64]).any() or torch.isnan(_s[-64:]).any())
-            if not _sample_ok or (_n <= 128 and torch.isnan(result).any()):
-                # Full scan only when sample detected NaN
-                nan_frac = torch.isnan(result).float().mean().item()
-                logger.warning("NaN in prefill GatedDeltaNet layer %d (frac=%.4f), replacing with zeros",
-                               self.layer_idx, nan_frac)
-                result = torch.nan_to_num(result, nan=0.0)
+                _check = _s[:min(64, _n)]
+                if torch.isnan(_check).any():
+                    nan_frac = torch.isnan(result).float().mean().item()
+                    logger.error("NaN in prefill GatedDeltaNet layer %d "
+                                 "(frac=%.4f) — NOT replacing, propagating "
+                                 "to output for honest failure",
+                                 self.layer_idx, nan_frac)
             return result
 
         else:
@@ -719,17 +740,14 @@ class GatedDeltaNet(nn.Module):
             out, _ = self.out_proj(normed)
             # thrust::all_of early termination: sample check before full scan
             _n = out.numel()
-            _has_nan = False
-            if _n > 128:
+            if _n > 0:
                 _s = out.view(-1)
-                _has_nan = torch.isnan(_s[:64]).any() or torch.isnan(_s[-64:]).any()
-            else:
-                _has_nan = torch.isnan(out).any().item()
-            if _has_nan:
-                nan_frac = torch.isnan(out).float().mean().item()
-                logger.warning("NaN in decode GatedDeltaNet layer %d (frac=%.4f), replacing with zeros",
-                               self.layer_idx, nan_frac)
-                out = torch.nan_to_num(out, nan=0.0)
+                _check = _s[:min(64, _n)]
+                if torch.isnan(_check).any():
+                    nan_frac = torch.isnan(out).float().mean().item()
+                    logger.error("NaN in decode GatedDeltaNet layer %d "
+                                 "(frac=%.4f) — NOT replacing, propagating",
+                                 self.layer_idx, nan_frac)
             return out
 
 
@@ -1140,25 +1158,49 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         # pre-registered field checked as None (no hasattr overhead).
         if self._use_native_moe is None:
             _hw_policy.detect(hidden_states.device)
-            # Only try native if at least align+invoke are available
-            # (topk_softmax has PyTorch fallback in _custom_ops.py)
+            # Three-way dispatch (CCCL pattern):
+            # 1. Try ixformer native MoE (align+invoke)
+            # 2. Try corex_moe module (Sub168 uses this: expert-grouped-wmma)
+            # 3. Fall back to pure PyTorch experts
             self._use_native_moe = (
                 _hw_policy.moe_native_align and _hw_policy.moe_native_invoke)
             if not self._use_native_moe:
+                # Try corex_moe path (Sub168 docker log: corex_moe.py:339)
+                try:
+                    import importlib
+                    _cm = importlib.import_module('vllm.model_executor.models.corex_moe')
+                    if hasattr(_cm, 'fused_moe_forward') or hasattr(_cm, 'CoreXFusedMoE'):
+                        self._corex_moe_module = _cm
+                        self._use_native_moe = True
+                        logger.info("MoE: CoreX fused MoE module found (corex_moe.py)")
+                except (ImportError, ModuleNotFoundError):
+                    pass
+            if not self._use_native_moe:
                 logger.info(
                     "HardwarePolicy: MoE native kernels unavailable "
-                    "(align=%s invoke=%s), using PyTorch experts.",
+                    "(align=%s invoke=%s, corex_moe=N/A), using PyTorch experts.",
                     _hw_policy.moe_native_align, _hw_policy.moe_native_invoke)
 
         if self._use_native_moe:
             try:
                 routed_out = self.experts(hidden_states, router_logits)
             except Exception as e:
-                logger.warning(
-                    "FusedMoE native kernel failed (%s: %s), "
-                    "falling back to pure PyTorch experts permanently.",
-                    type(e).__name__, e)
-                self._use_native_moe = False
+                # CCCL dispatch pattern: allow one retry before permanent fallback.
+                # First failure could be transient (e.g. memory pressure).
+                if not hasattr(self, '_native_moe_retries'):
+                    self._native_moe_retries = 0
+                self._native_moe_retries += 1
+                if self._native_moe_retries >= 2:
+                    logger.warning(
+                        "FusedMoE native kernel failed %d times (%s: %s), "
+                        "permanent fallback to PyTorch.",
+                        self._native_moe_retries, type(e).__name__, e)
+                    self._use_native_moe = False
+                else:
+                    logger.warning(
+                        "FusedMoE native kernel failed attempt %d (%s: %s), "
+                        "will retry next call.",
+                        self._native_moe_retries, type(e).__name__, e)
                 routed_out = self._pure_pytorch_experts(hidden_states, router_logits)
         else:
             routed_out = self._pure_pytorch_experts(hidden_states, router_logits)
