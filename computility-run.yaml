@@ -51,3 +51,7 @@ env:
       value: /tmp/vllm-request-metrics.jsonl
     - name: VLLM_CACHE_BLOCK_SIZE
       value: '16'
+    - name: PYTORCH_CUDA_ALLOC_CONF
+      value: max_split_size_mb:512
+    - name: OMP_NUM_THREADS
+      value: '1'
