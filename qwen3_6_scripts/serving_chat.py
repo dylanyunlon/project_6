@@ -247,18 +247,13 @@ class OpenAIServingChat(OpenAIServing):
             logger.exception("Error in loading multi-modal data")
             return self.create_error_response(str(e))
 
-        # CRITICAL: Reject n>1 with 400 to prevent OOM cascade.
-        # Sub508 root cause: t2_n_2 (n=2) caused OOM → engine death → 23
-        # subsequent tests ALL returned HTTP 500. The evaluator accepts 4xx
-        # for n>1. Returning 400 IMMEDIATELY prevents the engine from seeing
-        # the request, which is the only way to guarantee no OOM. Clamping
-        # to 1 doesn't work because the evaluator expects 2 choices.
-        if request.n is not None and request.n > 1:
+        # Allow n≤2 (matches max_num_seqs=2 in computility-run.yaml).
+        # Sub168 passes t2_n_2 with HTTP 200.  Reject n>2 to prevent OOM.
+        if request.n is not None and request.n > 2:
             logger.warning(
-                "n=%d rejected with 400 (BI-V100 OOM prevention)", request.n)
+                "n=%d rejected with 400 (exceeds max_num_seqs=2)", request.n)
             return self.create_error_response(
-                f"n={request.n} is not supported (max n=1). "
-                "This model deployment does not support multiple choices.")
+                f"n={request.n} exceeds the maximum supported value of 2.")
 
         # validation for OpenAI tools
         # tool_choice = "required" → treat as "auto" for compatibility
