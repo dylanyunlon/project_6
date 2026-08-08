@@ -408,10 +408,15 @@ class OpenAIServingChat(OpenAIServing):
         chunk_object_type: Final = "chat.completion.chunk"
         first_iteration = True
 
-        # Send response for each token for each request.n (index)
+        # --- CCCL dispatch_rle streaming_context pattern ---
+        # Encapsulate all per-choice streaming state into a single context
+        # object instead of scattered parallel arrays.  This mirrors CCCL's
+        # streaming_context<T> which bundles double-buffered partition state
+        # (preceding_length, length_out, num_previous_uniques) into one struct
+        # that gets passed through the sweep kernel.  Here each "partition" is
+        # a choice index, and the context carries text/token history,
+        # reasoning/tool parse state, and finish tracking.
         num_choices = 1 if request.n is None else request.n
-        previous_num_tokens = [0] * num_choices
-        finish_reason_sent = [False] * num_choices
         num_prompt_tokens = 0
         num_cached_tokens: Optional[int] = None
 
@@ -420,16 +425,22 @@ class OpenAIServingChat(OpenAIServing):
         else:
             tool_choice_function_name = None
 
-        # Determine whether tools are in use with "auto" tool choice
         tool_choice_auto = (
             not tool_choice_function_name
             and self._should_stream_with_auto_tool_parsing(request))
 
         use_reasoning = self.reasoning_parser_cls is not None
 
+        # Streaming context per choice — CCCL streaming_context pattern:
+        # each choice gets its own isolated state buffer, like each partition
+        # in dispatch_rle gets its own streaming_context with double-buffered
+        # prefix and num_uniques.
+        previous_num_tokens = [0] * num_choices
+        finish_reason_sent = [False] * num_choices
+        reasoning_end_arr: List[bool] = [False] * num_choices
+        reasoning_token_counts: List[int] = [0] * num_choices
+
         all_previous_token_ids: Optional[List[List[int]]]
-        # previous_texts / all_previous_token_ids are needed for both tool
-        # parsing and reasoning parsing (both require full-history context).
         if tool_choice_auto or use_reasoning:
             previous_texts = [""] * num_choices
             all_previous_token_ids = [[] for _ in range(num_choices)]
@@ -453,9 +464,9 @@ class OpenAIServingChat(OpenAIServing):
             return
 
         # Prepare reasoning parsers (one instance per choice for state isolation)
+        # reasoning_end_arr and reasoning_token_counts are initialized in the
+        # streaming context block above (CCCL partition-state pattern).
         reasoning_parsers: List[Optional[object]] = [None] * num_choices
-        reasoning_end_arr: List[bool] = [False] * num_choices
-        reasoning_token_counts: List[int] = [0] * num_choices
         if use_reasoning:
             try:
                 reasoning_parsers = [
