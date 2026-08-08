@@ -66,13 +66,25 @@ else
     echo "[patch_ops] WARNING: transformers/models not found"
 fi
 
-# 1b. CoreX API probe — MUST run BEFORE deploying our qwen3_5.py
-# Discovers corex_gdn.py, corex_moe.py, corex_fa2.py interfaces from base image.
-# Also inspects native qwen3_5.py before we overwrite it.
-# Results go to /workspace/corex_probe_result.json + build log.
-echo "[patch_ops] Running CoreX API probe..."
-python3 ./probe_corex_api.py 2>&1
-echo "[patch_ops] CoreX probe done (see above for results)"
+# 1b. CoreX probe — direct shell, guaranteed to show in build log
+echo "[probe] === CoreX .so files ==="
+ls -la /usr/local/corex/lib64/libcorex_*.so 2>/dev/null || echo "[probe] NO .so files in /usr/local/corex/lib64/"
+echo "[probe] === CoreX Python wrappers ==="
+ls -la "$VLLM/model_executor/models/corex_"*.py 2>/dev/null || echo "[probe] NO corex_*.py in $VLLM/model_executor/models/"
+echo "[probe] === Native qwen3_5.py ==="
+if [ -f "$VLLM/model_executor/models/qwen3_5.py" ]; then
+    wc -lc "$VLLM/model_executor/models/qwen3_5.py"
+    grep -c "corex_gdn\|corex_moe\|CoreXGDN" "$VLLM/model_executor/models/qwen3_5.py" || echo "[probe] no corex refs"
+else
+    echo "[probe] qwen3_5.py NOT in base image"
+fi
+echo "[probe] === All model files (corex related) ==="
+find "$VLLM" -name "*corex*" -type f 2>/dev/null || echo "[probe] zero corex files anywhere in vllm"
+echo "[probe] === LD_LIBRARY_PATH ==="
+echo "$LD_LIBRARY_PATH"
+echo "[probe] === /usr/local/corex/ tree ==="
+find /usr/local/corex/lib64/ -name "*.so" 2>/dev/null | head -20 || echo "[probe] no .so in corex lib64"
+echo "[probe] ==========================="
 
 # 2. Model module — qwen3_5.py with CoreX dispatch (CCCL env_dispatch pattern).
 # Our version tries to import corex_gdn/corex_moe from the base image.
