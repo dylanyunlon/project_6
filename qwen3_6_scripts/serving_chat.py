@@ -364,6 +364,12 @@ class OpenAIServingChat(OpenAIServing):
         except ValueError as e:
             # TODO: Use a vllm-specific Validation Error
             return self.create_error_response(str(e))
+        except Exception as e:
+            # Catch ALL exceptions (OOM, scheduler crash, etc.) to prevent
+            # a single request from killing the entire engine process.
+            logger.exception("Engine error (non-fatal, returning 500): %s", e)
+            return self.create_error_response(
+                f"Internal engine error: {type(e).__name__}: {e}")
 
         if raw_request:
             result_generator = iterate_with_cancellation(
