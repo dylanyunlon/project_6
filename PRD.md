@@ -121,3 +121,17 @@ multi_worker_policy用于超大segment的协作处理。
 ### 不改sampling params的原因
 t2_temperature系列测试明确验证temperature传递。
 覆盖默认值会导致测试失败。当前策略正确。
+
+## CCCL block_reduce_warp_reductions → DeltaNet chunk_size
+
+### 设计思想
+Sequential path dominance → reduce per-iteration work.
+CCCL: thread count固定时，减少items_per_thread让每个thread做更少work。
+我们: Python loop iterations固定(=chunk_size)，减少chunk_size从32→16。
+
+## CCCL execution/exception.cuh → api_server.py _select_error_policy
+
+### 设计思想  
+Device code: exception_ptr永远false，不假装能恢复，直接fail fast。
+Host code: 用标准exception。
+我们: _select_error_policy按exception类型分发——OOM→503, dead→503, validation→400。
