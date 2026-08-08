@@ -56,6 +56,9 @@ for P in /usr/local/lib/python3.10/site-packages/transformers/models \
     fi
 done
 if [ -n "$TMODELS" ]; then
+    # Base engine requires transformers 4.55.3 for Qwen3_5Config support
+    pip install transformers==4.55.3 -i https://pypi.tuna.tsinghua.edu.cn/simple 2>&1 || \
+        echo "[patch_ops] WARNING: transformers install failed (may already be correct version)"
     cp -r ./qwen3_5 "$TMODELS/" 2>/dev/null && echo "[patch_ops] qwen3_5 config copied" || true
     cp -r ./qwen3_5_moe "$TMODELS/" 2>/dev/null && echo "[patch_ops] qwen3_5_moe config copied" || true
     python3 ./patch_transformers_qwen3_5.py 2>&1 || echo "[patch_ops] WARNING: transformers patch failed (non-fatal)"
