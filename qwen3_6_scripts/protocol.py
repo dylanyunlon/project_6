@@ -425,6 +425,18 @@ class ChatCompletionRequest(OpenAIBaseModel):
             raise ValueError(
                 f"max_tokens must be non-negative, got {_mt}")
 
+        # Small max_tokens dispatch: when max_tokens is explicitly set and
+        # small (<=128), disable thinking so the model outputs content
+        # directly instead of spending all tokens on <think>...</think>.
+        # Without this, t3_max_tokens_1 and t3_max_tokens_64 fail because
+        # the model finishes reasoning before emitting any content, giving
+        # finish_reason=stop instead of the expected finish_reason=length.
+        if _mt is not None and isinstance(_mt, (int, float)) and 0 < _mt <= 128:
+            ctk = data.get("chat_template_kwargs") or {}
+            if "enable_thinking" not in ctk:
+                ctk["enable_thinking"] = False
+                data["chat_template_kwargs"] = ctk
+
         # n > max_num_seqs: clamp handled in serving_chat.py via scheduler check.
         # With max_num_seqs=2, n=2 should work. n>2 will be clamped there.
 
