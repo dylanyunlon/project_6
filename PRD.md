@@ -103,3 +103,21 @@ CCCL三级分发：compute_capability → sm_tuning → benchmark参数
 | previous element | previous_texts[i] |
 | current = prev + delta | current_text = previous_text + delta_text |
 | update prev = current | previous_texts[i] = current_text |
+
+## CCCL tuning_batched_topk.cuh → 采样策略映射
+
+### 设计思想
+6级worker_policy按tile size递减排列。运行时选最小够用的配置。
+multi_worker_policy用于超大segment的协作处理。
+
+### 映射
+| CCCL batched_topk | 我们的对应 |
+|-------------------|-----------|
+| worker_policy.items_per_thread (2-64) | max_tokens cap (2048/8192) |
+| segment size → policy selection | 请求类型 → cap选择 |
+| epilogue_policy (收尾阶段) | finish_reason处理 |
+| multi_worker_policy | n>1多choice并行 |
+
+### 不改sampling params的原因
+t2_temperature系列测试明确验证temperature传递。
+覆盖默认值会导致测试失败。当前策略正确。
