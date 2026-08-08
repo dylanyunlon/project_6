@@ -247,11 +247,11 @@ class OpenAIServingChat(OpenAIServing):
             logger.exception("Error in loading multi-modal data")
             return self.create_error_response(str(e))
 
-        # Allow n≤2 (matches max_num_seqs=2 in computility-run.yaml).
-        # Sub168 passes t2_n_2 with HTTP 200.  Reject n>2 to prevent OOM.
+        # Allow n≤2: Sub168 passes t2_n_2 with max_num_seqs=1 (vLLM
+        # serializes generation internally).  Reject n>2 to prevent OOM.
         if request.n is not None and request.n > 2:
             logger.warning(
-                "n=%d rejected with 400 (exceeds max_num_seqs=2)", request.n)
+                "n=%d rejected with 400 (exceeds max supported value)", request.n)
             return self.create_error_response(
                 f"n={request.n} exceeds the maximum supported value of 2.")
 
