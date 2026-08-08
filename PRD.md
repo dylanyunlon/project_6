@@ -57,3 +57,30 @@ prefix_prefill.py, logits_processor.py, mamba_cache.py, arg_utils.py
 4. ✅ d03 tool_call thinking耗尽 → 自动禁用thinking
 5. ✅ 内存碎片OOM → PYTORCH_CUDA_ALLOC_CONF
 6. ✅ 模型层代码破坏CoreX → patch_ops.sh只部署serving层
+
+## CCCL tuning_select_if.cuh → serving_chat.py 映射
+
+### 设计思想翻译
+CCCL三级分发：compute_capability → sm_tuning → benchmark参数
+我们三级分发：请求类型 → 处理路径 → Sub168实测参数
+
+### 参数对应关系
+| CCCL概念 | 我们的对应 |
+|---------|-----------|
+| compute_capability (SM80/90/100) | 请求类型 (tool_call/reasoning/basic) |
+| input_size (1/2/4/8 bytes) | 请求复杂度 (simple/multimodal/multi-turn) |
+| flagged/unflagged | has_tools/no_tools |
+| keep_rejects/discard | enable_thinking/disable_thinking |
+| threads_per_block | max_tokens cap |
+| items_per_thread | default_max_tokens计算 |
+| delay_constructor | token budget 分配策略 |
+| benchmark注释 (4个加速比) | Sub168日志实测数据 |
+
+### Sub168 benchmark数据（=我们的tuning表）
+| 请求类型 | 时间 | token数 | TPS |
+|---------|------|---------|-----|
+| d01 basic | 8.49s | 139 | 16.4 |
+| d03 tool_call | 2.12s | ~34 | ~16 |
+| d04 reasoning | 17.78s | 1192 | 67 |
+| d07 reasoning+content | 61.11s | 4451 | 72.8 |
+| replay avg | - | - | 11.86 |
