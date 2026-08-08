@@ -199,14 +199,14 @@ def _torch_chunk_gated_delta_rule(
     g = g.cumsum(dim=-1)
     g = g.clamp(-20.0, 20.0)
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
-    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask_upper, 0)
+    attn = -((_ix_matmul(k_beta, key.transpose(-1, -2))) * decay_mask).masked_fill(mask_upper, 0)
     for i in range(1, chunk_size):
         row = attn[..., i, :i].clone()
         sub = attn[..., :i, :i].clone()
         attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
     attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
-    value = attn @ v_beta
-    k_cumdecay = attn @ (k_beta * g.clamp(-20, 20).exp().unsqueeze(-1))
+    value = _ix_matmul(attn, v_beta)
+    k_cumdecay = _ix_matmul(attn, k_beta * g.clamp(-20, 20).exp().unsqueeze(-1))
 
     last_state = (
         torch.zeros(batch, num_heads, k_dim, v_dim, dtype=value.dtype, device=value.device)
@@ -220,15 +220,16 @@ def _torch_chunk_gated_delta_rule(
 
     for i in range(total_len // chunk_size):
         q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
-        attn_i = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask_upper2, 0)
-        v_prime = k_cumdecay[:, :, i] @ last_state
+        attn_i = (_ix_matmul(q_i, k_i.transpose(-1, -2)) * decay_mask[:, :, i]).masked_fill_(mask_upper2, 0)
+        v_prime = _ix_matmul(k_cumdecay[:, :, i], last_state)
         v_new = v_i - v_prime
-        attn_inter = (q_i * g[:, :, i, :, None].clamp(-20, 20).exp()) @ last_state
-        core_out[:, :, i] = attn_inter + attn_i @ v_new
+        attn_inter = _ix_matmul(q_i * g[:, :, i, :, None].clamp(-20, 20).exp(), last_state)
+        core_out[:, :, i] = attn_inter + _ix_matmul(attn_i, v_new)
         last_state = (
             last_state * g[:, :, i, -1, None, None].clamp(-20, 20).exp()
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).clamp(-20, 20).exp()[..., None])
-            .transpose(-1, -2) @ v_new
+            + _ix_matmul(
+                (k_i * (g[:, :, i, -1, None] - g[:, :, i]).clamp(-20, 20).exp()[..., None])
+                .transpose(-1, -2), v_new)
         )
 
     if not output_final_state:
@@ -609,7 +610,7 @@ class GatedDeltaNet(nn.Module):
             BH = ts_flat.shape[0]
 
             # kv_mem = k_t @ temporal_state  shape: (B*H_v, 1, k_dim) @ (B*H_v, k_dim, v_dim)
-            kv_mem = torch.bmm(
+            kv_mem = _ix_bmm(
                 k_t.view(BH, 1, self.head_k_dim), ts_flat
             ).view(num_seqs, local_num_v, self.head_v_dim)  # (B, H_v, v_dim)
 
@@ -622,7 +623,7 @@ class GatedDeltaNet(nn.Module):
             )
 
             # Output: core_out = q_t @ updated temporal_state
-            core_out = torch.bmm(
+            core_out = _ix_bmm(
                 q_t.view(BH, 1, self.head_k_dim), ts_flat
             ).view(num_seqs, local_num_v, self.head_v_dim).to(orig_dtype)
             # core_out: (B, H_v, v_dim) = (num_seqs, local_num_v, head_v_dim) already
@@ -907,7 +908,7 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         with reduce_results=False.
         """
         # Routing: softmax → topk → renormalise
-        routing_weights = torch.softmax(router_logits.float(), dim=-1)
+        routing_weights = _ix_softmax(router_logits.float(), dim=-1)
         topk_weights, topk_ids = torch.topk(
             routing_weights, self.top_k, dim=-1)           # (T, top_k)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
@@ -939,7 +940,7 @@ class Qwen3_5MoeSparseBlock(nn.Module):
             act = F.silu(gate) * up                            # (K, I)
 
             # bmm: (K,H,I) @ (K,I,1) → (K,H,1) → (K,H)
-            expert_out = torch.bmm(w2_sel, act.unsqueeze(-1)).squeeze(-1)  # (K, H)
+            expert_out = _ix_bmm(w2_sel, act.unsqueeze(-1)).squeeze(-1)  # (K, H)
 
             out = (expert_out * ws.unsqueeze(-1)).sum(0, keepdim=True).to(
                 hidden_states.dtype)                           # (1, H)
