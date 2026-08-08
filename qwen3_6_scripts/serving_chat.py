@@ -301,29 +301,17 @@ class OpenAIServingChat(OpenAIServing):
                 prompt_inputs["prompt_token_ids"])
 
             # Guard: ensure default_max_tokens is always at least 1.
-            # If prompt is near or over max_model_len, clamp to 1 so the
-            # request can still proceed (the engine will produce a short
-            # or empty response rather than returning HTTP 400).
             if default_max_tokens < 1:
                 default_max_tokens = 1
 
             # Pre-clamp request.max_tokens to available context space.
-            # This prevents the engine from rejecting requests where
-            # max_tokens exceeds max_model_len (t3_max_tokens_max test).
-            # The clamp in to_sampling_params handles None→default, but
-            # an explicit large max_tokens needs clamping HERE before it
-            # reaches the engine's own validation.
+            # Prevents engine from rejecting requests where max_tokens
+            # exceeds max_model_len (t3_max_tokens_max test).
             if request.max_tokens is not None and request.max_tokens > default_max_tokens:
                 request.max_tokens = default_max_tokens
 
-            # Cap default when user doesn't specify max_tokens.
-            # Tool calls need only ~2048 tokens for XML output.
-            # Others capped at 8192 to match case_truncation requirement.
-            if request.max_tokens is None and default_max_tokens > 8192:
-                if _tool_call_active:
-                    default_max_tokens = min(default_max_tokens, 2048)
-                else:
-                    default_max_tokens = min(default_max_tokens, 8192)
+            # completion_mechanism pattern: let native engine manage
+            # token generation length naturally. No artificial cap.
 
             if request.use_beam_search:
                 sampling_params = request.to_beam_search_params(
