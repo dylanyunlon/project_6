@@ -135,3 +135,26 @@ CCCL: thread count固定时，减少items_per_thread让每个thread做更少work
 Device code: exception_ptr永远false，不假装能恢复，直接fail fast。
 Host code: 用标准exception。
 我们: _select_error_policy按exception类型分发——OOM→503, dead→503, validation→400。
+
+## CCCL segmented_sort.cu → 完整base引擎迁移
+
+### 关键发现
+通过segmented_sort.cu的AST链追溯到base引擎zip包，发现我们缺少10个关键文件。
+
+### base引擎完整部署清单 (patch_ops.sh)
+
+| 文件 | 作用 | 缺失后果 |
+|-----|------|---------|
+| paged_attn.py | 绕过Triton hang | GPU永久挂起 |
+| patch_model_runner.py | 修prefix_cache_hit bug | chunked prefill第2+chunk crash |
+| mamba_cache.py | GatedDeltaNet状态管理 | 状态丢失→输出错误 |
+| sequence.py | 修completion_tokens膨胀 | 10K prompt×3 chunks = 30K虚假token |
+| scheduler.py | prefix cache metrics | 无cache统计 |
+| patch_xformers_sdpa_seq.py | head_dim=256 bypass | attention crash |
+| qwen3_5.py | 模型代码（条件部署） | ModuleNotFoundError |
+| serving层6文件 | API兼容 | 功能测试全失败 |
+| transformers==4.55.3 | Qwen3_5Config支持 | 配置加载失败 |
+
+### qwen3_5.py策略
+base原版1369行 → 无nan_to_num、无clamp、无_hw_policy。
+条件部署：如果Docker镜像已有>1000字节的qwen3_5.py就不覆盖。
