@@ -163,7 +163,31 @@ Sub508 (95.85s for d01):
 4. **fused_add_rms_norm**: residual+norm两步 → 一步fused
 5. **softmax**: MoE路由softmax → ixformer.softmax
 
-### 需要适配 (改数据布局):
-6. **conv2d**: F.conv1d的causal conv → ixformer.conv2d (需要1D→2D reshape)
-7. **gemv**: decode路径的小向量乘 → ixformer.gemv
-8. **sdpa**: chunk内的QK^T+softmax → ixformer.scaled_dot_product_attention
+## 六、功能测试FAIL根因分析（6个非crash FAIL）
+
+```
+FAIL类型A: NaN导致模型输出质量问题 (修NaN后自愈)
+├─ d03_tool_call: tools=0 — 模型不能输出<tool_call> XML
+├─ d07_reasoning_plus_content: content[0] — 模型不输出</think>
+├─ d10_thinking_disable_ctk: 乱码 — 模型logits被NaN扭曲
+├─ t1a_thinking_true: reasoning[0] — output.text为空→parser返回空
+└─ t1c_thinking_default: reasoning[0] — 同上
+
+FAIL类型B: 请求处理层问题
+└─ d05_multimodal: HTTP 400 — 多模态请求验证失败
+
+FAIL类型C: 引擎crash级联 (修max-num-seqs=2后自愈)
+└─ t2_n_2 → t3/t4/t5/t6/t7/t8/t9/t10/t12/t13/t14/t15/t16 全部HTTP 500 (25个)
+
+当前代码状态:
+  NaN修复: ✅ cumsum前clamp[-5,2] + 后clamp[-20,20] + A_log clamp[-8,4]
+  引擎防崩: ✅ max-num-seqs=2 + catch-all Exception
+  ixformer加速: ✅ matmul/bmm/softmax接入12处热路径
+  reasoning parser: ✅ qwen3已注册，部署正确
+  tool parser: ✅ qwen3_coder已注册，adjust_request禁thinking
+  
+预期: NaN修复后模型质量恢复 → 类型A的5个FAIL自愈
+      max-num-seqs=2 → 类型C的25个FAIL自愈
+      剩余: d05_multimodal需要单独debug
+      预估: 45/51 PASS (88%)
+```
