@@ -218,17 +218,34 @@ def _torch_chunk_gated_delta_rule(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
         diagonal=1)
 
-    for i in range(total_len // chunk_size):
-        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
-        attn_i = (_ix_matmul(q_i, k_i.transpose(-1, -2)) * decay_mask[:, :, i]).masked_fill_(mask_upper2, 0)
+    # dispatch_scan.cuh Phase 1: pre-compute ALL chunk-local attention matrices
+    # outside the state loop. attn_i[c] only depends on q, k, decay_mask — NOT state.
+    # This is the CCCL "init kernel" pattern: compute everything possible
+    # before the sequential scan kernel that needs tile_state propagation.
+    num_chunks = total_len // chunk_size
+    attn_i_all = torch.empty(
+        batch, num_heads, num_chunks, chunk_size, chunk_size,
+        dtype=value.dtype, device=value.device)
+    for i in range(num_chunks):
+        attn_i_all[:, :, i] = (
+            _ix_matmul(query[:, :, i], key[:, :, i].transpose(-1, -2))
+            * decay_mask[:, :, i]
+        ).masked_fill_(mask_upper2, 0)
+
+    # dispatch_scan.cuh Phase 2: sequential state propagation (scan kernel).
+    # Only state-dependent ops remain in this loop.
+    g_exp_cache = g.clamp(-20, 20).exp()  # pre-compute once
+    g_clamped = g.clamp(-20, 20)  # keep raw clamped g for difference computation
+    for i in range(num_chunks):
         v_prime = _ix_matmul(k_cumdecay[:, :, i], last_state)
-        v_new = v_i - v_prime
-        attn_inter = _ix_matmul(q_i * g[:, :, i, :, None].clamp(-20, 20).exp(), last_state)
-        core_out[:, :, i] = attn_inter + _ix_matmul(attn_i, v_new)
+        v_new = value[:, :, i] - v_prime
+        attn_inter = _ix_matmul(query[:, :, i] * g_exp_cache[:, :, i, :, None], last_state)
+        core_out[:, :, i] = attn_inter + _ix_matmul(attn_i_all[:, :, i], v_new)
+        # State update uses difference form: exp(g[-1] - g[:]) to avoid division
         last_state = (
-            last_state * g[:, :, i, -1, None, None].clamp(-20, 20).exp()
+            last_state * g_exp_cache[:, :, i, -1, None, None]
             + _ix_matmul(
-                (k_i * (g[:, :, i, -1, None] - g[:, :, i]).clamp(-20, 20).exp()[..., None])
+                (key[:, :, i] * (g_clamped[:, :, i, -1, None] - g_clamped[:, :, i]).exp()[..., None])
                 .transpose(-1, -2), v_new)
         )
 
