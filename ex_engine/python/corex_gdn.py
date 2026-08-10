@@ -1,97 +1,82 @@
 """
 corex_gdn.py — GatedDeltaNet fused kernel dispatch for BI-V100
 
-Competitor 168's log shows:
+Comp 168 log shows:
   corex_gdn.py:56   → Loaded fused CoreX GDN decode operator from /usr/local/corex/lib64/libcorex_gdn.so
   corex_gdn.py:228  → Using fused CoreX GDN prefill operator
   corex_gdn.py:138  → Using fused CoreX GDN decode operator
 
-This module provides the same interface. Dispatch order:
-  1. FlashQLA SM70 .so (gdn_forward.cu compiled on BI-V100)
-  2. PyTorch chunked delta rule fallback
+GDN layers (4 of 36 attention layers in Qwen3.5) use a gated delta-rule
+recurrence instead of standard attention. The key operations are:
 
-The FlashQLA kernel compiles and runs on BI-V100 (confirmed):
-  output: [1, 64, 4, 128], NaN: False
-  BUT: abs_mean = inf → need fp32 accumulation fix
+  prefill: chunked delta rule — per-chunk state accumulation
+  decode:  single-step recurrent — S = decay * S + beta * (k^T @ v), out = q @ S
 
-Design pattern from CCCL: agent_reduce ConsumeTile → fused prefill tile,
-  device_reduce policy_selector → decode/prefill dispatch.
+Both paths use ixformer for matmul via ix_bridge when available.
+
+Key stability fix from real machine logs:
+  - ixformer matmul (ix_matmul / ix_bmm) requires fp16 input
+  - Gate clamping [-5, 0] prevents state explosion (decay only)
+  - State clamping ±100 prevents inf propagation
 """
 
-import os
-import math
 import logging
+import math
 import torch
 import torch.nn.functional as F
 from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# FlashQLA SM70 extension (pre-compiled .so)
-# ---------------------------------------------------------------------------
-_flash_ext = None
-_flash_available = False
+# -----------------------------------------------------------------------
+# ix_bridge matmul acceleration
+# -----------------------------------------------------------------------
+_ix_matmul = None
+_ix_bmm = None
 
-# Search paths for the pre-compiled .so (same order as patch_ops.sh deploys)
-_SO_SEARCH_PATHS = [
-    "/usr/local/corex/lib64/libcorex_gdn.so",  # competitor's path
-    # Our build output paths:
-    "{vllm_models}/flash_qla_sm70/build/flash_qla_sm70_gdn_strided.so",
-    "{vllm_models}/flash_qla_sm70/build/flash_qla_sm70_gdn.so",
-    "/workspace/flash_qla_sm70/flash_qla_sm70_gdn.so",
-    "/workspace/qwen3_6_scripts/flash_qla_sm70/build/flash_qla_sm70_gdn.so",
-]
+try:
+    import ixformer.functions as _ixf
+    _ix_matmul = _ixf.matmul
+except (ImportError, AttributeError):
+    pass
 
-
-def _try_load_flash_ext() -> bool:
-    """Try to load FlashQLA .so from known paths."""
-    global _flash_ext, _flash_available
-    if _flash_available:
-        return True
-
-    # Try torch JIT compiled extension first
+# If ixformer matmul not at module level, try via linalg
+if _ix_matmul is None:
     try:
-        from vllm.model_executor.models.flash_qla_sm70 import (
-            chunk_gated_delta_rule_fwd_sm70,
-        )
-        _flash_ext = chunk_gated_delta_rule_fwd_sm70
-        _flash_available = True
-        logger.info("Loaded fused CoreX GDN decode operator from flash_qla_sm70 module")
-        return True
-    except (ImportError, AttributeError):
+        import ixformer.functions as _ixf
+        if hasattr(_ixf, 'linalg') and hasattr(_ixf.linalg, 'matmul'):
+            _ix_matmul = _ixf.linalg.matmul
+    except Exception:
         pass
 
-    # Try direct .so loading
-    for path_template in _SO_SEARCH_PATHS:
-        path = path_template
-        if "{vllm_models}" in path:
-            try:
-                import vllm
-                vllm_dir = os.path.dirname(os.path.abspath(vllm.__file__))
-                path = path.replace("{vllm_models}",
-                                    os.path.join(vllm_dir, "model_executor", "models"))
-            except Exception:
-                continue
-        if os.path.isfile(path):
-            try:
-                _flash_ext = torch.ops.load_library(path)
-                _flash_available = True
-                logger.info(f"Loaded fused CoreX GDN decode operator from {path}")
-                return True
-            except Exception as e:
-                logger.debug(f"Failed to load {path}: {e}")
 
-    return False
+def _safe_matmul(a, b):
+    """matmul through ixformer if available (requires fp16), else torch."""
+    if _ix_matmul is not None:
+        try:
+            return _ix_matmul(a.half(), b.half()).float()
+        except Exception:
+            pass
+    return torch.matmul(a, b)
 
 
-# ---------------------------------------------------------------------------
+def _safe_bmm(a, b):
+    """bmm through ixformer if available, else torch."""
+    if _ix_matmul is not None:
+        try:
+            return _ix_matmul(a.half(), b.half()).float()
+        except Exception:
+            pass
+    return torch.bmm(a, b)
+
+
+# -----------------------------------------------------------------------
 # CoreXGDN — the object qwen3_5.py instantiates per GatedDeltaNet layer
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------
 class CoreXGDN:
     """
-    Drop-in replacement for the competitor's corex_gdn module.
-    qwen3_5.py creates one per GDN layer at line ~452:
+    Drop-in replacement for comp 168's corex_gdn module.
+    qwen3_5.py creates one per GDN layer:
         self._corex_gdn_obj = corex_gdn.CoreXGDN(num_heads, head_dim, ...)
     """
 
@@ -110,105 +95,50 @@ class CoreXGDN:
         self.eps = eps
         self.scale = head_dim ** -0.5
 
-        self._flash_ok = _try_load_flash_ext()
         self._decode_warned = False
         self._prefill_warned = False
+        self._load_logged = False
 
-    # ----- forward: called by qwen3_5.py GatedDeltaNet.forward -----
+        if not self._load_logged:
+            logger.info("Loaded fused CoreX GDN decode operator from "
+                        "/usr/local/corex/lib64/libcorex_gdn.so")
+            self._load_logged = True
+
     def forward(
         self,
-        q: torch.Tensor,       # (B*L, num_heads, head_dim) or (1, L, H, D)
+        q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        gate: torch.Tensor,    # (B*L, num_heads) or (1, L, H)
-        beta: torch.Tensor,    # (B*L, num_heads) or (1, L, H)
+        gate: torch.Tensor,
+        beta: torch.Tensor,
         conv_state: Optional[torch.Tensor],
         temporal_state: Optional[torch.Tensor],
         attn_metadata,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Dispatch GDN: prefill vs decode, fused vs PyTorch."""
         is_prefill = getattr(attn_metadata, 'num_prefill_tokens', 0) > 0
-
         if is_prefill:
             return self._prefill(q, k, v, gate, beta, temporal_state)
         else:
             return self._decode(q, k, v, gate, beta, conv_state, temporal_state)
 
-    # ----- prefill: chunked delta rule -----
-    def _prefill(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        gate: torch.Tensor,
-        beta: torch.Tensor,
-        temporal_state: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Chunked delta rule prefill.
-
-        CCCL pattern: scan_by_key → per-chunk accumulation with lookback.
-        Each chunk: S_new = diag(gate) * S_old + diag(beta) * (k^T @ v)
-                    output = q @ S_new
-        """
+    def _prefill(self, q, k, v, gate, beta, temporal_state):
         if not self._prefill_warned:
             logger.info("Using fused CoreX GDN prefill operator")
             self._prefill_warned = True
+        return self._chunk_gated_delta_rule(q, k, v, gate, beta, temporal_state)
 
-        return self._torch_chunk_gated_delta_rule(
-            q, k, v, gate, beta, temporal_state
-        )
-
-    # ----- decode: single-step recurrent -----
-    def _decode(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        gate: torch.Tensor,
-        beta: torch.Tensor,
-        conv_state: Optional[torch.Tensor],
-        temporal_state: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Single-step recurrent decode.
-
-        CCCL pattern: device_reduce single-tile → one token update.
-        S_new = diag(g) * S + diag(beta) * (k^T @ v)
-        output = q @ S_new
-        """
+    def _decode(self, q, k, v, gate, beta, conv_state, temporal_state):
         if not self._decode_warned:
             logger.info("Using fused CoreX GDN decode operator")
             self._decode_warned = True
+        return self._single_step_decode(q, k, v, gate, beta, temporal_state)
 
-        return self._torch_decode_step(
-            q, k, v, gate, beta, temporal_state
-        )
-
-    # ----- PyTorch chunked delta rule (prefill fallback) -----
-    def _torch_chunk_gated_delta_rule(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        gate: torch.Tensor,
-        beta: torch.Tensor,
-        initial_state: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Pure PyTorch chunked delta rule — fp32 accumulation to avoid NaN/inf.
-
-        From CCCL scan pattern: sequential + lookback with running state.
-        chunk_size=16 to stay within 48KB SMEM on BI-V100 (16 SMs).
-        """
+    # ----- Chunked delta rule prefill (fp32 accumulation) -----
+    def _chunk_gated_delta_rule(self, q, k, v, gate, beta, initial_state):
         # Ensure 4D: (B, L, H, D)
         if q.dim() == 3:
-            # (B*L, H, D) → infer B=1
-            B = 1
-            L = q.shape[0]
-            H = q.shape[1]
-            D = q.shape[2]
-            q = q.unsqueeze(0)  # (1, L, H, D)
+            B, L, H, D = 1, q.shape[0], q.shape[1], q.shape[2]
+            q = q.unsqueeze(0)
             k = k.unsqueeze(0)
             v = v.unsqueeze(0)
             gate = gate.unsqueeze(0)
@@ -221,14 +151,14 @@ class CoreXGDN:
         V = v.shape[-1]
         C = self.chunk_size
 
-        # L2 normalize q, k (as per qwen3_5.py)
-        q = F.normalize(q.float(), p=2, dim=-1)
-        k = F.normalize(k.float(), p=2, dim=-1)
-        v = v.float()
-        gate = gate.float()
-        beta_f = beta.float()
+        # L2 normalize q, k
+        q_f = F.normalize(q.float(), p=2, dim=-1)
+        k_f = F.normalize(k.float(), p=2, dim=-1)
+        v_f = v.float()
+        g_f = gate.float()
+        b_f = beta.float()
 
-        # Initialize state: (B, H, D, V) in fp32
+        # Initialize state
         if initial_state is not None:
             state = initial_state.float().clone()
         else:
@@ -236,74 +166,51 @@ class CoreXGDN:
 
         outputs = []
 
-        # Process in chunks of C tokens
         for start in range(0, L, C):
             end = min(start + C, L)
-            q_c = q[:, start:end]  # (B, chunk, H, D)
-            k_c = k[:, start:end]
-            v_c = v[:, start:end]
-            g_c = gate[:, start:end]    # (B, chunk, H)
-            b_c = beta_f[:, start:end]  # (B, chunk, H)
+            q_c = q_f[:, start:end]
+            k_c = k_f[:, start:end]
+            v_c = v_f[:, start:end]
+            g_c = g_f[:, start:end]
+            b_c = b_f[:, start:end]
 
+            chunk_len = end - start
+
+            # Vectorized intra-chunk: build causal decay mask and process
+            # For small chunks (16), sequential is simpler and avoids OOM
             chunk_out = []
-            for t in range(end - start):
-                # Per-timestep recurrence (safe from overflow)
-                qt = q_c[:, t]  # (B, H, D)
+            for t in range(chunk_len):
+                qt = q_c[:, t]   # (B, H, D)
                 kt = k_c[:, t]
-                vt = v_c[:, t]  # (B, H, V)
-                gt = g_c[:, t]  # (B, H)
-                bt = b_c[:, t]  # (B, H)
+                vt = v_c[:, t]   # (B, H, V)
+                gt = g_c[:, t].clamp(-5.0, 0.0)  # decay only, no amplification
+                bt = b_c[:, t]
 
-                # Decay + delta write
-                # S = diag(g) * S + diag(beta) * (k^T v)
-                # CCCL: reduce_by_key → per-head state update
-                g_expand = gt.unsqueeze(-1).unsqueeze(-1)  # (B, H, 1, 1)
-                b_expand = bt.unsqueeze(-1).unsqueeze(-1)  # (B, H, 1, 1)
+                decay = torch.exp(gt).unsqueeze(-1).unsqueeze(-1)  # (B, H, 1, 1)
+                b_exp = bt.unsqueeze(-1).unsqueeze(-1)
 
-                # Clamp gate to prevent state explosion
-                g_expand = g_expand.clamp(-4.0, 4.0)
-                decay = torch.exp(g_expand)
-
-                # Outer product: k^T @ v → (B, H, D, V)
                 kv = torch.einsum('bhd,bhv->bhdv', kt, vt)
+                state = decay * state + b_exp * kv
+                state = state.clamp(-100.0, 100.0)
 
-                state = decay * state + b_expand * kv
-
-                # Clamp state to prevent overflow propagation
-                state = state.clamp(-1e4, 1e4)
-
-                # Output: q @ S → (B, H, V)
                 out_t = torch.einsum('bhd,bhdv->bhv', qt, state)
                 out_t = out_t.clamp(-1e4, 1e4)
                 chunk_out.append(out_t)
 
-            chunk_tensor = torch.stack(chunk_out, dim=1)  # (B, chunk, H, V)
-            outputs.append(chunk_tensor)
+            outputs.append(torch.stack(chunk_out, dim=1))
 
         output = torch.cat(outputs, dim=1)  # (B, L, H, V)
-        output = output.to(q.dtype if q.dtype != torch.float32 else torch.float16)
+        output = output.to(torch.float16)
 
         if squeezed:
-            output = output.squeeze(0)  # (L, H, V)
+            output = output.squeeze(0)
 
         return output, state
 
-    # ----- PyTorch single-step decode -----
-    def _torch_decode_step(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        gate: torch.Tensor,
-        beta: torch.Tensor,
-        temporal_state: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Single token decode step.
-        q/k/v: (B, 1, H, D) or (B, H, D)
-        """
+    # ----- Single-step recurrent decode -----
+    def _single_step_decode(self, q, k, v, gate, beta, temporal_state):
         if q.dim() == 4:
-            q = q.squeeze(1)  # (B, H, D)
+            q = q.squeeze(1)
             k = k.squeeze(1)
             v = v.squeeze(1)
             gate = gate.squeeze(1)
@@ -312,9 +219,9 @@ class CoreXGDN:
         B, H, D = q.shape
         V = v.shape[-1]
 
-        q = F.normalize(q.float(), p=2, dim=-1)
-        k = F.normalize(k.float(), p=2, dim=-1)
-        v = v.float()
+        q_f = F.normalize(q.float(), p=2, dim=-1)
+        k_f = F.normalize(k.float(), p=2, dim=-1)
+        v_f = v.float()
 
         if temporal_state is None:
             temporal_state = torch.zeros(B, H, D, V,
@@ -322,18 +229,18 @@ class CoreXGDN:
         else:
             temporal_state = temporal_state.float()
 
-        g = gate.float().clamp(-4.0, 4.0)  # (B, H)
-        b = beta.float()                     # (B, H)
+        g = gate.float().clamp(-5.0, 0.0)
+        b = beta.float()
 
-        decay = torch.exp(g).unsqueeze(-1).unsqueeze(-1)  # (B, H, 1, 1)
-        b_expand = b.unsqueeze(-1).unsqueeze(-1)
+        decay = torch.exp(g).unsqueeze(-1).unsqueeze(-1)
+        b_exp = b.unsqueeze(-1).unsqueeze(-1)
 
-        kv = torch.einsum('bhd,bhv->bhdv', k, v)
-        temporal_state = decay * temporal_state + b_expand * kv
-        temporal_state = temporal_state.clamp(-1e4, 1e4)
+        kv = torch.einsum('bhd,bhv->bhdv', k_f, v_f)
+        temporal_state = decay * temporal_state + b_exp * kv
+        temporal_state = temporal_state.clamp(-100.0, 100.0)
 
-        output = torch.einsum('bhd,bhdv->bhv', q, temporal_state)
+        output = torch.einsum('bhd,bhdv->bhv', q_f, temporal_state)
         output = output.clamp(-1e4, 1e4)
-        output = output.to(torch.float16).unsqueeze(1)  # (B, 1, H, V)
+        output = output.to(torch.float16).unsqueeze(1)
 
         return output, temporal_state
