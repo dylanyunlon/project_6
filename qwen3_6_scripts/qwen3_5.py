@@ -123,15 +123,15 @@ try:
     from vllm.model_executor.models import corex_gdn as _corex_gdn_module
     _corex_gdn_available = True
     logger.info("CoreX GDN module found — fused GDN kernels available")
-except ImportError:
-    pass
+except ImportError as e:
+    logger.warning("corex_gdn import failed: %s", e)
 
 try:
     from vllm.model_executor.models import corex_moe as _corex_moe_module
     _corex_moe_available = True
     logger.info("CoreX MoE module found — fused MoE kernels available")
-except ImportError:
-    pass
+except ImportError as e:
+    logger.warning("corex_moe import failed: %s — MoE uses PyTorch loop (SLOW)", e)
 
 _corex_fa2_available = False
 _corex_fa2_module = None
@@ -139,8 +139,8 @@ try:
     from vllm.model_executor.models import corex_fa2 as _corex_fa2_module
     _corex_fa2_available = True
     logger.info("CoreX FA2 module found — fused attention kernels available")
-except ImportError:
-    pass
+except ImportError as e:
+    logger.warning("corex_fa2 import failed: %s", e)
 
 # EX Engine: fused MoE topk_softmax CUDA kernel (xllm CUB-based)
 _ex_moe_topk_softmax = None
