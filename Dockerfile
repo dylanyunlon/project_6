@@ -7,10 +7,8 @@ COPY ./qwen3_6_scripts /workspace/qwen3_6_scripts
 COPY ./computility-run.yaml /workspace/computility-run.yaml
 COPY ./ex_engine /workspace/ex_engine
 
-# Build + patch in a single RUN layer. Every step tolerates failure.
-RUN set +e && \
-    chmod +x /workspace/ex_engine/build.sh && \
-    bash /workspace/ex_engine/build.sh --corex || echo "[Dockerfile] build.sh non-zero (ok)" && \
-    chmod +x /workspace/qwen3_6_scripts/patch_ops.sh && \
-    bash /workspace/qwen3_6_scripts/patch_ops.sh || echo "[Dockerfile] patch_ops non-zero (ok)" && \
-    echo "[Dockerfile] DONE"
+RUN chmod +x /workspace/ex_engine/build.sh && \
+    bash /workspace/ex_engine/build.sh --corex
+
+RUN chmod +x /workspace/qwen3_6_scripts/patch_ops.sh && \
+    bash /workspace/qwen3_6_scripts/patch_ops.sh
