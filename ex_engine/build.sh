@@ -57,19 +57,32 @@ compile_factor() {
 
     if [[ "$COMPILER" == "corex" ]]; then
         # CoreX/Iluvatar: clang-based CUDA compilation
-        # SM70 = BI-V100 architecture
+        # From real machine GDN compile log (dockerrizhi.txt):
+        #   /usr/local/corex/bin/clang++ ... --cuda-gpu-arch=ivcore10
+        #   --cuda-path=/usr/local/corex -std=c++17
+        #   -D__ILUVATAR__ -D__ILUVATAR_WORKAROUND__
+        local OBJ="${BUILD_DIR}/$(basename ${cu_file} .cu).cuda.o"
         "${COREX_ROOT}/bin/clang++" \
-            -x cuda \
-            --cuda-gpu-arch=sm_70 \
-            -std=c++17 \
+            -D__ILUVATAR__ \
+            -D__ILUVATAR_WORKAROUND__ \
+            -D__ILUVATAR_DIAG__ \
+            -fPIC \
             -O2 \
-            -shared -fPIC \
+            --cuda-gpu-arch=ivcore10 \
+            --cuda-path="${COREX_ROOT}" \
+            -std=c++17 \
             -I"${INCLUDE_DIR}" \
-            -I"${COREX_ROOT}/include" \
+            -isystem "${COREX_ROOT}/include" \
+            -c "${cu_file}" \
+            -o "${OBJ}"
+
+        # Link .o → .so (match real machine: c++ ... -shared -L ... -lcudart)
+        c++ "${OBJ}" -shared \
             -L"${COREX_ROOT}/lib64" \
             -lcudart \
-            -o "${so_path}" \
-            "${cu_file}"
+            -o "${so_path}"
+
+        rm -f "${OBJ}"
     else
         # Standard nvcc
         nvcc \

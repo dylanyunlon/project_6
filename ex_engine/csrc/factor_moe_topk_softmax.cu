@@ -98,27 +98,12 @@ __global__ void moe_topk_softmax_kernel(
     float global_sum = s_sum[0] + s_sum[1];
     float my_prob = my_exp / global_sum;  // softmax output
 
-    // Step 5: Top-K selection via shared memory partial sort
-    // Use shared memory to collect all (prob, id) pairs, then
-    // do a register-based bitonic top-K.
+    // Step 5: Top-K selection via shared memory
+    // 64 elements is tiny — thread-0 serial insertion sort is faster than
+    // launching a parallel radix/bitonic for k=8 from n=64.
     __shared__ float  s_probs[64];
-    __shared__ int    s_ids[64];
     s_probs[tid] = my_prob;
-    s_ids[tid]   = my_id;
     __syncthreads();
-
-    // Thread 0 does a simple insertion sort for top_k=8 from 64 elements
-    // This is faster than full bitonic for k << n.
-    // 64 elements × 8 comparisons = 512 ops (fits in registers)
-    if (tid < top_k) {
-        // Each of the first top_k threads finds one winner
-        // We use a parallel argmax approach: each thread looks for
-        // the (tid+1)-th largest element.
-        // Simple approach: tid=0 finds max, tid=1 finds 2nd max, etc.
-        // Use iterative suppression in shared memory.
-
-        // Actually, simpler: thread 0 does all work (64 experts is tiny)
-    }
 
     if (tid == 0) {
         float* out_w = topk_weights + token_idx * top_k;
@@ -134,12 +119,11 @@ __global__ void moe_topk_softmax_kernel(
             best_id[k] = -1;
         }
 
-        for (int e = 0; e < num_experts; e++) {
+        for (int e = 0; e < num_experts && e < BLOCK_SIZE; e++) {
             float p = s_probs[e];
-            // Insert into sorted top-K
             if (p > best_w[TOP_K - 1]) {
                 best_w[TOP_K - 1] = p;
-                best_id[TOP_K - 1] = e;
+                best_id[TOP_K - 1] = e;  // expert index = thread index
                 // Bubble up
                 #pragma unroll
                 for (int k = TOP_K - 1; k > 0; k--) {

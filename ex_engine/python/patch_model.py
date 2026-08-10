@@ -191,11 +191,7 @@ def _patch_gdn_prefill(engine):
 
 
 # ---------------------------------------------------------------------------
-# Auto-apply on import if build dir exists
+# Call apply_patches() explicitly AFTER vllm model modules are loaded.
+# Integration point: qwen3_5.py calls this at the end of model __init__,
+# or patch_ops.sh adds it to the startup sequence.
 # ---------------------------------------------------------------------------
-_AUTO_BUILD_DIR = os.environ.get("EX_ENGINE_BUILD_DIR", "/workspace/ex_engine/build")
-if os.path.isdir(_AUTO_BUILD_DIR):
-    try:
-        apply_patches(_AUTO_BUILD_DIR)
-    except Exception as e:
-        logger.warning("EX Engine auto-apply failed: %s", e)

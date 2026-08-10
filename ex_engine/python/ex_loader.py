@@ -156,13 +156,27 @@ class EXEngine:
             return False
 
     def load_all(self) -> int:
-        """Load all available factor .so files from build_dir."""
+        """Load all available factor .so files from build_dir or co-located."""
         loaded = 0
+        # Search paths: build_dir first, then directory containing this module
+        search_dirs = [self.build_dir]
+        module_dir = os.path.dirname(os.path.abspath(__file__))
+        if module_dir not in search_dirs:
+            search_dirs.append(module_dir)
+        # Also check parent's build dir
+        parent_build = os.path.join(os.path.dirname(module_dir), "build")
+        if parent_build not in search_dirs:
+            search_dirs.append(parent_build)
+
         for fid in range(EX_FACTOR_COUNT):
-            so_path = os.path.join(self.build_dir, f"ex_factor_{fid}.so")
-            if self.load_factor(fid, so_path):
-                loaded += 1
-        logger.info("EX Engine: loaded %d/%d factors", loaded, EX_FACTOR_COUNT)
+            for d in search_dirs:
+                so_path = os.path.join(d, f"ex_factor_{fid}.so")
+                if os.path.exists(so_path):
+                    if self.load_factor(fid, so_path):
+                        loaded += 1
+                    break
+        logger.info("EX Engine: loaded %d/%d factors from %s", loaded, EX_FACTOR_COUNT,
+                    search_dirs)
         return loaded
 
     def has_factor(self, factor_id: int) -> bool:

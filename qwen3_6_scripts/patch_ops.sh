@@ -178,9 +178,28 @@ if [ -n "$VLLM2" ]; then
     cp ./chat_utils.py "$VLLM2/entrypoints/chat_utils.py" 2>/dev/null || true
 fi
 
-echo "[patch_ops] DONE — SM70 GDN kernel + serving layer + engine patches deployed"
-echo "[patch_ops] Deployed: qwen3_5.py, flash_qla_sm70 (SM70 GDN CUDA kernel), paged_attn.py, mamba_cache.py, sequence.py, scheduler.py, xformers patches, serving layer"
-echo "[patch_ops] SM70 GDN kernel: JIT compiles on first forward pass (~2min), then cached"
+# Deploy EX Engine Python module into vllm importable path
+EX_ENGINE_SRC="/workspace/ex_engine"
+if [ -d "$EX_ENGINE_SRC/python" ] && [ -d "$EX_ENGINE_SRC/build" ]; then
+    EX_DST="$VLLM/model_executor/models/ex_engine"
+    mkdir -p "$EX_DST"
+    cp "$EX_ENGINE_SRC/python/"*.py "$EX_DST/" 2>/dev/null || true
+    # Copy built .so files
+    cp "$EX_ENGINE_SRC/build/"*.so "$EX_DST/" 2>/dev/null || true
+    echo "[patch_ops] EX Engine deployed: $(ls $EX_DST/*.so 2>/dev/null | wc -l) factors"
+    if [ -n "$VLLM2" ]; then
+        EX_DST2="$VLLM2/model_executor/models/ex_engine"
+        mkdir -p "$EX_DST2"
+        cp "$EX_ENGINE_SRC/python/"*.py "$EX_DST2/" 2>/dev/null || true
+        cp "$EX_ENGINE_SRC/build/"*.so "$EX_DST2/" 2>/dev/null || true
+    fi
+else
+    echo "[patch_ops] WARNING: EX Engine not built — MoE will use slow PyTorch fallback"
+fi
+
+echo "[patch_ops] DONE — EX Engine + SM70 GDN kernel + serving layer deployed"
+echo "[patch_ops] Deployed: qwen3_5.py, flash_qla_sm70, ex_engine factors, paged_attn.py, mamba_cache.py, sequence.py, scheduler.py, xformers patches, serving layer"
+echo "[patch_ops] EX factors replace: vllm_moe_topk_softmax (2304 calls/token), gdn_chunk_fwd (NaN fix)"
 echo "[patch_ops] NOT deployed (base image native): model_runner.py, _custom_ops.py, sampler.py, logits_processor.py, arg_utils.py"
 
 # Deploy flash_qla SM70 GDN kernel (from 1Cat-vLLM, MIT license)
