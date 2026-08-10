@@ -71,8 +71,25 @@ except ImportError:
 
 # corex_gdn/corex_moe: these are custom modules that teams package into their
 # Docker image. If present, they provide fused GDN/MoE kernels.
-_corex_gdn_module = None
-_corex_moe_module = None
+# ix_bridge: C++ bridge to ixformer::infer::topk_softmax (bypasses missing Python binding)
+_ix_bridge_module = None
+_ix_bridge_available = False
+try:
+    from ex_engine.python.ix_bridge import topk_softmax as _ix_topk_softmax
+    _ix_bridge_available = True
+    logger.info("ix_bridge: ixformer C++ topk_softmax available")
+except ImportError:
+    try:
+        # Try deployed path inside vllm models dir
+        import importlib, sys
+        _ex_dir = os.path.join(os.path.dirname(__file__), "ex_engine")
+        if os.path.isdir(_ex_dir) and _ex_dir not in sys.path:
+            sys.path.insert(0, os.path.dirname(_ex_dir))
+        from ex_engine.python.ix_bridge import topk_softmax as _ix_topk_softmax
+        _ix_bridge_available = True
+        logger.info("ix_bridge: ixformer C++ topk_softmax available (deployed path)")
+    except ImportError:
+        logger.info("ix_bridge: not available, MoE uses PyTorch topk")
 _corex_gdn_available = False
 _corex_moe_available = False
 
@@ -469,17 +486,13 @@ class GatedDeltaNet(nn.Module):
                         "CoreX GDN forward failed (%s), falling back", e)
                 self._use_corex_gdn = False  # permanent fallback
 
-        # FlashQLA SM70 dispatch: fused CUDA kernel for prefill
-        # Decode stays PyTorch (SM70 decode kernel needs different state layout)
-        if _flash_qla_available and attn_metadata.num_prefill_tokens > 0:
-            try:
-                return self._flash_qla_prefill(
-                    hidden_states, attn_metadata, conv_state, temporal_state)
-            except Exception as e:
-                if self.layer_idx == 0:
-                    logger.warning(
-                        "FlashQLA SM70 prefill failed (%s), falling back to PyTorch", e)
-                # Don't disable permanently — may work for different shapes
+        # flash_qla SM70 DISABLED: produces inf on BI-V100 (abs mean=inf from real test)
+        # xllm uses equivalent PyTorch chunked path (qwen3_gated_delta_net_base.cpp)
+        # which works correctly in fp32. Keeping PyTorch path only.
+        #
+        # if _flash_qla_available and attn_metadata.num_prefill_tokens > 0:
+        #     try:
+        #         return self._flash_qla_prefill(...)
 
         return self._pytorch_forward(
             hidden_states, attn_metadata, conv_state, temporal_state)
@@ -1048,12 +1061,18 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         Output is partial (pre-all-reduce), same contract as FusedMoE
         with reduce_results=False.
         """
-        # Routing: softmax → topk → renormalise
-        routing_weights = _ix_softmax(router_logits.float(), dim=-1)
-        topk_weights, topk_ids = torch.topk(
-            routing_weights, self.top_k, dim=-1)           # (T, top_k)
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        topk_weights = topk_weights.to(hidden_states.dtype)
+        # Routing: fused topk+softmax via ixformer C++ bridge (if available)
+        # Falls back to PyTorch softmax → topk → renormalize
+        if _ix_bridge_available:
+            topk_weights, topk_ids = _ix_topk_softmax(
+                router_logits, self.top_k, renormalize=True)
+            topk_weights = topk_weights.to(hidden_states.dtype)
+        else:
+            routing_weights = _ix_softmax(router_logits.float(), dim=-1)
+            topk_weights, topk_ids = torch.topk(
+                routing_weights, self.top_k, dim=-1)           # (T, top_k)
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+            topk_weights = topk_weights.to(hidden_states.dtype)
 
         w13 = self.experts.w13_weight  # (E, 2*I, H)
         w2  = self.experts.w2_weight   # (E, H, I)

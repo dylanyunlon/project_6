@@ -178,23 +178,33 @@ if [ -n "$VLLM2" ]; then
     cp ./chat_utils.py "$VLLM2/entrypoints/chat_utils.py" 2>/dev/null || true
 fi
 
-# Deploy EX Engine Python module into vllm importable path
+# Deploy EX Engine Python module + C++ bridge into vllm importable path
 EX_ENGINE_SRC="/workspace/ex_engine"
-if [ -d "$EX_ENGINE_SRC/python" ] && [ -d "$EX_ENGINE_SRC/build" ]; then
+if [ -d "$EX_ENGINE_SRC/python" ]; then
+    # Deploy into vllm's model dir so qwen3_5.py can import it
     EX_DST="$VLLM/model_executor/models/ex_engine"
-    mkdir -p "$EX_DST"
-    cp "$EX_ENGINE_SRC/python/"*.py "$EX_DST/" 2>/dev/null || true
-    # Copy built .so files
-    cp "$EX_ENGINE_SRC/build/"*.so "$EX_DST/" 2>/dev/null || true
-    echo "[patch_ops] EX Engine deployed: $(ls $EX_DST/*.so 2>/dev/null | wc -l) factors"
+    mkdir -p "$EX_DST/python"
+    mkdir -p "$EX_DST/csrc"
+    cp "$EX_ENGINE_SRC/python/"*.py "$EX_DST/python/" 2>/dev/null || true
+    # ix_moe_bridge.cpp needs to be next to the python module for JIT compile
+    cp "$EX_ENGINE_SRC/csrc/ix_moe_bridge.cpp" "$EX_DST/csrc/" 2>/dev/null || true
+    cp "$EX_ENGINE_SRC/csrc/ix_moe_bridge.cpp" "$EX_DST/python/" 2>/dev/null || true
+    # Also make ex_engine importable from Python path
+    touch "$EX_DST/__init__.py"
+    touch "$EX_DST/python/__init__.py"
+    # Copy built .so files if they exist
+    if [ -d "$EX_ENGINE_SRC/build" ]; then
+        cp "$EX_ENGINE_SRC/build/"*.so "$EX_DST/" 2>/dev/null || true
+    fi
+    echo "[patch_ops] EX Engine deployed to $EX_DST"
+    ls -la "$EX_DST/csrc/" 2>/dev/null || true
     if [ -n "$VLLM2" ]; then
         EX_DST2="$VLLM2/model_executor/models/ex_engine"
-        mkdir -p "$EX_DST2"
-        cp "$EX_ENGINE_SRC/python/"*.py "$EX_DST2/" 2>/dev/null || true
-        cp "$EX_ENGINE_SRC/build/"*.so "$EX_DST2/" 2>/dev/null || true
+        mkdir -p "$EX_DST2/python" "$EX_DST2/csrc"
+        cp -r "$EX_DST/"* "$EX_DST2/" 2>/dev/null || true
     fi
 else
-    echo "[patch_ops] WARNING: EX Engine not built — MoE will use slow PyTorch fallback"
+    echo "[patch_ops] WARNING: EX Engine not found — MoE uses slow PyTorch fallback"
 fi
 
 echo "[patch_ops] DONE — EX Engine + SM70 GDN kernel + serving layer deployed"
