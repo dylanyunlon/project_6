@@ -828,30 +828,47 @@ def invoke_fused_moe_kernel(
 
 
 # ---------- topk_softmax: CUDA kernel → PyTorch fallback ----------
-# Our moe_topk_softmax_v3.cu is a fused warp-shuffle CUDA kernel
-# specialized for 64 experts. It's precompiled during Docker build.
-# If loading fails (no GPU at build time), falls back to PyTorch.
+# moe_topk_softmax_v3.cu: fused warp-shuffle kernel, 64 experts, zero SMEM.
+# Precompiled during Docker build → .so cached by torch.
+# If not found, JIT from .cu source. PyTorch last resort.
 _moe_topk_ext = None
 _moe_topk_init_done = False
 
 def _init_moe_topk():
     global _moe_topk_ext, _moe_topk_init_done
     _moe_topk_init_done = True
-    # Try loading precompiled .so first
+    # 1. Try import precompiled module (torch cache from Docker build)
     try:
         import moe_topk_softmax_v3 as ext
         _moe_topk_ext = ext
-        logger.info("topk_softmax: loaded CUDA kernel (moe_topk_softmax_v3)")
+        logger.info("topk_softmax: loaded precompiled CUDA kernel")
         return
     except ImportError:
         pass
-    # Try JIT compile from source
-    import os, glob
+    # 2. Try loading from known .so paths
+    import glob
+    so_patterns = [
+        "/workspace/ex_engine/build/moe_topk_softmax_v3*.so",
+        "/root/.cache/torch_extensions/*/moe_topk_softmax_v3/*.so",
+        "/tmp/torch_extensions/*/moe_topk_softmax_v3/*.so",
+    ]
+    for pattern in so_patterns:
+        for so_path in glob.glob(pattern):
+            try:
+                torch.ops.load_library(so_path)
+                # After load_library, the pybind module should be importable
+                import moe_topk_softmax_v3 as ext
+                _moe_topk_ext = ext
+                logger.info("topk_softmax: loaded CUDA kernel from %s", so_path)
+                return
+            except Exception:
+                pass
+    # 3. JIT compile from .cu source
+    import os
     search_paths = [
         "/workspace/ex_engine/csrc/moe_topk_softmax_v3.cu",
-        os.path.join(os.path.dirname(__file__), "moe_topk_softmax_v3.cu"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "moe_topk_softmax_v3.cu"),
     ]
-    # Also search vllm model dir where patch_ops.sh copies it
     for base in ["/usr/local/corex/lib/python3/dist-packages/vllm/model_executor/models",
                  "/usr/local/corex/lib64/python3/dist-packages/vllm/model_executor/models"]:
         search_paths.append(os.path.join(base, "moe_topk_softmax_v3.cu"))
@@ -869,8 +886,9 @@ def _init_moe_topk():
                 logger.info("topk_softmax: JIT compiled CUDA kernel from %s", cu_path)
                 return
             except Exception as e:
-                logger.warning("topk_softmax: JIT compile failed (%s), trying next", e)
-    logger.info("topk_softmax: no CUDA kernel available, using PyTorch fallback")
+                logger.warning("topk_softmax: JIT compile failed (%s)", e)
+                break  # Don't retry same source with different paths
+    logger.warning("topk_softmax: CUDA kernel unavailable — PyTorch fallback (SLOW)")
 
 
 def topk_softmax(topk_weights: torch.Tensor, topk_ids: torch.Tensor,

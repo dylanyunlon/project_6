@@ -267,7 +267,10 @@ if [ -f "$MOE_TOPK_CU" ]; then
     echo "[patch_ops] Precompiling moe_topk_softmax_v3.cu ..."
     python3 /workspace/ex_engine/precompile_moe_topk.py 2>&1 || \
         echo "[patch_ops] WARNING: MoE topk precompile failed — will JIT at runtime"
-    # Also deploy .cu source to vllm for JIT fallback
+    # Find and report the compiled .so location
+    echo "[patch_ops] Searching for compiled .so ..."
+    find /root/.cache/torch_extensions /tmp/torch_extensions -name "*.so" -path "*moe_topk*" 2>/dev/null | head -3
+    # Also deploy .cu source to vllm dir for runtime JIT fallback
     cp "$MOE_TOPK_CU" "$VLLM/model_executor/models/" 2>/dev/null || true
     if [ -n "$VLLM2" ]; then
         cp "$MOE_TOPK_CU" "$VLLM2/model_executor/models/" 2>/dev/null || true
