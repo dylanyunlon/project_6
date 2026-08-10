@@ -90,22 +90,14 @@ find /usr/local/corex/lib64/ -name "*.so" 2>/dev/null | head -20 || echo "[probe
 echo "[probe] ==========================="
 
 # 2. Model module — qwen3_5.py
-# PRD: "条件部署：如果Docker镜像已有>1000字节的qwen3_5.py就不覆盖"
-# Sub168 proof: base image native qwen3_5.py with CoreX dispatch = ZERO NaN, 
-# 16.4 TPS. Our custom one = 99.98% NaN, ERROR spam. DO NOT OVERWRITE.
+# Base image qwen3_5.py (81706 bytes) has NaN in GDN:
+#   CoreXGDN.__init__() got unexpected keyword argument 'num_v_heads'
+#   → all GDN layers fallback to base's PyTorch GDN → NaN frac=0.5000
+# Our version fixes the GDN math (xllm-aligned cumsum + difference form).
+# ALWAYS deploy ours.
 _NATIVE_QW="$VLLM/model_executor/models/qwen3_5.py"
-if [ -f "$_NATIVE_QW" ]; then
-    _NATIVE_SIZE=$(stat -c%s "$_NATIVE_QW" 2>/dev/null || echo 0)
-    if [ "$_NATIVE_SIZE" -gt 1000 ]; then
-        echo "[patch_ops] KEEP base image qwen3_5.py ($_NATIVE_SIZE bytes) — proven by Sub168"
-    else
-        cp ./qwen3_5.py "$_NATIVE_QW" 2>/dev/null && \
-            echo "[patch_ops] qwen3_5.py deployed (base was stub: $_NATIVE_SIZE bytes)" || true
-    fi
-else
-    cp ./qwen3_5.py "$_NATIVE_QW" 2>/dev/null && \
-        echo "[patch_ops] qwen3_5.py deployed (base had no qwen3_5.py)" || true
-fi
+cp ./qwen3_5.py "$_NATIVE_QW" && \
+    echo "[patch_ops] qwen3_5.py deployed (replaces base — fixes GDN NaN)"
 
 # 2b. Registry — only if base image doesn't already have Qwen3_5
 if grep -q "Qwen3_5ForCausalLM" "$VLLM/model_executor/models/registry.py" 2>/dev/null; then
@@ -172,17 +164,8 @@ done
 if [ -n "$VLLM2" ]; then
     echo "[patch_ops] Second vllm at: $VLLM2"
     _NATIVE_QW2="$VLLM2/model_executor/models/qwen3_5.py"
-    # Same conditional logic as primary vllm
-    if [ -f "$_NATIVE_QW2" ]; then
-        _SIZE2=$(stat -c%s "$_NATIVE_QW2" 2>/dev/null || echo 0)
-        if [ "$_SIZE2" -gt 1000 ]; then
-            echo "[patch_ops] KEEP VLLM2 qwen3_5.py ($_SIZE2 bytes)"
-        else
-            cp ./qwen3_5.py "$_NATIVE_QW2" 2>/dev/null || true
-        fi
-    else
-        cp ./qwen3_5.py "$_NATIVE_QW2" 2>/dev/null || true
-    fi
+    cp ./qwen3_5.py "$_NATIVE_QW2" 2>/dev/null && \
+        echo "[patch_ops] VLLM2 qwen3_5.py deployed" || true
     if ! grep -q "Qwen3_5ForCausalLM" "$VLLM2/model_executor/models/registry.py" 2>/dev/null; then
         cp ./registry.py "$VLLM2/model_executor/models/registry.py" 2>/dev/null || true
     fi
