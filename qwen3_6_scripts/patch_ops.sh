@@ -185,9 +185,11 @@ if [ -d "$EX_ENGINE_SRC/python" ]; then
     EX_DST="$VLLM/model_executor/models/ex_engine"
     mkdir -p "$EX_DST/python" "$EX_DST/csrc"
     cp "$EX_ENGINE_SRC/python/"*.py "$EX_DST/python/" 2>/dev/null || true
-    # ix_moe_bridge.cpp for JIT compile
+    # ix_moe_bridge.cpp for JIT compile — deploy to ALL search paths
     cp "$EX_ENGINE_SRC/csrc/ix_moe_bridge.cpp" "$EX_DST/csrc/" 2>/dev/null || true
     cp "$EX_ENGINE_SRC/csrc/ix_moe_bridge.cpp" "$EX_DST/python/" 2>/dev/null || true
+    cp "$EX_ENGINE_SRC/csrc/ix_moe_bridge.cpp" "/workspace/ex_engine/csrc/" 2>/dev/null || true
+    cp "$EX_ENGINE_SRC/csrc/ix_moe_bridge.cpp" "/workspace/qwen3_6_scripts/" 2>/dev/null || true
     touch "$EX_DST/__init__.py"
     touch "$EX_DST/python/__init__.py"
     # Copy built .so files

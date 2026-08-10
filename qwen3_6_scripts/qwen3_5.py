@@ -71,29 +71,35 @@ except ImportError:
 
 # corex_gdn/corex_moe: these are custom modules that teams package into their
 # Docker image. If present, they provide fused GDN/MoE kernels.
-# ix_bridge: C++ bridge to ixformer::infer::topk_softmax (bypasses missing Python binding)
-_ix_bridge_module = None
+# ix_bridge: C++ bridge to ixformer::infer (full MoE pipeline)
 _ix_bridge_available = False
 _ix_topk_softmax = None
+_ix_fused_moe_forward = None
 try:
-    from ex_engine.python.ix_bridge import topk_softmax as _ix_topk_softmax
+    from ex_engine.python.ix_bridge import (
+        topk_softmax as _ix_topk_softmax,
+        fused_moe_forward as _ix_fused_moe_forward,
+        is_available as _ix_bridge_check,
+    )
     _ix_bridge_available = True
-    logger.info("ix_bridge: ixformer C++ topk_softmax available")
+    logger.info("ix_bridge: full ixformer MoE pipeline available (topk + fused_moe)")
 except ImportError:
     try:
-        # Try deployed path inside vllm models dir
-        import importlib, sys
+        import sys
         _ex_dir = os.path.join(os.path.dirname(__file__), "ex_engine")
         if os.path.isdir(_ex_dir) and _ex_dir not in sys.path:
             sys.path.insert(0, os.path.dirname(_ex_dir))
-        from ex_engine.python.ix_bridge import topk_softmax as _ix_topk_softmax
+        from ex_engine.python.ix_bridge import (
+            topk_softmax as _ix_topk_softmax,
+            fused_moe_forward as _ix_fused_moe_forward,
+            is_available as _ix_bridge_check,
+        )
         _ix_bridge_available = True
-        logger.info("ix_bridge: ixformer C++ topk_softmax available (deployed path)")
+        logger.info("ix_bridge: full ixformer MoE pipeline available (deployed path)")
     except ImportError as e:
-        # NOT silent: log the exact error so we can diagnose from docker logs
         logger.warning(
-            "ix_bridge: IMPORT FAILED (%s). MoE will use PyTorch topk. "
-            "This is 3x slower. Run probe_ixformer_symbols.py to diagnose.", e)
+            "ix_bridge: IMPORT FAILED (%s). MoE will use PyTorch fallback. "
+            "This is 3-10x slower.", e)
 _corex_gdn_available = False
 _corex_moe_available = False
 
@@ -1073,13 +1079,36 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
-        """Pure-PyTorch MoE (ixformer has no MoE kernels on BI-V100).
+        """MoE expert computation with tiered dispatch.
+
+        Dispatch order:
+          Tier 0: ix_fused_moe_forward — full C++ pipeline (7 kernel launches)
+          Tier 1: EX Engine CUB topk kernel + PyTorch GEMM
+          Tier 2: ix_bridge topk_softmax + PyTorch GEMM
+          Tier 3: Pure PyTorch (torch.softmax + torch.topk + for-loop)
 
         w13_weight: (num_experts, 2*inter_per_partition, hidden)  [TP-sharded]
         w2_weight:  (num_experts, hidden,  inter_per_partition)   [TP-sharded]
-        Output is partial (pre-all-reduce), same contract as FusedMoE
-        with reduce_results=False.
+        Output is partial (pre-all-reduce), same contract as FusedMoE.
         """
+        w13 = self.experts.w13_weight  # (E, 2*I, H)
+        w2  = self.experts.w2_weight   # (E, H, I)
+
+        # Tier 0: Full fused MoE pipeline via ixformer C++
+        # 7 kernel launches vs 3*E in Python loop
+        if _ix_fused_moe_forward is not None and _ix_bridge_available:
+            try:
+                return _ix_fused_moe_forward(
+                    hidden_states, router_logits,
+                    w13, w2,
+                    self.top_k, self.num_experts,
+                    renormalize=True,
+                )
+            except Exception as e:
+                if not getattr(self, '_ix_fused_warned', False):
+                    logger.warning("ix_fused_moe_forward failed (%s), falling back to tiered dispatch", e)
+                    self._ix_fused_warned = True
+
         # Routing: fused topk+softmax dispatch chain
         # Tier 1: EX Engine CUB kernel → Tier 2: ix_bridge → Tier 3: PyTorch
         if _ex_moe_topk_available:
@@ -1104,9 +1133,6 @@ class Qwen3_5MoeSparseBlock(nn.Module):
                 routing_weights, self.top_k, dim=-1)           # (T, top_k)
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
             topk_weights = topk_weights.to(hidden_states.dtype)
-
-        w13 = self.experts.w13_weight  # (E, 2*I, H)
-        w2  = self.experts.w2_weight   # (E, H, I)
 
         T = hidden_states.shape[0]
         if T == 1:
