@@ -1,13 +1,8 @@
 // ix_moe_bridge.cpp — Full MoE pipeline bridge to ixformer C++ API
-static const std::optional<torch::Tensor> kNoneTensor = {};
 //
-static const std::optional<torch::Tensor> kNoneTensor = {};
 // Exposes ALL 6 MoE functions from ixformer::infer (ixformer.h):
-static const std::optional<torch::Tensor> kNoneTensor = {};
 //   1. topk_softmax          — fused routing
-static const std::optional<torch::Tensor> kNoneTensor = {};
 //   2. moe_compute_token_index_api — permutation maps (src_dst, dst_src)
-static const std::optional<torch::Tensor> kNoneTensor = {};
 //   3. moe_expand_input      — gather tokens by expert
 //   4. moe_w16a16_group_gemm — batched expert GEMM
 //   5. silu_and_mul           — fused activation
@@ -20,6 +15,9 @@ static const std::optional<torch::Tensor> kNoneTensor = {};
 #include <torch/extension.h>
 #include <tuple>
 #include <vector>
+#include <optional>
+
+static const std::optional<torch::Tensor> kNoneTensor = {};
 
 // Forward-declare ixformer C++ API (from base image SDK)
 namespace ixformer {

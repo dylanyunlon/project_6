@@ -52,12 +52,42 @@ def step0_compile_bridge():
     print(f"  Source: {cpp_path}")
 
     from torch.utils.cpp_extension import load
+    import glob
+
+    # Find ixformer .so to link against
+    extra_ldflags = []
+    try:
+        import ixformer
+        ixf_dir = os.path.dirname(ixformer.__file__)
+        for so in glob.glob(os.path.join(ixf_dir, "*.so")):
+            if "cpython" not in so:
+                extra_ldflags.append(so)
+        for so in glob.glob(os.path.join(ixf_dir, "_ixformer_torch*.so")):
+            extra_ldflags.append(so)
+    except ImportError:
+        pass
+    corex_lib = "/usr/local/corex/lib64"
+    if os.path.isdir(corex_lib):
+        for lib in ["libixattn.so", "libixformer.so"]:
+            p = os.path.join(corex_lib, lib)
+            if os.path.exists(p) and p not in extra_ldflags:
+                extra_ldflags.append(p)
+        extra_ldflags.append(f"-Wl,-rpath,{corex_lib}")
+    try:
+        import ixformer
+        extra_ldflags.append(f"-Wl,-rpath,{os.path.dirname(ixformer.__file__)}")
+    except ImportError:
+        pass
+
+    print(f"  Link libs: {[os.path.basename(x) for x in extra_ldflags if not x.startswith('-')]}")
+
     t0 = time.time()
     try:
         bridge = load(
             name="ix_full_bridge",
             sources=[cpp_path],
             extra_cflags=["-O2", "-std=c++17"],
+            extra_ldflags=extra_ldflags,
             verbose=True,
         )
         dt = time.time() - t0

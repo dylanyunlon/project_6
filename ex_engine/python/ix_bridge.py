@@ -51,6 +51,39 @@ def _load_bridge():
     _loaded = True
 
     from torch.utils.cpp_extension import load
+    import glob
+
+    # Find ixformer .so libraries to link against
+    extra_ldflags = []
+    ixf_lib_dirs = set()
+    try:
+        import ixformer
+        ixf_dir = os.path.dirname(ixformer.__file__)
+        # Link against all .so in the ixformer package
+        for so in glob.glob(os.path.join(ixf_dir, "*.so")):
+            if "cpython" not in so:  # skip the Python extension .so
+                extra_ldflags.append(so)
+                ixf_lib_dirs.add(os.path.dirname(so))
+        # Also try the _C and _ixformer_torch extensions
+        for so in glob.glob(os.path.join(ixf_dir, "_ixformer_torch*.so")):
+            extra_ldflags.append(so)
+    except ImportError:
+        pass
+
+    # Also check /usr/local/corex/lib64 for libixattn etc
+    corex_lib = "/usr/local/corex/lib64"
+    if os.path.isdir(corex_lib):
+        for lib in ["libixattn.so", "libixformer.so", "libcublas.so"]:
+            p = os.path.join(corex_lib, lib)
+            if os.path.exists(p) and p not in extra_ldflags:
+                extra_ldflags.append(p)
+                ixf_lib_dirs.add(corex_lib)
+
+    # Add rpath so the .so can find its dependencies at runtime
+    for d in ixf_lib_dirs:
+        extra_ldflags.append(f"-Wl,-rpath,{d}")
+
+    logger.info("ix_bridge extra_ldflags: %s", extra_ldflags)
 
     for cpp_name in _CPP_NAMES:
         cpp_path = _find_cpp(cpp_name)
@@ -63,6 +96,7 @@ def _load_bridge():
                 name=mod_name,
                 sources=[cpp_path],
                 extra_cflags=["-O2", "-std=c++17"],
+                extra_ldflags=extra_ldflags,
                 verbose=False,
             )
             _available = True
