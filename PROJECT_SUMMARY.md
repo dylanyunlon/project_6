@@ -77,29 +77,46 @@ project_6/
 - `Qwen3_5MoE.forward()` — MoE层: Tier 0-3分发 (ix_fused_moe → ix_bridge → corex_moe → PyTorch)
 
 ## 当前状态
-- 360+ commits
-- 38 GitHub issues (open) + 72 draft issues (待转真issue)
-- ix_full_bridge.cpp 已写完14个ixformer::infer函数桥接
-- corex_moe/corex_gdn/corex_fa2 已重写, 使用真实ixformer::infer dispatch chain
-- 需要真机编译 ix_full_bridge.cpp → .so 并验证MoE走C++ pipeline
+- 370+ commits, 67 GitHub issues (63 open, 4 closed)
+- GitHub Project #6: 149 items (121 draft issues + 28 real issues)
+- CCCL upstream (5205 files) 作为工程基座, tuning/dispatch pattern 1:1映射
+- 真机 comp 168 日志已完整分析: 3个致命bug已定位并修复
+- 可提交竞赛平台测试
 
 ## 本次任务完成内容
-重写3个dlopen模块(corex_moe.py, corex_gdn.py, corex_fa2.py):
-- corex_moe.py: 接入ix_bridge→ixformer::infer 7步MoE pipeline, 移除独立CUDA topk依赖
-- corex_gdn.py: gate clamp[-5,0] + state clamp±100 稳定性修复
-- corex_fa2.py: 3级tiered dispatch (ix_bridge C++ → ixformer Python → V1 fallback)
-- 分析comp 168 docker日志确认真机dlopen调用链条
+comp 168 docker日志 + upstream_ref 系统设计分析 → 三个致命bug修复:
+
+1. **OOM修复**: computility-run.yaml max_model_len 256000→80000
+   - comp 168日志: `torch.cuda.OutOfMemoryError: Tried to allocate 32.00 MiB`
+   - 引擎OOM→崩溃→replay_tencent 881请求中704个 Connection refused
+   - BI-V100 KV cache容量~88112 blocks, 256000远超上限
+
+2. **topk_softmax ERROR日志消除**: _custom_ops.py silent fallback
+   - comp 168日志: `ixformer.functions has no attribute vllm_moe_topk_softmax` × 500+次
+   - 从 ixformer.h 确认 `ixformer::infer::topk_softmax` 在C++层存在但Python binding缺失
+   - 新代码: 尝试 ixformer._C.topk_softmax → 安静 PyTorch fallback
+
+3. **_custom_ops.py 部署**: patch_ops.sh 添加部署步骤
+   - 之前标记为 "DO NOT deploy", 现在修复后部署
+
+关键发现 (from upstream_ref/xllm):
+- xllm/core/kernels/ilu/ixformer.h: 完整的 ixformer::infer API (14函数)
+- xllm/core/layers/ilu/fused_moe.cpp: 生产级7步MoE pipeline (797行)
+- xllm/core/kernels/ilu/fused_moe.cpp: topk_softmax + gen_idx + expand + combine
+- 这些代码在 upstream_ref 中已存在, 接口与我们的 ix_full_bridge.cpp 完全一致
 
 ## 历史任务摘要
-- CCCL upstream导入(8900文件) + 27/27 muh tuning headers + CCCL→vllm pattern mapping
-- ix_full_bridge.cpp 14函数桥接 + ix_moe_bridge.cpp MoE子集 + moe_topk_softmax_v3.cu
-- GDN dtype guard + NaN clamp修复 + corex_gdn/corex_moe初始版本
+- comp 168 三个致命bug修复 (OOM + topk_softmax + _custom_ops部署)
+- corex_moe/corex_gdn/corex_fa2 dlopen模块重写 (ixformer::infer dispatch chain)
+- CCCL upstream导入(5205文件) + 27/27 muh tuning headers + CCCL→vllm pattern mapping
+- ix_full_bridge.cpp 14函数桥接 + moe_topk_softmax_v3.cu
+- GDN dtype guard + NaN clamp修复
 - serving层部署(protocol/serving_chat/api_server等) + Sub508/509功能修复
-- 38 GitHub issues创建 + PRD/SYSTEM_DESIGN文档
+- 67 GitHub issues + 121 draft issues + PRD/SYSTEM_DESIGN文档
 
 ## 遗留问题/下次继续
-1. **真机编译ix_full_bridge.cpp** — 需要在Docker中JIT编译, 验证MoE走Tier 0 (C++ 7步)
-2. **72个draft issues转真issue** — 内容已写好, 需要GitHub API批量关联到repo
-3. **MoE Python loop性能** — 如果ix_bridge编译失败, Tier 2的Python expert loop是性能瓶颈(64 experts × 每token)
-4. **GDN prefill精度** — FlashQLA .so在BI-V100上编译通过但abs_mean=inf, 需要fp32 accumulation fix
-5. **benchmark实测** — Sub168基准 TPS=11.86, 需要在新dispatch chain下重测
+1. **GDN NaN (P0)** — prefill GDN 99.98% NaN, 替换为zeros=模型质量归零; 需要参考 xllm/npu_torch/qwen3_gated_delta_net_base.cpp 做 fp32 accumulation
+2. **真机编译ix_full_bridge.cpp** — JIT编译后MoE走Tier 0 (C++ 7步) 取代 Python loop
+3. **MoE性能** — 当前全走PyTorch for循环 (64 experts × 每token), Output TPS=11.86
+4. **121个draft issues→真issue** — GitHub API批量转换
+5. **提交竞赛平台** — 当前修复应能通过functional_acceptance基本测试, 不再OOM崩溃
