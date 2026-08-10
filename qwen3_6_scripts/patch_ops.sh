@@ -178,6 +178,18 @@ if [ -n "$VLLM2" ]; then
     cp ./chat_utils.py "$VLLM2/entrypoints/chat_utils.py" 2>/dev/null || true
 fi
 
+# Deploy corex_gdn.py + corex_moe.py → vllm model_executor/models/
+# These provide the fused GDN prefill kernel and MoE pipeline that competitor 168 had
+if [ -f "/workspace/ex_engine/python/corex_gdn.py" ]; then
+    cp "/workspace/ex_engine/python/corex_gdn.py" "$VLLM/model_executor/models/corex_gdn.py" 2>/dev/null || true
+    cp "/workspace/ex_engine/python/corex_moe.py" "$VLLM/model_executor/models/corex_moe.py" 2>/dev/null || true
+    echo "[patch_ops] Deployed: corex_gdn.py + corex_moe.py → $VLLM/model_executor/models/"
+    if [ -n "$VLLM2" ]; then
+        cp "/workspace/ex_engine/python/corex_gdn.py" "$VLLM2/model_executor/models/corex_gdn.py" 2>/dev/null || true
+        cp "/workspace/ex_engine/python/corex_moe.py" "$VLLM2/model_executor/models/corex_moe.py" 2>/dev/null || true
+    fi
+fi
+
 # Deploy EX Engine Python module + C++ bridge into vllm importable path
 EX_ENGINE_SRC="/workspace/ex_engine"
 if [ -d "$EX_ENGINE_SRC/python" ]; then
