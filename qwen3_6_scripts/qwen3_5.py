@@ -581,6 +581,13 @@ class GatedDeltaNet(nn.Module):
             k_4d = k.unsqueeze(0)            # (1, L, Hk, K)
             v_4d = v_raw.unsqueeze(0)        # (1, L, Hv, V)
             g_3d = gate.unsqueeze(0)         # (1, L, Hv)
+            # Clamp gate to prevent exp() overflow in CUDA kernel.
+            # gate = -dt * A_log.exp(), typically negative (decay).
+            # But pathological weights can produce positive values → exp > 1
+            # → state grows exponentially over L tokens → inf.
+            # PyTorch ref clamps g ∈ [-5, 2] before cumsum.
+            # For recurrent kernel: clamp raw gate so exp(gate) ∈ [exp(-5), exp(2)]
+            g_3d = g_3d.clamp(-5.0, 2.0)
             beta_3d = b_seq.unsqueeze(0)     # (1, L, Hv)
 
             # Initial state from temporal_state
@@ -800,6 +807,8 @@ class GatedDeltaNet(nn.Module):
                 k_t.view(BH, self.head_k_dim, 1),
                 delta.view(BH, 1, self.head_v_dim),
             )
+            # Clamp state to prevent gradual drift → NaN over long sequences
+            temporal_state.clamp_(-65504.0, 65504.0)
 
             # Output: core_out = q_t @ updated temporal_state
             core_out = _ix_bmm(
