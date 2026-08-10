@@ -82,18 +82,33 @@ class CoreXGDN:
 
     def __init__(
         self,
-        num_heads: int,
-        head_dim: int,
+        num_heads: int = 0,
+        head_dim: int = 128,
         layer_idx: int = 0,
         chunk_size: int = 16,
         eps: float = 1e-6,
+        # kwargs from qwen3_5.py (GatedDeltaNet uses separate k/v dims)
+        num_v_heads: int = 0,
+        num_k_heads: int = 0,
+        head_k_dim: int = 0,
+        head_v_dim: int = 0,
+        conv_kernel_size: int = 4,
+        **kwargs,  # future-proof
     ):
-        self.num_heads = num_heads
-        self.head_dim = head_dim
+        # Accept both calling conventions:
+        #   CoreXGDN(num_heads, head_dim)  — simple
+        #   CoreXGDN(num_v_heads=.., num_k_heads=.., head_k_dim=.., head_v_dim=..)  — from qwen3_5.py
+        self.num_v_heads = num_v_heads or num_heads
+        self.num_k_heads = num_k_heads or num_heads
+        self.head_k_dim = head_k_dim or head_dim
+        self.head_v_dim = head_v_dim or head_dim
+        self.num_heads = self.num_v_heads
+        self.head_dim = self.head_k_dim
         self.layer_idx = layer_idx
         self.chunk_size = chunk_size
         self.eps = eps
-        self.scale = head_dim ** -0.5
+        self.conv_kernel_size = conv_kernel_size
+        self.scale = self.head_k_dim ** -0.5
 
         self._decode_warned = False
         self._prefill_warned = False
@@ -106,20 +121,68 @@ class CoreXGDN:
 
     def forward(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        gate: torch.Tensor,
-        beta: torch.Tensor,
-        conv_state: Optional[torch.Tensor],
-        temporal_state: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
         attn_metadata,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        conv_state: torch.Tensor,
+        temporal_state: torch.Tensor,
+        in_proj_qkv,   # nn.Module — projects hidden → conv_dim
+        in_proj_z,      # nn.Module — projects hidden → val_dim
+        in_proj_b,      # nn.Module — projects hidden → num_v_heads (beta)
+        in_proj_a,      # nn.Module — projects hidden → num_v_heads (alpha/dt)
+        conv1d_weight,  # (conv_dim, 1, kernel_size) depthwise conv weight
+        A_log,          # (num_v_heads,) log decay parameters
+        dt_bias,        # (num_v_heads,) dt bias
+        norm,           # GatedRMSNorm module
+        out_proj,       # RowParallelLinear
+    ) -> torch.Tensor:
+        """Full GDN layer forward — matches qwen3_5.py calling convention.
+
+        This mirrors the PyTorch _pytorch_forward() path but uses ixformer
+        matmul acceleration and fused CoreX GDN ops when available.
+        """
+        from vllm.model_executor.parallel_utils.communication_op import (
+            tensor_model_parallel_all_reduce,
+        )
+        try:
+            from vllm.distributed import get_tensor_model_parallel_world_size
+        except ImportError:
+            get_tensor_model_parallel_world_size = lambda: 1
+
+        tp_size = get_tensor_model_parallel_world_size()
+        local_key_dim = self.num_k_heads * self.head_k_dim // tp_size
+        local_val_dim = self.num_v_heads * self.head_v_dim // tp_size
+        local_num_v = self.num_v_heads
+        local_num_k = self.num_k_heads
+        local_conv_dim = local_key_dim * 2 + local_val_dim
+
         is_prefill = getattr(attn_metadata, 'num_prefill_tokens', 0) > 0
+
+        # Project all tokens at once
+        mixed_qkv_all, _ = in_proj_qkv(hidden_states)
+        z_all, _ = in_proj_z(hidden_states)
+        b_all, _ = in_proj_b(hidden_states)
+        a_all, _ = in_proj_a(hidden_states)
+
         if is_prefill:
-            return self._prefill(q, k, v, gate, beta, temporal_state)
+            if not self._prefill_warned:
+                logger.info("Using fused CoreX GDN prefill operator")
+                self._prefill_warned = True
+            return self._full_prefill(
+                hidden_states, attn_metadata, conv_state, temporal_state,
+                mixed_qkv_all, z_all, b_all, a_all,
+                conv1d_weight, A_log, dt_bias, norm, out_proj,
+                local_key_dim, local_val_dim, local_num_v, local_num_k,
+                local_conv_dim)
         else:
-            return self._decode(q, k, v, gate, beta, conv_state, temporal_state)
+            if not self._decode_warned:
+                logger.info("Using fused CoreX GDN decode operator")
+                self._decode_warned = True
+            return self._full_decode(
+                hidden_states, attn_metadata, conv_state, temporal_state,
+                mixed_qkv_all, z_all, b_all, a_all,
+                conv1d_weight, A_log, dt_bias, norm, out_proj,
+                local_key_dim, local_val_dim, local_num_v, local_num_k,
+                local_conv_dim)
 
     def _prefill(self, q, k, v, gate, beta, temporal_state):
         if not self._prefill_warned:

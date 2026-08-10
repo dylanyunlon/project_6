@@ -32,6 +32,8 @@ command:
     - '8192'
     - --dtype
     - half
+    - --limit-mm-per-prompt
+    - image=1
 env:
     - name: VLLM_ENGINE_ITERATION_TIMEOUT_S
       value: '3600'

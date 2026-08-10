@@ -463,6 +463,7 @@ class GatedDeltaNet(nn.Module):
         self._use_corex_gdn = False
         if _corex_gdn_available and _corex_gdn_module is not None:
             try:
+                # Try base image's CoreXGDN signature first (may differ from ours)
                 self._corex_gdn_obj = _corex_gdn_module.CoreXGDN(
                     num_v_heads=self.num_v_heads // tp_size,
                     num_k_heads=self.num_k_heads // tp_size,
@@ -472,11 +473,25 @@ class GatedDeltaNet(nn.Module):
                     layer_idx=layer_idx,
                 )
                 self._use_corex_gdn = True
-                logger.info("GatedDeltaNet layer %d: CoreX fused GDN enabled", layer_idx)
+            except TypeError:
+                # Fallback: simpler signature
+                try:
+                    self._corex_gdn_obj = _corex_gdn_module.CoreXGDN(
+                        self.num_v_heads // tp_size,
+                        self.head_k_dim,
+                        layer_idx=layer_idx,
+                    )
+                    self._use_corex_gdn = True
+                except Exception as e2:
+                    logger.warning(
+                        "GatedDeltaNet layer %d: CoreX GDN init failed (%s), PyTorch",
+                        layer_idx, e2)
             except Exception as e:
                 logger.warning(
-                    "GatedDeltaNet layer %d: CoreX GDN init failed (%s), using PyTorch",
+                    "GatedDeltaNet layer %d: CoreX GDN init failed (%s), PyTorch",
                     layer_idx, e)
+            if self._use_corex_gdn and layer_idx == 0:
+                logger.info("GatedDeltaNet: CoreX fused GDN enabled")
 
     def _conv1d_weight_loader(self, param: torch.Tensor,
                               loaded_weight: torch.Tensor) -> None:
