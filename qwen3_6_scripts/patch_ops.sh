@@ -143,4 +143,27 @@ cp ./_custom_ops.py "$VLLM/_custom_ops.py" 2>/dev/null && \
     echo "[patch_ops] _custom_ops.py deployed" || true
 [ -n "$VLLM2" ] && cp ./_custom_ops.py "$VLLM2/_custom_ops.py" 2>/dev/null || true
 
+# ---- 6. ex_engine.python subpackage (qwen3_5.py does "from ex_engine.python.ix_bridge") ----
+# The flat ex_engine package has ix_bridge.py at top level, but qwen3_5.py imports from .python subdir
+_EX_PKG=$(python3 -c "import ex_engine; import os; print(os.path.dirname(ex_engine.__file__))" 2>/dev/null)
+if [ -n "$_EX_PKG" ] && [ -d "$_EX_PKG" ]; then
+    mkdir -p "$_EX_PKG/python"
+    touch "$_EX_PKG/python/__init__.py"
+    for f in ix_bridge.py corex_moe.py corex_gdn.py corex_fa2.py; do
+        [ -f "$_EX_PKG/$f" ] && ln -sf "$_EX_PKG/$f" "$_EX_PKG/python/$f"
+    done
+    echo "[patch_ops] ex_engine.python subpackage linked"
+fi
+
+# ---- 7. flash_qla_sm70 deployment to BOTH vllm paths ----
+_FLASH_SRC="/workspace/qwen3_6_scripts/flash_qla_sm70"
+if [ -d "$_FLASH_SRC" ]; then
+    for _VPATH in "$VLLM" "$VLLM2"; do
+        [ -z "$_VPATH" ] && continue
+        _FLASH_DST="$_VPATH/model_executor/models/flash_qla_sm70"
+        cp -r "$_FLASH_SRC" "$_FLASH_DST" 2>/dev/null || true
+    done
+    echo "[patch_ops] flash_qla_sm70 deployed to vllm model dirs"
+fi
+
 echo "[patch_ops] DONE"

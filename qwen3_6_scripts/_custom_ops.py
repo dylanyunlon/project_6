@@ -18,6 +18,83 @@ logger = init_logger(__name__)
 
 supports_moe_ops = True
 
+# ============================================================================
+# MoE CUDA kernels — JIT-compiled from vllm v0.5.5 (torch::Tensor API)
+# topk_softmax + moe_align_block_size compiled as moe_kernels.so
+# ============================================================================
+_moe_kernels = None
+_moe_kernels_loaded = False
+
+def _load_moe_kernels():
+    """Load pre-compiled moe_kernels.so or JIT compile on demand."""
+    global _moe_kernels, _moe_kernels_loaded
+    if _moe_kernels_loaded:
+        return _moe_kernels
+    _moe_kernels_loaded = True
+    
+    import os, glob, importlib.util
+    
+    # Try pre-compiled .so from torch extensions cache
+    try:
+        import moe_kernels
+        _moe_kernels = moe_kernels
+        logger.info("[EX] moe_kernels loaded from cache")
+        return _moe_kernels
+    except ImportError:
+        pass
+    
+    # Try to find .so in known locations
+    search_paths = [
+        os.path.expanduser('~/.cache/torch_extensions'),
+        '/root/.cache/torch_extensions',
+        '/workspace/ex_engine/build',
+    ]
+    for sp in search_paths:
+        for so in glob.glob(os.path.join(sp, '**/moe_kernels*.so'), recursive=True):
+            try:
+                spec = importlib.util.spec_from_file_location('moe_kernels', so)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                _moe_kernels = mod
+                logger.info(f"[EX] moe_kernels loaded from {so}")
+                return _moe_kernels
+            except Exception:
+                continue
+    
+    # JIT compile as last resort
+    moe_dir = None
+    for candidate in [
+        '/workspace/ex_engine/csrc/moe_v055',
+        os.path.join(os.path.dirname(__file__), '..', 'model_executor', 'models', 
+                     'ex_engine', 'csrc', 'moe_v055'),
+    ]:
+        if os.path.isdir(candidate):
+            moe_dir = candidate
+            break
+    
+    if moe_dir and os.path.isfile(os.path.join(moe_dir, 'moe_pybind.cpp')):
+        try:
+            from torch.utils.cpp_extension import load
+            _moe_kernels = load(
+                name='moe_kernels',
+                sources=[
+                    os.path.join(moe_dir, 'moe_pybind.cpp'),
+                    os.path.join(moe_dir, 'topk_softmax_kernels.cu'),
+                    os.path.join(moe_dir, 'moe_align_block_size_kernels.cu'),
+                ],
+                extra_include_paths=[moe_dir],
+                extra_cflags=['-O2', '-std=c++17'],
+                extra_cuda_cflags=['-O2', '--expt-relaxed-constexpr'],
+                verbose=False,
+            )
+            logger.info(f"[EX] moe_kernels JIT compiled from {moe_dir}")
+            return _moe_kernels
+        except Exception as e:
+            logger.warning(f"[EX] moe_kernels JIT compile failed: {e}")
+    
+    logger.warning("[EX] moe_kernels NOT available — MoE will use PyTorch path")
+    return None
+
 if TYPE_CHECKING:
 
     def register_fake(fn):
