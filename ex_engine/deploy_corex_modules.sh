@@ -60,13 +60,24 @@ else
     echo "[COREX] ✓ corex_moe.py already exists (base image or prior deploy)"
 fi
 
+# Deploy corex_fa2.py
+if [[ ! -f "${VLLM_MODELS}/corex_fa2.py" ]]; then
+    cp "${SRC_DIR}/corex_fa2.py" "${VLLM_MODELS}/corex_fa2.py"
+    echo "[COREX] ✓ Deployed corex_fa2.py"
+else
+    echo "[COREX] ✓ corex_fa2.py already exists (base image or prior deploy)"
+fi
+
 # Also deploy to ex_engine location (backup import path)
 mkdir -p /workspace/ex_engine/python 2>/dev/null || true
 cp "${SRC_DIR}/corex_gdn.py" /workspace/ex_engine/python/ 2>/dev/null || true
 cp "${SRC_DIR}/corex_moe.py" /workspace/ex_engine/python/ 2>/dev/null || true
+cp "${SRC_DIR}/corex_fa2.py" /workspace/ex_engine/python/ 2>/dev/null || true
 
 echo "[COREX] Deploy complete"
 echo "[COREX] Expected log on startup:"
 echo "  corex_gdn.py:NN → Loaded fused CoreX GDN decode operator ..."
 echo "  corex_gdn.py:NN → Using fused CoreX GDN prefill operator"
 echo "  corex_moe.py:NN → Using CoreX fused MoE prefill operator: tokens=N, kernel=expert-grouped-wmma"
+echo "  corex_fa2.py:NN → Using CoreX FA2 packed prefill: B=N Hq=4 Hkv=1 D=256 ..."
+echo "  corex_fa2.py:NN → Using CoreX paged decode: B=N Hq=4 Hkv=1 D=256 ..."

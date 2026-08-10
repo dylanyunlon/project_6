@@ -133,6 +133,15 @@ try:
 except ImportError:
     pass
 
+_corex_fa2_available = False
+_corex_fa2_module = None
+try:
+    from vllm.model_executor.models import corex_fa2 as _corex_fa2_module
+    _corex_fa2_available = True
+    logger.info("CoreX FA2 module found — fused attention kernels available")
+except ImportError:
+    pass
+
 # EX Engine: fused MoE topk_softmax CUDA kernel (xllm CUB-based)
 _ex_moe_topk_softmax = None
 _ex_moe_topk_available = False
