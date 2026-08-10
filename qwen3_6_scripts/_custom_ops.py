@@ -1142,12 +1142,12 @@ def reshape_and_cache_flashinfer(
 def copy_blocks(key_caches: List[torch.Tensor],
                 value_caches: List[torch.Tensor],
                 block_mapping: torch.Tensor) -> None:
-    ixf_F.copy_blocks(key_caches, value_caches, block_mapping)
+    ixf_F.vllm_copy_cache(key_caches, value_caches, block_mapping)
 
 
 def swap_blocks(src: torch.Tensor, dst: torch.Tensor,
                 block_mapping: torch.Tensor) -> None:
-    ixf_F.swap_blocks(src, dst, block_mapping)
+    ixf_F.vllm_swap_blocks(src, dst, block_mapping)
 
 
 def convert_fp8(output: torch.Tensor,
