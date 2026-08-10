@@ -127,19 +127,33 @@ def topk_softmax(
 def moe_forward(
     hidden_states: torch.Tensor,
     gate_output: torch.Tensor,
-    w1: torch.Tensor,
+    w1_or_w13: torch.Tensor,
     w2: torch.Tensor,
-    w3: torch.Tensor,
+    w3: Optional[torch.Tensor] = None,
     topk: int = 8,
     renormalize: bool = True,
     **kwargs,
 ) -> torch.Tensor:
     """
     Full MoE pipeline: CUDA topk → per-expert GEMM (cublas) → silu → GEMM → scatter-add.
+
+    Accepts two weight formats:
+      Format A (xllm style):  w1=(E,I,H), w2=(E,H,I), w3=(E,I,H) — gate and up separate
+      Format B (vllm style):  w13=(E,2*I,H), w2=(E,H,I), w3=None — gate_up merged
     """
     num_tokens = hidden_states.shape[0]
     hidden_size = hidden_states.shape[1]
     dtype = hidden_states.dtype
+
+    # Detect weight format
+    if w3 is None:
+        # Format B: w13 merged — split into w1 (gate) and w3 (up)
+        w13 = w1_or_w13
+        inter2 = w13.shape[1]
+        w1 = w13[:, :inter2 // 2, :]  # (E, I, H)
+        w3 = w13[:, inter2 // 2:, :]  # (E, I, H)
+    else:
+        w1 = w1_or_w13
 
     topk_weights, topk_ids = topk_softmax(gate_output, topk, renormalize)
 

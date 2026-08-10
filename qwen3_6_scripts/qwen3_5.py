@@ -1207,12 +1207,16 @@ class Qwen3_5MoeSparseBlock(nn.Module):
                 routed_out = self._corex_moe_forward(
                     hidden_states, router_logits,
                     self.experts.w13_weight, self.experts.w2_weight,
-                    self.top_k,
+                    w3=None, topk=self.top_k,
                 )
             except Exception as e:
-                logger.warning("CoreX MoE forward failed (%s), falling back permanently", e)
-                self._use_corex_moe = False
-                routed_out = self._pure_pytorch_experts(hidden_states, router_logits)
+                # NO FALLBACK — crash with error log so we can diagnose
+                logger.error("CoreX MoE forward FAILED: %s", e)
+                raise RuntimeError(
+                    f"corex_moe.moe_forward failed: {e}. "
+                    f"Shapes: hidden={hidden_states.shape}, router={router_logits.shape}, "
+                    f"w13={self.experts.w13_weight.shape}, w2={self.experts.w2_weight.shape}"
+                ) from e
         else:
             routed_out = self._pure_pytorch_experts(hidden_states, router_logits)
 
