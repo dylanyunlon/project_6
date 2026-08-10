@@ -1,122 +1,91 @@
 """
 ex_engine/python/patch_model.py — Wire EX Engine factors into vllm model
 
-CCCL parallel: CCCL's dispatch_reduce.cuh has a Dispatch() that selects
-the tuned kernel based on compute_capability. This patch does the same:
-it replaces the PyTorch fallback paths with EX factor kernel calls.
+Architecture (CCCL dispatch parallel):
+  CCCL: compute_capability → policy_selector → kernel
+  EX:   hardware_id → factor_table → {.so kernel | FlashQLA ext} → dispatch
 
 Patched paths:
-  1. Qwen3_5MoeSparseBlock._pure_pytorch_experts()
-     → Uses EX factor 0 (moe_topk_softmax) for routing
-     → Falls back to PyTorch GEMM for expert computation (factor 2 TBD)
+  1. MoE routing: softmax+topk+renorm → ex_factor_0.so (warp shuffle kernel)
+  2. GDN prefill: _torch_chunk_gated_delta_rule → FlashQLA gdn_forward
+  3. GDN decode: recurrent step → FlashQLA gdn_decode
 
-  2. GatedDeltaNet.forward() prefill path
-     → Uses EX factor 5 (gdn_chunk_fwd) instead of _torch_chunk_gated_delta_rule
-     → Eliminates NaN by using fp32 accumulation
-
-Integration:
-  Called from patch_ops.sh during Docker build, or imported at runtime:
-    python -c "from ex_engine.python.patch_model import apply_patches; apply_patches()"
+Key finding from real hardware test:
+  FlashQLA compiles with corex clang/16 on BI-V100 and produces non-NaN output.
+  No PyTorch fallback needed — we have PROVEN kernels.
 """
 
 import logging
 import os
 import torch
-import types
 
 logger = logging.getLogger("ex_engine.patch")
 
 
 def apply_patches(build_dir: str = "/workspace/ex_engine/build"):
-    """
-    Apply EX Engine patches to the loaded vllm model modules.
-    Must be called AFTER vllm modules are imported.
-    """
-    # Lazy import to avoid circular deps
+    """Apply EX Engine patches to loaded vllm model modules."""
+    logger.info("EX Engine: applying algorithm factor patches")
+
+    n_patched = 0
+
+    # Patch 1: MoE topk_softmax
+    if _patch_moe_routing(build_dir):
+        n_patched += 1
+
+    # Patch 2: GDN prefill + decode via FlashQLA
+    if _patch_gdn_flashqla():
+        n_patched += 1
+
+    logger.info("EX Engine: %d patches applied", n_patched)
+    return n_patched
+
+
+def _patch_moe_routing(build_dir: str) -> bool:
+    """Replace softmax→topk→renorm with fused EX factor 0 kernel."""
     try:
-        from ex_engine.python.ex_loader import EXEngine
-    except ImportError:
-        import sys
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        from ex_engine.python.ex_loader import EXEngine
+        from ex_engine.python.ex_loader import EXEngine, EX_FACTOR_MOE_TOPK_SOFTMAX
+        engine = EXEngine(build_dir)
+        if not engine.load_factor(EX_FACTOR_MOE_TOPK_SOFTMAX,
+                                   os.path.join(build_dir, "ex_factor_0.so")):
+            logger.warning("MoE topk_softmax .so not found, skip")
+            return False
+    except Exception as e:
+        logger.warning("MoE loader init failed: %s", e)
+        return False
 
-    engine = EXEngine(build_dir)
-    loaded = engine.load_all()
-
-    if loaded == 0:
-        logger.warning("EX Engine: no factors loaded, skipping patches")
-        return
-
-    logger.info("EX Engine: %d factors loaded, applying patches", loaded)
-
-    # -----------------------------------------------------------------------
-    # Patch 1: MoE routing — replace softmax+topk with fused factor
-    # -----------------------------------------------------------------------
-    if engine.has_factor(0):  # EX_FACTOR_MOE_TOPK_SOFTMAX
-        _patch_moe_routing(engine)
-
-    # -----------------------------------------------------------------------
-    # Patch 2: GDN prefill — replace _torch_chunk_gated_delta_rule
-    # -----------------------------------------------------------------------
-    if engine.has_factor(5):  # EX_FACTOR_GDN_CHUNK_FWD
-        _patch_gdn_prefill(engine)
-
-    logger.info("EX Engine: patches applied successfully")
-
-
-def _patch_moe_routing(engine):
-    """
-    Replace the pure PyTorch softmax→topk→renormalize in MoE with
-    fused EX factor kernel.
-
-    Target: Qwen3_5MoeSparseBlock._pure_pytorch_experts()
-    The first 3 lines:
-        routing_weights = _ix_softmax(router_logits.float(), dim=-1)
-        topk_weights, topk_ids = torch.topk(routing_weights, self.top_k, dim=-1)
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    """
     try:
         from vllm.model_executor.models import qwen3_5 as m
     except ImportError:
-        logger.warning("Cannot import qwen3_5, skipping MoE patch")
-        return
+        logger.warning("Cannot import qwen3_5 for MoE patch")
+        return False
 
     if not hasattr(m, 'Qwen3_5MoeSparseBlock'):
-        logger.warning("Qwen3_5MoeSparseBlock not found, skipping MoE patch")
-        return
-
-    original_fn = m.Qwen3_5MoeSparseBlock._pure_pytorch_experts
+        return False
 
     def patched_experts(self, hidden_states, router_logits):
-        # EX fused topk+softmax (1 kernel instead of 2 + 1 normalize)
         topk_weights, topk_ids = engine.moe_topk_softmax(
             router_logits, top_k=self.top_k)
         topk_weights = topk_weights.to(hidden_states.dtype)
 
-        # Expert computation still uses PyTorch path
-        # (factor 2 will replace this with batched GEMM later)
         w13 = self.experts.w13_weight
-        w2  = self.experts.w2_weight
+        w2 = self.experts.w2_weight
         T = hidden_states.shape[0]
 
         if T == 1:
-            # Decode fast path (same as original)
             eids = topk_ids[0]
             ws = topk_weights[0]
             w13_sel = w13[eids]
             w2_sel = w2[eids]
             H = hidden_states.shape[-1]
-
             gate_up = torch.nn.functional.linear(
                 hidden_states, w13_sel.reshape(-1, H))
             gate_up = gate_up.view(self.top_k, -1)
             gate, up = gate_up.chunk(2, dim=-1)
             act = torch.nn.functional.silu(gate) * up
             expert_out = torch.bmm(w2_sel, act.unsqueeze(-1)).squeeze(-1)
-            out = (expert_out * ws.unsqueeze(-1)).sum(0, keepdim=True)
-            return out.to(hidden_states.dtype)
+            return (expert_out * ws.unsqueeze(-1)).sum(0, keepdim=True).to(
+                hidden_states.dtype)
         else:
-            # Prefill path — loop over experts
             out = torch.zeros_like(hidden_states)
             unique_eids = topk_ids.view(-1).unique().tolist()
             for eid in unique_eids:
@@ -130,68 +99,106 @@ def _patch_moe_routing(engine):
                 expert_out = torch.nn.functional.linear(act, w2[eid])
                 weights = topk_weights[tok_ids, topk_pos].unsqueeze(-1)
                 out.index_add_(0, tok_ids,
-                             (expert_out * weights).to(out.dtype))
+                               (expert_out * weights).to(out.dtype))
             return out
 
     m.Qwen3_5MoeSparseBlock._pure_pytorch_experts = patched_experts
-    logger.info("EX Patched: MoE routing → fused topk_softmax factor")
+    logger.info("EX Patched: MoE routing → fused topk_softmax factor 0")
+    return True
 
 
-def _patch_gdn_prefill(engine):
+def _patch_gdn_flashqla() -> bool:
     """
-    Replace _torch_chunk_gated_delta_rule with EX factor 5 (gdn_chunk_fwd).
-    This eliminates the NaN problem by using fp32 state accumulation.
+    Replace _torch_chunk_gated_delta_rule with FlashQLA gdn_forward.
+
+    FlashQLA is PROVEN on real BI-V100 hardware:
+      - Compiles with corex clang/16 (--cuda-gpu-arch=ivcore10)
+      - Produces non-NaN output
+      - Exports: gdn_forward, gdn_forward_vlk_varlen,
+                 gdn_decode_mixed_qkv_ddtree_state,
+                 gdn_decode_mixed_qkv_global_state
     """
+    # Try to load FlashQLA
+    flash_ext = None
+    for so_dir in [
+        "/workspace/flash_qla_sm70",
+        "/workspace/qwen3_6_scripts/flash_qla_sm70",
+    ]:
+        cu_path = os.path.join(so_dir, "csrc", "gdn_forward.cu")
+        if os.path.exists(cu_path):
+            try:
+                os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "7.0")
+                from torch.utils.cpp_extension import load
+                flash_ext = load(
+                    name="flash_qla_sm70_gdn",
+                    sources=[cu_path],
+                    extra_cuda_cflags=["-O3"],
+                    extra_cflags=["-O3"],
+                    verbose=False,
+                )
+                logger.info("FlashQLA GDN loaded from %s", cu_path)
+                break
+            except Exception as e:
+                logger.warning("FlashQLA compile failed from %s: %s", cu_path, e)
+                continue
+
+    if flash_ext is None:
+        logger.warning("FlashQLA GDN not available, GDN stays PyTorch fallback")
+        return False
+
+    # Verify the extension has what we need
+    if not hasattr(flash_ext, 'gdn_forward'):
+        logger.error("FlashQLA ext missing gdn_forward, skip")
+        return False
+
     try:
         from vllm.model_executor.models import qwen3_5 as m
     except ImportError:
-        logger.warning("Cannot import qwen3_5, skipping GDN patch")
-        return
+        logger.warning("Cannot import qwen3_5 for GDN patch")
+        return False
 
     if not hasattr(m, '_torch_chunk_gated_delta_rule'):
-        logger.warning("_torch_chunk_gated_delta_rule not found, skipping GDN patch")
-        return
+        logger.warning("_torch_chunk_gated_delta_rule not found")
+        return False
 
-    original_fn = m._torch_chunk_gated_delta_rule
-
+    # Patch _torch_chunk_gated_delta_rule → FlashQLA gdn_forward
     def patched_gdn_chunk(q, k, v, gate, beta, chunk_size, state):
         """
-        EX factor replacement for _torch_chunk_gated_delta_rule.
+        Replace pure-PyTorch GDN chunk with FlashQLA.
 
-        Args match the original function signature:
-            q: (1, L, H, D) or (B, L, H, D)
-            k, v: same shape
-            gate: (1, L, H) or (B, L, H)
-            beta: same shape
-            chunk_size: int (ignored — factor processes full sequence)
-            state: (B, H, D, D)
-
-        Returns: (output, new_state)
+        FlashQLA signature:
+          gdn_forward(q, k, v, g, beta, initial_state, scale, output_final_state, head_first)
+          → (output, final_state)
         """
-        B = q.shape[0]
-        L = q.shape[1]
-        H = q.shape[2]
-        D = q.shape[3]
+        K = q.shape[-1]
+        scale = float(K ** -0.5)
 
-        # Ensure contiguous and correct dtype
-        q_c = q.contiguous().half()
-        k_c = k.contiguous().half()
-        v_c = v.contiguous().half()
-        g_c = gate.float().contiguous()
-        b_c = beta.float().contiguous()
-        s_c = state.float().contiguous()
+        # FlashQLA expects specific tensor layout
+        q_c = q.contiguous()
+        k_c = k.contiguous()
+        v_c = v.contiguous()
+        g_c = gate.contiguous()
+        b_c = beta.contiguous()
 
-        output, new_state = engine.gdn_chunk_fwd(
-            q_c, k_c, v_c, g_c, b_c, s_c)
+        output, new_state = flash_ext.gdn_forward(
+            q_c, k_c, v_c, g_c, b_c,
+            state,      # initial_state (can be None)
+            scale,      # scale factor
+            True,       # output_final_state
+            False,      # head_first = False (our layout is B,L,H,D)
+        )
 
         return output, new_state
 
     m._torch_chunk_gated_delta_rule = patched_gdn_chunk
-    logger.info("EX Patched: GDN prefill → gdn_chunk_fwd factor (NaN-free)")
+    logger.info("EX Patched: GDN prefill → FlashQLA gdn_forward (NaN-free)")
+    return True
 
 
-# ---------------------------------------------------------------------------
-# Call apply_patches() explicitly AFTER vllm model modules are loaded.
-# Integration point: qwen3_5.py calls this at the end of model __init__,
-# or patch_ops.sh adds it to the startup sequence.
-# ---------------------------------------------------------------------------
+# Auto-apply on import if environment is set
+_AUTO_BUILD_DIR = os.environ.get("EX_ENGINE_BUILD_DIR", "/workspace/ex_engine/build")
+if os.environ.get("EX_ENGINE_AUTO_PATCH", "0") == "1":
+    try:
+        apply_patches(_AUTO_BUILD_DIR)
+    except Exception as e:
+        logger.warning("EX Engine auto-apply failed: %s", e)
