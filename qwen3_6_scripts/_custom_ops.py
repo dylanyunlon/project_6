@@ -18,72 +18,6 @@ logger = init_logger(__name__)
 
 supports_moe_ops = True
 
-# ============================================================================
-# EX Engine: ix_moe_bridge — JIT-compiled C++ bridge to ixformer::infer MoE ops
-# This is the ONLY way to call topk_softmax, group_gemm, etc. on BI-V100
-# because ixformer.functions Python binding doesn't expose them.
-# ============================================================================
-_ix_moe_bridge = None
-
-def _load_moe_bridge():
-    """Load ix_moe_bridge via torch.utils.cpp_extension JIT compile."""
-    import os, glob
-    bridge = None
-    
-    # Try 1: pre-compiled .so from ex_engine build
-    search_paths = [
-        '/workspace/ex_engine/build',
-        os.path.join(os.path.dirname(__file__), '..', 'model_executor', 'models', 'ex_engine'),
-        '/usr/local/corex/lib/python3/dist-packages/ex_engine',
-    ]
-    for sp in search_paths:
-        so_files = glob.glob(os.path.join(sp, 'ix_moe_bridge*.so'))
-        if so_files:
-            try:
-                import importlib.util
-                spec = importlib.util.spec_from_file_location('ix_moe_bridge', so_files[0])
-                bridge = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(bridge)
-                logger.info(f"[EX] Loaded ix_moe_bridge from {so_files[0]}")
-                return bridge
-            except Exception as e:
-                logger.warning(f"[EX] Failed to load pre-built bridge {so_files[0]}: {e}")
-    
-    # Try 2: JIT compile ix_moe_bridge.cpp against libixformer.so
-    cpp_search = [
-        '/workspace/ex_engine/csrc/ix_moe_bridge.cpp',
-        os.path.join(os.path.dirname(__file__), 'ix_moe_bridge.cpp'),
-        os.path.join(os.path.dirname(__file__), '..', 'model_executor', 'models', 'ex_engine', 'csrc', 'ix_moe_bridge.cpp'),
-    ]
-    cpp_file = None
-    for p in cpp_search:
-        if os.path.isfile(p):
-            cpp_file = p
-            break
-    
-    if cpp_file:
-        try:
-            from torch.utils.cpp_extension import load
-            bridge = load(
-                name='ix_moe_bridge',
-                sources=[cpp_file],
-                extra_include_paths=['/usr/local/corex/include'],
-                extra_ldflags=[
-                    '-L/usr/local/corex/lib64',
-                    '-L/usr/local/corex/lib64/python3/dist-packages/ixformer',
-                    '-lixformer',
-                    '-Wl,-rpath,/usr/local/corex/lib64/python3/dist-packages/ixformer',
-                ],
-                verbose=False,
-            )
-            logger.info(f"[EX] JIT compiled ix_moe_bridge from {cpp_file}")
-            return bridge
-        except Exception as e:
-            logger.warning(f"[EX] JIT compile failed for {cpp_file}: {e}")
-    
-    logger.warning("[EX] ix_moe_bridge NOT available — topk_softmax will use PyTorch path")
-    return None
-
 if TYPE_CHECKING:
 
     def register_fake(fn):
@@ -896,39 +830,20 @@ def invoke_fused_moe_kernel(
 def topk_softmax(topk_weights: torch.Tensor, topk_ids: torch.Tensor,
                  token_expert_indicies: torch.Tensor,
                  gating_output: float) -> None:
-    # EX Engine: algorithm factor replacement for topk_softmax.
-    # ixformer::infer::topk_softmax is in libixformer.so (C++ level)
-    # but NOT exposed via ixformer.functions Python binding.
-    # We call it via ix_moe_bridge (pybind11 JIT-compiled against libixformer.so).
-    # NO FALLBACK — if bridge fails, raise immediately to catch integration bugs.
-    global _ix_moe_bridge
-    if _ix_moe_bridge is None:
-        _ix_moe_bridge = _load_moe_bridge()
-    if _ix_moe_bridge is not None:
-        # Bridge available — call ixformer::infer::topk_softmax via C++
-        if isinstance(gating_output, torch.Tensor):
-            gating_output = gating_output.float().contiguous()
-        topk = topk_weights.shape[1]
-        tw, ti = _ix_moe_bridge.topk_softmax(gating_output, topk, False)
-        topk_weights.copy_(tw.to(topk_weights.dtype))
-        topk_ids.copy_(ti.to(topk_ids.dtype))
-        token_expert_indicies.copy_(
-            torch.arange(topk, device=topk_ids.device, dtype=topk_ids.dtype)
-            .unsqueeze(0).expand_as(topk_ids))
+    # BI-V100 base image: ixf_F.vllm_moe_topk_softmax does NOT exist.
+    # libixformer.so has NO topk_softmax symbol (verified via nm -D).
+    # PyTorch implementation — silent, no ERROR log spam.
+    if isinstance(gating_output, torch.Tensor):
+        probs = torch.softmax(gating_output.float(), dim=-1)
     else:
-        # Bridge not loaded — use PyTorch (for build environments without GPU)
-        # In production this path should NOT be hit
-        if isinstance(gating_output, torch.Tensor):
-            probs = torch.softmax(gating_output.float(), dim=-1)
-        else:
-            probs = torch.softmax(gating_output, dim=-1)
-        topk = topk_weights.shape[1]
-        tw, ti = torch.topk(probs, topk, dim=-1)
-        topk_weights.copy_(tw)
-        topk_ids.copy_(ti.to(topk_ids.dtype))
-        token_expert_indicies.copy_(
-            torch.arange(topk, device=topk_ids.device, dtype=topk_ids.dtype)
-            .unsqueeze(0).expand_as(topk_ids))
+        probs = torch.softmax(gating_output, dim=-1)
+    topk = topk_weights.shape[1]
+    tw, ti = torch.topk(probs, topk, dim=-1)
+    topk_weights.copy_(tw.to(topk_weights.dtype))
+    topk_ids.copy_(ti.to(topk_ids.dtype))
+    token_expert_indicies.copy_(
+        torch.arange(topk, device=topk_ids.device, dtype=topk_ids.dtype)
+        .unsqueeze(0).expand_as(topk_ids))
 
 
 if supports_moe_ops and hasattr(torch.ops._moe_C, "marlin_gemm_moe"):

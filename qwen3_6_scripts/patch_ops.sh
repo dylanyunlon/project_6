@@ -260,37 +260,7 @@ if [ -d "$EX_ENGINE_SRC/python" ]; then
     echo "[patch_ops] EX Engine Python package deployed to $EX_PY_DST"
 fi
 
-# 7a. JIT compile ix_moe_bridge.cpp → .so (bridge to ixformer::infer C++ API)
-# This is CRITICAL: topk_softmax, group_gemm, etc. are ONLY accessible via C++
-IX_MOE_BRIDGE_CPP="/workspace/ex_engine/csrc/ix_moe_bridge.cpp"
-if [ -f "$IX_MOE_BRIDGE_CPP" ]; then
-    echo "[patch_ops] Pre-compiling ix_moe_bridge.cpp (ixformer C++ bridge)..."
-    python3 -c "
-import torch
-from torch.utils.cpp_extension import load
-try:
-    bridge = load(
-        name='ix_moe_bridge',
-        sources=['$IX_MOE_BRIDGE_CPP'],
-        extra_include_paths=['/usr/local/corex/include'],
-        extra_ldflags=[
-            '-L/usr/local/corex/lib64',
-            '-L/usr/local/corex/lib64/python3/dist-packages/ixformer',
-            '-lixformer',
-            '-Wl,-rpath,/usr/local/corex/lib64/python3/dist-packages/ixformer',
-        ],
-        verbose=True,
-    )
-    print('[patch_ops] ix_moe_bridge compiled successfully')
-    # Test basic function availability
-    print(f'[patch_ops] Bridge functions: {[x for x in dir(bridge) if not x.startswith(\"_\")]}')
-except Exception as e:
-    print(f'[patch_ops] WARNING: ix_moe_bridge compile failed: {e}')
-    print('[patch_ops] topk_softmax will use PyTorch fallback')
-" 2>&1 || echo "[patch_ops] WARNING: ix_moe_bridge pre-compile step failed"
-fi
-
-# 7b. Precompile MoE topk_softmax CUDA kernel (.cu → .so)
+# 7. Precompile MoE topk_softmax CUDA kernel (.cu → .so)
 # This replaces the missing ixf_F.vllm_moe_topk_softmax with our own CUDA kernel
 MOE_TOPK_CU="/workspace/ex_engine/csrc/moe_topk_softmax_v3.cu"
 if [ -f "$MOE_TOPK_CU" ]; then
