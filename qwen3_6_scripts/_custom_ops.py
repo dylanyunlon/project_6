@@ -827,12 +827,74 @@ def invoke_fused_moe_kernel(
     )
 
 
+# ---------- topk_softmax: CUDA kernel → PyTorch fallback ----------
+# Our moe_topk_softmax_v3.cu is a fused warp-shuffle CUDA kernel
+# specialized for 64 experts. It's precompiled during Docker build.
+# If loading fails (no GPU at build time), falls back to PyTorch.
+_moe_topk_ext = None
+_moe_topk_init_done = False
+
+def _init_moe_topk():
+    global _moe_topk_ext, _moe_topk_init_done
+    _moe_topk_init_done = True
+    # Try loading precompiled .so first
+    try:
+        import moe_topk_softmax_v3 as ext
+        _moe_topk_ext = ext
+        logger.info("topk_softmax: loaded CUDA kernel (moe_topk_softmax_v3)")
+        return
+    except ImportError:
+        pass
+    # Try JIT compile from source
+    import os, glob
+    search_paths = [
+        "/workspace/ex_engine/csrc/moe_topk_softmax_v3.cu",
+        os.path.join(os.path.dirname(__file__), "moe_topk_softmax_v3.cu"),
+    ]
+    # Also search vllm model dir where patch_ops.sh copies it
+    for base in ["/usr/local/corex/lib/python3/dist-packages/vllm/model_executor/models",
+                 "/usr/local/corex/lib64/python3/dist-packages/vllm/model_executor/models"]:
+        search_paths.append(os.path.join(base, "moe_topk_softmax_v3.cu"))
+    for cu_path in search_paths:
+        if os.path.isfile(cu_path):
+            try:
+                from torch.utils.cpp_extension import load
+                ext = load(
+                    name="moe_topk_softmax_v3",
+                    sources=[cu_path],
+                    extra_cuda_cflags=["-O3"],
+                    verbose=False,
+                )
+                _moe_topk_ext = ext
+                logger.info("topk_softmax: JIT compiled CUDA kernel from %s", cu_path)
+                return
+            except Exception as e:
+                logger.warning("topk_softmax: JIT compile failed (%s), trying next", e)
+    logger.info("topk_softmax: no CUDA kernel available, using PyTorch fallback")
+
+
 def topk_softmax(topk_weights: torch.Tensor, topk_ids: torch.Tensor,
                  token_expert_indicies: torch.Tensor,
                  gating_output: float) -> None:
-    # BI-V100 base image: ixf_F.vllm_moe_topk_softmax does NOT exist.
-    # libixformer.so has NO topk_softmax symbol (verified via nm -D).
-    # PyTorch implementation — silent, no ERROR log spam.
+    global _moe_topk_ext, _moe_topk_init_done
+    if not _moe_topk_init_done:
+        _init_moe_topk()
+
+    # Priority 1: Our CUDA kernel (fused warp-shuffle, ~5x faster than PyTorch)
+    if _moe_topk_ext is not None:
+        try:
+            gating = gating_output if isinstance(gating_output, torch.Tensor) else gating_output
+            topk_k = topk_weights.shape[1]
+            results = _moe_topk_ext.moe_topk_softmax(gating, topk_k, False)
+            topk_weights.copy_(results[0].to(topk_weights.dtype))
+            topk_ids.copy_(results[1].to(topk_ids.dtype))
+            token_expert_indicies.copy_(results[2].to(token_expert_indicies.dtype))
+            return
+        except Exception as e:
+            logger.warning("topk_softmax CUDA kernel failed (%s), falling back to PyTorch", e)
+            _moe_topk_ext = None  # disable permanently on failure
+
+    # Priority 2: PyTorch fallback (always works)
     if isinstance(gating_output, torch.Tensor):
         probs = torch.softmax(gating_output.float(), dim=-1)
     else:
