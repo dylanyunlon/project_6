@@ -7,12 +7,10 @@ COPY ./qwen3_6_scripts /workspace/qwen3_6_scripts
 COPY ./computility-run.yaml /workspace/computility-run.yaml
 COPY ./ex_engine /workspace/ex_engine
 
-RUN apt-get update -qq && \
-    apt-get install -y -qq gcc ninja-build && \
-    rm -rf /var/lib/apt/lists/*
-
 RUN chmod +x /workspace/ex_engine/build.sh && \
-    bash /workspace/ex_engine/build.sh --corex
+    bash /workspace/ex_engine/build.sh --corex 2>&1 | tee /workspace/ex_build.log ; \
+    echo "[Dockerfile] ex_engine build exit code: $?"
 
 RUN chmod +x /workspace/qwen3_6_scripts/patch_ops.sh && \
-    bash /workspace/qwen3_6_scripts/patch_ops.sh
+    bash /workspace/qwen3_6_scripts/patch_ops.sh 2>&1 | tee /workspace/patch_ops.log ; \
+    echo "[Dockerfile] patch_ops exit code: $?"
