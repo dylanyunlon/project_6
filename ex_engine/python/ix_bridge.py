@@ -1,15 +1,17 @@
 """
-ix_bridge.py — Full ixformer MoE pipeline bridge.
+ix_bridge.py — Full ixformer bridge loader.
 
-Loads ix_moe_bridge.so via JIT and exposes both individual ops and the full
-fused MoE forward pass that replaces the Python for-loop in qwen3_5.py.
+Loads ix_full_bridge.so (all 14 ixformer::infer functions) or falls back
+to ix_moe_bridge.so (MoE-only 6 functions).
 
-Pipeline (mirrors xllm/core/layers/ilu/fused_moe.cpp):
-  topk_softmax → moe_gen_idx → moe_expand_input → group_gemm(w13)
-  → silu_and_mul → group_gemm(w2) → moe_combine_result
-
-All 6 ixformer::infer C++ functions are called through ix_moe_bridge.cpp
-which forward-declares them and links against the base image SDK.
+Functions exposed:
+  MoE:       topk_softmax, moe_gen_idx, moe_expand_input, group_gemm,
+             silu_and_mul, moe_combine_result, fused_moe_forward
+  Attention: paged_attention, flash_attn_prefill
+  Norm:      rms_norm, fused_add_rms_norm
+  RoPE:      rotary_embedding
+  Cache:     reshape_and_cache
+  Linear:    linear
 """
 
 import os
@@ -19,23 +21,22 @@ from typing import Tuple, Optional, List
 
 logger = logging.getLogger("ex_engine.ix_bridge")
 
-_ix_bridge = None
-_ix_bridge_loaded = False  # True after attempt, even if failed
-_ix_bridge_available = False
+_bridge = None
+_loaded = False
+_available = False
+
+# All .cpp sources to try, in priority order
+_CPP_NAMES = ["ix_full_bridge.cpp", "ix_moe_bridge.cpp"]
 
 
-def _find_cpp_source():
-    """Find ix_moe_bridge.cpp in multiple locations."""
-    candidates = []
-    # 1. Relative to this file: ex_engine/csrc/
+def _find_cpp(name):
     here = os.path.dirname(os.path.abspath(__file__))
-    candidates.append(os.path.join(here, "..", "csrc", "ix_moe_bridge.cpp"))
-    # 2. Deployed path inside vllm model dir
-    candidates.append(os.path.join(here, "ix_moe_bridge.cpp"))
-    # 3. /workspace paths
-    candidates.append("/workspace/ex_engine/csrc/ix_moe_bridge.cpp")
-    candidates.append("/workspace/qwen3_6_scripts/ix_moe_bridge.cpp")
-
+    candidates = [
+        os.path.join(here, "..", "csrc", name),
+        os.path.join(here, name),
+        os.path.join("/workspace/ex_engine/csrc", name),
+        os.path.join("/workspace/qwen3_6_scripts", name),
+    ]
     for c in candidates:
         p = os.path.normpath(c)
         if os.path.exists(p):
@@ -44,136 +45,117 @@ def _find_cpp_source():
 
 
 def _load_bridge():
-    """JIT-compile and load ix_moe_bridge.so — called once."""
-    global _ix_bridge, _ix_bridge_loaded, _ix_bridge_available
-    if _ix_bridge_loaded:
-        return _ix_bridge_available
-    _ix_bridge_loaded = True
+    global _bridge, _loaded, _available
+    if _loaded:
+        return _available
+    _loaded = True
 
-    cpp_file = _find_cpp_source()
-    if cpp_file is None:
-        logger.warning("ix_moe_bridge.cpp not found in any search path")
-        return False
+    from torch.utils.cpp_extension import load
 
-    try:
-        from torch.utils.cpp_extension import load
-        logger.info("JIT-compiling ix_moe_bridge.cpp from %s ...", cpp_file)
-        _ix_bridge = load(
-            name="ix_moe_bridge",
-            sources=[cpp_file],
-            extra_cflags=["-O2", "-std=c++17"],
-            verbose=False,
-        )
-        _ix_bridge_available = True
-        fns = [x for x in dir(_ix_bridge) if not x.startswith("_")]
-        logger.info("ix_moe_bridge loaded: %s", fns)
-        return True
-    except Exception as e:
-        logger.warning("ix_moe_bridge JIT compile failed: %s", e)
-        return False
+    for cpp_name in _CPP_NAMES:
+        cpp_path = _find_cpp(cpp_name)
+        if cpp_path is None:
+            continue
+        mod_name = cpp_name.replace(".cpp", "").replace(".", "_")
+        try:
+            logger.info("JIT-compiling %s from %s ...", cpp_name, cpp_path)
+            _bridge = load(
+                name=mod_name,
+                sources=[cpp_path],
+                extra_cflags=["-O2", "-std=c++17"],
+                verbose=False,
+            )
+            _available = True
+            fns = [x for x in dir(_bridge) if not x.startswith("_")]
+            logger.info("ix_bridge loaded (%s): %s", cpp_name, fns)
+            return True
+        except Exception as e:
+            logger.warning("JIT compile %s failed: %s — trying next", cpp_name, e)
+
+    logger.warning("All ix_bridge sources failed to compile")
+    return False
 
 
 def is_available() -> bool:
-    """Check if bridge is available (lazy-load on first call)."""
-    if not _ix_bridge_loaded:
+    if not _loaded:
         _load_bridge()
-    return _ix_bridge_available
+    return _available
+
+
+def _get():
+    if not is_available():
+        raise RuntimeError("ix_bridge not available")
+    return _bridge
 
 
 # =========================================================================
-# Individual ops (thin wrappers with type safety)
+# MoE
 # =========================================================================
+def topk_softmax(gating_output, topk, renormalize=True):
+    return _get().topk_softmax(gating_output, topk, renormalize)
 
-def topk_softmax(
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Fused topk+softmax via ixformer::infer::topk_softmax.
-    Returns: (topk_weights [T, K] fp32, topk_ids [T, K] int32)
-    """
-    if not is_available():
-        raise RuntimeError("ix_moe_bridge not available — JIT compile failed")
-    return _ix_bridge.topk_softmax(gating_output, topk, renormalize)
+def moe_gen_idx(expert_id, expert_num):
+    return _get().moe_gen_idx(expert_id, expert_num)
 
+def moe_expand_input(input, gather_index, combine_idx, topk):
+    return _get().moe_expand_input(input, gather_index, combine_idx, topk)
 
-def moe_gen_idx(
-    expert_id: torch.Tensor,
-    expert_num: int,
-) -> List[torch.Tensor]:
-    """
-    Build expert permutation maps.
-    Returns: [src_dst, dst_src, expert_sizes, cumsum]
-    """
-    if not is_available():
-        raise RuntimeError("ix_moe_bridge not available")
-    return _ix_bridge.moe_gen_idx(expert_id, expert_num)
+def group_gemm(inputs, weights, token_count, output_n):
+    return _get().group_gemm(inputs, weights, token_count, output_n)
 
+def silu_and_mul(input):
+    return _get().silu_and_mul(input)
 
-def moe_expand_input(
-    input: torch.Tensor,
-    gather_index: torch.Tensor,
-    combine_idx: torch.Tensor,
-    topk: int,
-) -> torch.Tensor:
-    """Gather tokens by expert assignment."""
-    if not is_available():
-        raise RuntimeError("ix_moe_bridge not available")
-    return _ix_bridge.moe_expand_input(input, gather_index, combine_idx, topk)
+def moe_combine_result(input, weight):
+    return _get().moe_combine_result(input, weight)
 
-
-def group_gemm(
-    inputs: torch.Tensor,
-    weights: torch.Tensor,
-    token_count: torch.Tensor,
-    output_n: int,
-) -> torch.Tensor:
-    """Batched expert GEMM via ixformer."""
-    if not is_available():
-        raise RuntimeError("ix_moe_bridge not available")
-    return _ix_bridge.group_gemm(inputs, weights, token_count, output_n)
-
-
-def silu_and_mul(input: torch.Tensor) -> torch.Tensor:
-    """Fused SiLU gate activation."""
-    if not is_available():
-        raise RuntimeError("ix_moe_bridge not available")
-    return _ix_bridge.silu_and_mul(input)
-
-
-def moe_combine_result(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-) -> torch.Tensor:
-    """Weighted reduce for MoE output."""
-    if not is_available():
-        raise RuntimeError("ix_moe_bridge not available")
-    return _ix_bridge.moe_combine_result(input, weight)
-
+def fused_moe_forward(hidden_states, router_logits, w13, w2,
+                      topk, num_experts, renormalize=True):
+    return _get().fused_moe_forward(
+        hidden_states, router_logits, w13, w2, topk, num_experts, renormalize)
 
 # =========================================================================
-# Full fused MoE forward — replaces _pure_pytorch_experts() entirely
+# Attention
 # =========================================================================
+def paged_attention(output, query, key_cache, value_cache,
+                    num_kv_heads, scale, block_tables, seq_lens,
+                    block_size, max_context_len, alibi_slopes=None):
+    return _get().paged_attention(
+        output, query, key_cache, value_cache,
+        num_kv_heads, scale, block_tables, seq_lens,
+        block_size, max_context_len, alibi_slopes)
 
-def fused_moe_forward(
-    hidden_states: torch.Tensor,    # (T, H)
-    router_logits: torch.Tensor,    # (T, E)
-    w13: torch.Tensor,              # (E, 2*I, H) gate_up
-    w2: torch.Tensor,               # (E, H, I) down
-    topk: int,
-    num_experts: int,
-    renormalize: bool = True,
-) -> torch.Tensor:
-    """
-    Full fused MoE forward via ixformer C++ pipeline.
+def flash_attn_prefill(query, key, value, output, block_tables,
+                       cu_seq_q, cu_seq_k, max_query_len, max_seq_len,
+                       scale, is_causal=True, window_left=-1, window_right=-1):
+    return _get().flash_attn_prefill(
+        query, key, value, output, block_tables,
+        cu_seq_q, cu_seq_k, max_query_len, max_seq_len,
+        scale, is_causal, window_left, window_right)
 
-    Pipeline: topk → gen_idx → expand → gemm1(w13) → silu → gemm2(w2) → combine
+# =========================================================================
+# Norm
+# =========================================================================
+def rms_norm(output, input, weight, eps=1e-6):
+    return _get().rms_norm(output, input, weight, eps)
 
-    Returns: (T, H) — partial output, needs all-reduce after.
-    """
-    if not is_available():
-        raise RuntimeError("ix_moe_bridge not available")
-    return _ix_bridge.fused_moe_forward(
-        hidden_states, router_logits, w13, w2, topk, num_experts, renormalize
-    )
+def fused_add_rms_norm(input, residual, weight, output, residual_output, eps=1e-6):
+    return _get().fused_add_rms_norm(input, residual, weight, output, residual_output, eps)
+
+# =========================================================================
+# RoPE
+# =========================================================================
+def rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox=True):
+    return _get().rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox)
+
+# =========================================================================
+# Cache
+# =========================================================================
+def reshape_and_cache(key, value, key_cache, value_cache, slot_mapping):
+    return _get().reshape_and_cache(key, value, key_cache, value_cache, slot_mapping)
+
+# =========================================================================
+# Linear
+# =========================================================================
+def linear(input, weight, bias=None):
+    return _get().linear(input, weight, bias)
