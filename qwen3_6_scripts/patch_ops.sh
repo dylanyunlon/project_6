@@ -180,33 +180,21 @@ if [ -n "$VLLM2" ]; then
     cp ./chat_utils.py "$VLLM2/entrypoints/chat_utils.py" 2>/dev/null || true
 fi
 
-# corex_gdn.py + corex_moe.py: DO NOT overwrite base image originals!
-# Comp 168 log proves: base image's corex_gdn.py loads libcorex_gdn.so and works.
-# Our overwrite breaks the interface (CoreXGDN.__init__ signature mismatch).
-# Only deploy ours if base has NO corex modules at all.
-if [ ! -f "$VLLM/model_executor/models/corex_gdn.py" ]; then
-    cp "/workspace/ex_engine/python/corex_gdn.py" "$VLLM/model_executor/models/corex_gdn.py" 2>/dev/null || true
-    echo "[patch_ops] corex_gdn.py deployed (base had none)"
-fi
-if [ ! -f "$VLLM/model_executor/models/corex_moe.py" ]; then
-    cp "/workspace/ex_engine/python/corex_moe.py" "$VLLM/model_executor/models/corex_moe.py" 2>/dev/null || true
-    echo "[patch_ops] corex_moe.py deployed (base had none)"
-fi
-# corex_fa2.py: deploy if base doesn't have it
-# Comp 168 log: corex_fa2.py provides FA2 packed/paged/chunked dispatch
-if [ ! -f "$VLLM/model_executor/models/corex_fa2.py" ]; then
-    if [ -f "/workspace/ex_engine/python/corex_fa2.py" ]; then
-        cp "/workspace/ex_engine/python/corex_fa2.py" "$VLLM/model_executor/models/corex_fa2.py" 2>/dev/null || true
-        echo "[patch_ops] corex_fa2.py deployed (base had none)"
+# Deploy corex_gdn.py + corex_moe.py + corex_fa2.py → vllm model_executor/models/
+# MUST overwrite: base image's corex_gdn.py produces NaN (GDN frac=0.5000).
+# Our versions have fixed GDN math (fp32 accumulation, cumsum clamp).
+if [ -f "/workspace/ex_engine/python/corex_gdn.py" ]; then
+    cp "/workspace/ex_engine/python/corex_gdn.py" "$VLLM/model_executor/models/corex_gdn.py" && \
+        echo "[patch_ops] corex_gdn.py deployed (overwrites base — fixes NaN)"
+    cp "/workspace/ex_engine/python/corex_moe.py" "$VLLM/model_executor/models/corex_moe.py" && \
+        echo "[patch_ops] corex_moe.py deployed"
+    cp "/workspace/ex_engine/python/corex_fa2.py" "$VLLM/model_executor/models/corex_fa2.py" && \
+        echo "[patch_ops] corex_fa2.py deployed"
+    if [ -n "$VLLM2" ]; then
+        cp "/workspace/ex_engine/python/corex_gdn.py" "$VLLM2/model_executor/models/corex_gdn.py" 2>/dev/null || true
+        cp "/workspace/ex_engine/python/corex_moe.py" "$VLLM2/model_executor/models/corex_moe.py" 2>/dev/null || true
+        cp "/workspace/ex_engine/python/corex_fa2.py" "$VLLM2/model_executor/models/corex_fa2.py" 2>/dev/null || true
     fi
-fi
-echo "[patch_ops] CoreX modules: preserved base originals where they exist"
-if [ -n "$VLLM2" ]; then
-    for _CM in corex_gdn.py corex_moe.py corex_fa2.py; do
-        if [ -f "$VLLM/model_executor/models/$_CM" ] && [ ! -f "$VLLM2/model_executor/models/$_CM" ]; then
-            cp "$VLLM/model_executor/models/$_CM" "$VLLM2/model_executor/models/$_CM" 2>/dev/null || true
-        fi
-    done
 fi
 
 # Deploy EX Engine Python module + C++ bridge into vllm importable path
