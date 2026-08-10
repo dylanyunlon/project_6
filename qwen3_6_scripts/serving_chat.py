@@ -140,27 +140,10 @@ class OpenAIServingChat(OpenAIServing):
             model_config = self.model_config
             tokenizer = await self.engine_client.get_tokenizer(lora_request)
 
-            # CCCL graceful degradation: strip image_url when not multimodal.
-            # Handle is_multimodal_model as method, property, or bool.
-            _is_mm = False
-            try:
-                _mm_attr = getattr(model_config, 'is_multimodal_model', False)
-                _is_mm = _mm_attr() if callable(_mm_attr) else bool(_mm_attr)
-            except Exception:
-                pass
-            if not _is_mm:
-                for msg in request.messages:
-                    content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
-                    if isinstance(content, list):
-                        filtered = [p for p in content
-                                    if not (isinstance(p, dict) and p.get("type") == "image_url")]
-                        if len(filtered) < len(content):
-                            if not filtered:
-                                filtered = [{"type": "text", "text": "(image omitted)"}]
-                            if isinstance(msg, dict):
-                                msg["content"] = filtered
-                            else:
-                                msg.content = filtered
+            # Note: base image identifies this model as multimodal
+            # (docker log: "--enable-prefix-caching not supported for multimodal models").
+            # Do NOT strip image_url — let images flow through to the engine.
+            # Previous strip logic caused d05_multimodal HTTP 400.
 
             conversation, mm_data_future = parse_chat_messages_futures(
                 request.messages, model_config, tokenizer)
