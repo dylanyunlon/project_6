@@ -1,0 +1,74 @@
+include(cc_library)
+
+cc_library(
+  NAME
+    util
+  HDRS
+    concurrent_queue.h
+    blocking_counter.h
+    blockingconcurrentqueue.h
+    closure_guard.h
+    concurrentqueue.h
+    device_name_utils.h
+    double_buffer.h
+    env_var.h
+    hash_util.h
+    http_downloader.h
+    json_reader.h
+    model_config_utils.h
+    lightweightsemaphore.h
+    net.h
+    pretty_print.h
+    rec_model_utils.h
+    scope_guard.h
+    slice.h
+    spin_lock.h
+    spin_rw_lock.h
+    int32_map.h
+    suffix_decoding_cache.h
+    suffix_tree.h
+    tensor_helper.h
+    threadpool.h
+    timer.h
+    type_traits.h
+    utils.h
+    uuid.h
+    shared_memory_manager.h
+  SRCS
+    device_name_utils.cpp
+    env_var.cpp
+    http_downloader.cpp
+    # TODO. add following at next pr.
+    json_reader.cpp
+    model_config_utils.cpp
+    net.cpp
+    pretty_print.cpp
+    suffix_decoding_cache.cpp
+    suffix_tree.cpp
+    threadpool.cpp
+    timer.cpp
+    utils.cpp
+    uuid.cpp
+    shared_memory_manager.cpp
+  DEPS
+    torch
+    brpc
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    leveldb::leveldb
+    nlohmann_json::nlohmann_json
+    glog::glog
+    torch
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+    $<$<BOOL:${USE_NPU}>:ms_tools_ext>
+    Boost::serialization
+    absl::synchronization
+    ${Python_LIBRARIES}
+    proto::xllm_proto
+    :platform
+    SMHasherSupport
+    xxHash
+    spdlog::spdlog
+)
+
+add_dependencies(util brpc-static)

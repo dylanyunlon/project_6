@@ -1,0 +1,29 @@
+include(cc_library)
+
+cc_library(
+  NAME 
+    sampler
+  HDRS
+    sampling_params.h
+    logits_utils.h
+    rejection_sampler.h
+    sampler.h
+    rec_sampler.h
+    beam_searcher.h
+    rec_constrained_decoding.h
+  SRCS
+    sampling_params.cpp
+    logits_utils.cpp
+    rejection_sampler.cpp
+    sampler.cpp
+    rec_sampler.cpp
+    beam_searcher.cpp
+    rec_constrained_decoding.cpp
+  DEPS
+    :state_dict
+    :common
+    glog::glog
+    torch
+    :kernels
+    $<$<BOOL:${USE_NPU}>:xllm_ops>
+)

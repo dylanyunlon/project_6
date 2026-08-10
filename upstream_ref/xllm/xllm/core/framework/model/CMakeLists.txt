@@ -1,0 +1,26 @@
+include(cc_library)
+
+cc_library(
+  NAME 
+    model
+  HDRS
+    causal_lm.h
+    rec_causal_lm.h
+    causal_vlm.h
+    dit_model.h
+    mm_embedding_vlm.h
+    model_args.h
+    model_input_params.h
+  SRCS
+  DEPS
+    :common
+    :common_layers
+    :kv_cache
+    :parallel_state
+    :processors
+    :chat_template
+    glog::glog
+    torch
+    torch_python
+    $<$<BOOL:${USE_NPU}>:platform_npu>
+)

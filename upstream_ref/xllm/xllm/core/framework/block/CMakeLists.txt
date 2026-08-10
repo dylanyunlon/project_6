@@ -1,0 +1,33 @@
+include(cc_binary)
+include(cc_library)
+
+cc_library(
+  NAME 
+    block
+  HDRS
+    block.h
+    block_manager.h
+    single_block_manager.h
+    block_manager_pool.h
+    block_manager_impl.h
+    concurrent_block_manager_impl.h
+    hierarchy_block_manager_pool.h
+  SRCS 
+    block.cpp
+    single_block_manager.cpp
+    block_manager_pool.cpp
+    concurrent_block_manager_impl.cpp
+    block_manager_impl.cpp
+    hierarchy_block_manager_pool.cpp
+  DEPS
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+    $<$<BOOL:${USE_NPU}>:graph>
+    :request
+    :common
+    glog::glog
+    Boost::serialization
+    SMHasherSupport
+    torch
+    :xtensor
+)
+target_link_libraries(block PRIVATE Folly::folly)

@@ -1,0 +1,31 @@
+include(cc_library)
+
+cc_library(
+  NAME
+    kv_cache
+  HDRS
+    embedding_cache.h
+    indexed_kv_cache_impl.h
+    kv_cache.h
+    kv_cache_event.h
+    kv_cache_impl.h
+    kv_cache_shape.h
+    kv_cache_utils.h
+    linear_attention_kv_cache_impl.h
+    quantized_kv_cache_impl.h
+  SRCS
+    embedding_cache.cpp 
+    indexed_kv_cache_impl.cpp
+    kv_cache.cpp
+    kv_cache_impl.cpp
+    kv_cache_shape.cpp
+    kv_cache_utils.cpp
+    linear_attention_kv_cache_impl.cpp
+    quantized_kv_cache_impl.cpp
+  DEPS
+    :common
+    :xtensor
+    glog::glog
+    torch
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+)

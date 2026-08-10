@@ -1,0 +1,41 @@
+include(cc_library)
+
+if(USE_NPU)
+  add_subdirectory(npu)
+endif()
+
+cc_library(
+  NAME
+    platform
+  HDRS
+    stream.h
+    device.h
+    vmm_api.h
+    shared_vmm_allocator.h
+    vmm_torch_allocator.h
+    $<$<BOOL:${USE_MLU}>:mlu/mlu_layer_synchronizer.h>
+    $<$<BOOL:${USE_MLU}>:mlu/mlu_tensor_alloc.h>
+    $<$<BOOL:${USE_CUDA}>:cuda/cuda_utils.h>
+    $<$<OR:$<BOOL:${USE_CUDA}>,$<BOOL:${USE_MLU}>>:numa_utils.h>
+  SRCS
+    stream.cpp
+    device.cpp
+    vmm_api.cpp
+    shared_vmm_allocator.cpp
+    $<$<BOOL:${USE_MLU}>:mlu/mlu_layer_synchronizer.cpp>
+    $<$<BOOL:${USE_MLU}>:mlu/mlu_tensor_alloc.cpp>
+    $<$<OR:$<BOOL:${USE_CUDA}>,$<BOOL:${USE_MLU}>>:numa_utils.cpp>
+  DEPS
+    torch
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+    $<$<BOOL:${USE_NPU}>:ascendcl>
+    $<$<BOOL:${USE_MLU}>:torch_mlu>
+    $<$<BOOL:${USE_MLU}>:cnrt>
+    $<$<BOOL:${USE_MLU}>:cndrv>
+    $<$<OR:$<BOOL:${USE_CUDA}>,$<BOOL:${USE_ILU}>>:cuda>
+    $<$<OR:$<BOOL:${USE_CUDA}>,$<BOOL:${USE_ILU}>>:cudart>
+    $<$<OR:$<BOOL:${USE_CUDA}>,$<BOOL:${USE_MLU}>,$<BOOL:${USE_ILU}>>:numa>
+    $<$<BOOL:${USE_MUSA}>:musa>
+    $<$<BOOL:${USE_MUSA}>:musart>
+    $<$<BOOL:${USE_NPU}>:platform_npu>
+)
