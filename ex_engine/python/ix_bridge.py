@@ -57,21 +57,15 @@ def topk_softmax(gating_output: torch.Tensor, topk: int, renormalize: bool = Tru
     """
     Fused topk+softmax via ixformer C++ API.
     
-    Args:
-        gating_output: (num_tokens, num_experts) router logits
-        topk: number of experts to select
-        renormalize: whether to renormalize weights
-    
-    Returns:
-        (topk_weights, topk_indices) — both (num_tokens, topk)
+    FAIL FAST: if bridge not available, raises RuntimeError immediately.
+    No silent fallback — 0 score with no error log is worse than a crash.
     """
     if not _ix_bridge_available:
         if not _load_bridge():
-            # Fallback to pure PyTorch
-            probs = torch.softmax(gating_output.float(), dim=-1)
-            topk_w, topk_ids = torch.topk(probs, topk, dim=-1)
-            if renormalize:
-                topk_w = topk_w / topk_w.sum(dim=-1, keepdim=True)
-            return topk_w, topk_ids.to(torch.int32)
+            raise RuntimeError(
+                "ix_moe_bridge: FATAL — ixformer C++ topk_softmax not available. "
+                "JIT compile failed. Run probe_ixformer_symbols.py on real machine "
+                "to diagnose. Cannot fall back silently — would produce 0 score."
+            )
     
     return _ix_bridge.topk_softmax(gating_output, topk, renormalize)

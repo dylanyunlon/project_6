@@ -74,6 +74,7 @@ except ImportError:
 # ix_bridge: C++ bridge to ixformer::infer::topk_softmax (bypasses missing Python binding)
 _ix_bridge_module = None
 _ix_bridge_available = False
+_ix_topk_softmax = None
 try:
     from ex_engine.python.ix_bridge import topk_softmax as _ix_topk_softmax
     _ix_bridge_available = True
@@ -88,8 +89,11 @@ except ImportError:
         from ex_engine.python.ix_bridge import topk_softmax as _ix_topk_softmax
         _ix_bridge_available = True
         logger.info("ix_bridge: ixformer C++ topk_softmax available (deployed path)")
-    except ImportError:
-        logger.info("ix_bridge: not available, MoE uses PyTorch topk")
+    except ImportError as e:
+        # NOT silent: log the exact error so we can diagnose from docker logs
+        logger.warning(
+            "ix_bridge: IMPORT FAILED (%s). MoE will use PyTorch topk. "
+            "This is 3x slower. Run probe_ixformer_symbols.py to diagnose.", e)
 _corex_gdn_available = False
 _corex_moe_available = False
 
