@@ -312,6 +312,14 @@ class OpenAIServingChat(OpenAIServing):
             engine_inputs = TokensPrompt(
                 prompt_token_ids=prompt_inputs["prompt_token_ids"])
             if mm_data is not None:
+                # Protect engine from death: if model doesn't support multimodal,
+                # return 400 instead of crashing the entire engine.
+                # ValueError "image=0 but found 1" kills the async engine permanently.
+                mm_config = getattr(self.model_config, 'multimodal_config', None)
+                if mm_config is None:
+                    logger.warning("Image data in request but model has no multimodal_config — rejecting to protect engine")
+                    return self.create_error_response(
+                        "This model does not support multimodal (image) inputs.")
                 engine_inputs["multi_modal_data"] = mm_data
 
             is_tracing_enabled = (await
