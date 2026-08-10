@@ -459,20 +459,24 @@ class GatedDeltaNet(nn.Module):
         self.norm = Qwen3_5RMSNormGated(self.head_v_dim,
                                         eps=text_cfg.rms_norm_eps)
 
-        # CoreX dispatch — our corex_gdn.py is deployed, init MUST succeed
+        # CoreX dispatch: try to create fused GDN operator from base image
         self._use_corex_gdn = False
         if _corex_gdn_available and _corex_gdn_module is not None:
-            self._corex_gdn_obj = _corex_gdn_module.CoreXGDN(
-                num_v_heads=self.num_v_heads // tp_size,
-                num_k_heads=self.num_k_heads // tp_size,
-                head_k_dim=self.head_k_dim,
-                head_v_dim=self.head_v_dim,
-                conv_kernel_size=self.conv_kernel_size,
-                layer_idx=layer_idx,
-            )
-            self._use_corex_gdn = True
-            if layer_idx == 0:
-                logger.info("GatedDeltaNet: CoreX fused GDN enabled")
+            try:
+                self._corex_gdn_obj = _corex_gdn_module.CoreXGDN(
+                    num_v_heads=self.num_v_heads // tp_size,
+                    num_k_heads=self.num_k_heads // tp_size,
+                    head_k_dim=self.head_k_dim,
+                    head_v_dim=self.head_v_dim,
+                    conv_kernel_size=self.conv_kernel_size,
+                    layer_idx=layer_idx,
+                )
+                self._use_corex_gdn = True
+                logger.info("GatedDeltaNet layer %d: CoreX fused GDN enabled", layer_idx)
+            except Exception as e:
+                logger.warning(
+                    "GatedDeltaNet layer %d: CoreX GDN init failed (%s), using PyTorch",
+                    layer_idx, e)
 
     def _conv1d_weight_loader(self, param: torch.Tensor,
                               loaded_weight: torch.Tensor) -> None:
@@ -498,16 +502,22 @@ class GatedDeltaNet(nn.Module):
         conv_state: torch.Tensor,          # (batch, local_conv_dim, kernel-1)  in-place
         temporal_state: torch.Tensor,      # (batch, local_v_heads, k_dim, v_dim)  in-place
     ) -> torch.Tensor:
-        # CoreX dispatch — NO FALLBACK. 0 score with fallback = same as crash.
+        # CoreX dispatch: try fused GDN kernel first (CCCL env_dispatch pattern)
         if self._use_corex_gdn:
-            return self._corex_gdn_obj.forward(
-                hidden_states, attn_metadata,
-                conv_state, temporal_state,
-                self.in_proj_qkv, self.in_proj_z,
-                self.in_proj_b, self.in_proj_a,
-                self.conv1d_weight, self.A_log, self.dt_bias,
-                self.norm, self.out_proj,
-            )
+            try:
+                return self._corex_gdn_obj.forward(
+                    hidden_states, attn_metadata,
+                    conv_state, temporal_state,
+                    self.in_proj_qkv, self.in_proj_z,
+                    self.in_proj_b, self.in_proj_a,
+                    self.conv1d_weight, self.A_log, self.dt_bias,
+                    self.norm, self.out_proj,
+                )
+            except Exception as e:
+                if self.layer_idx == 0:
+                    logger.warning(
+                        "CoreX GDN forward failed (%s), falling back", e)
+                self._use_corex_gdn = False  # permanent fallback
 
         # flash_qla SM70 DISABLED: produces inf on BI-V100 (abs mean=inf from real test)
         # xllm uses equivalent PyTorch chunked path (qwen3_gated_delta_net_base.cpp)
@@ -1069,17 +1079,20 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         self.shared_expert_gate = ReplicatedLinear(
             hidden_size, 1, bias=False, quant_config=quant_config)
 
-        # CoreX dispatch — corex_moe.py is deployed, moe_forward MUST exist
+        # CoreX dispatch: try to use fused MoE kernels from base image
         self._use_corex_moe = False
         if _corex_moe_available and _corex_moe_module is not None:
-            self._corex_moe_forward = getattr(
-                _corex_moe_module, 'moe_forward', None)
-            if self._corex_moe_forward is not None:
-                self._use_corex_moe = True
-                if layer_idx == 0:
+            try:
+                # corex_moe module provides direct forward functions
+                self._corex_moe_forward = getattr(
+                    _corex_moe_module, 'moe_forward', None)
+                if self._corex_moe_forward is not None:
+                    self._use_corex_moe = True
                     logger.info("MoE: CoreX fused MoE forward available")
-            else:
-                raise RuntimeError("corex_moe module loaded but moe_forward missing")
+                else:
+                    logger.warning("MoE: corex_moe has no moe_forward, using PyTorch")
+            except Exception as e:
+                logger.warning("MoE: CoreX MoE init failed (%s), using PyTorch", e)
 
     def _pure_pytorch_experts(
         self,
