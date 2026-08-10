@@ -241,7 +241,21 @@ if [ -d "$EX_ENGINE_SRC/python" ]; then
     echo "[patch_ops] EX Engine Python package deployed to $EX_PY_DST"
 fi
 
-echo "[patch_ops] DONE — EX Engine + SM70 GDN kernel + serving layer deployed"
+# 7. Precompile MoE topk_softmax CUDA kernel (.cu → .so)
+# This replaces the missing ixf_F.vllm_moe_topk_softmax with our own CUDA kernel
+MOE_TOPK_CU="/workspace/ex_engine/csrc/moe_topk_softmax_v3.cu"
+if [ -f "$MOE_TOPK_CU" ]; then
+    echo "[patch_ops] Precompiling moe_topk_softmax_v3.cu ..."
+    python3 /workspace/ex_engine/precompile_moe_topk.py 2>&1 || \
+        echo "[patch_ops] WARNING: MoE topk precompile failed — will JIT at runtime"
+    # Also deploy .cu source to vllm for JIT fallback
+    cp "$MOE_TOPK_CU" "$VLLM/model_executor/models/" 2>/dev/null || true
+    if [ -n "$VLLM2" ]; then
+        cp "$MOE_TOPK_CU" "$VLLM2/model_executor/models/" 2>/dev/null || true
+    fi
+fi
+
+echo "[patch_ops] DONE — EX Engine + SM70 GDN kernel + MoE topk kernel + serving layer deployed"
 echo "[patch_ops] Deployed: qwen3_5.py, flash_qla_sm70, ex_engine factors, paged_attn.py, mamba_cache.py, sequence.py, scheduler.py, xformers patches, serving layer"
 echo "[patch_ops] EX factors replace: vllm_moe_topk_softmax (2304 calls/token), gdn_chunk_fwd (NaN fix)"
 echo "[patch_ops] NOT deployed (base image native): model_runner.py, _custom_ops.py, sampler.py, logits_processor.py, arg_utils.py"

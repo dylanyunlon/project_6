@@ -52,8 +52,16 @@ def _load_topk_kernel():
     # JIT compile from source
     cu_search = [
         "/workspace/ex_engine/csrc/moe_topk_softmax_v3.cu",
-        "/workspace/qwen3_6_scripts/../ex_engine/csrc/moe_topk_softmax_v3.cu",
+        # Deployed by patch_ops.sh into vllm models dir
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "moe_topk_softmax_v3.cu"),
     ]
+    # Also search in vllm model_executor/models/
+    try:
+        import vllm
+        vllm_models = os.path.join(os.path.dirname(vllm.__file__), "model_executor", "models")
+        cu_search.append(os.path.join(vllm_models, "moe_topk_softmax_v3.cu"))
+    except Exception:
+        pass
     for cu_path in cu_search:
         if os.path.isfile(cu_path):
             try:
