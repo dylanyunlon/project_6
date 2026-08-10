@@ -89,14 +89,23 @@ echo "[probe] === /usr/local/corex/ tree ==="
 find /usr/local/corex/lib64/ -name "*.so" 2>/dev/null | head -20 || echo "[probe] no .so in corex lib64"
 echo "[probe] ==========================="
 
-# 2. Model module — qwen3_5.py with CoreX dispatch (CCCL env_dispatch pattern).
-# Our version tries to import corex_gdn/corex_moe from the base image.
-# If they exist → uses fused CUDA kernels (10x faster).
-# If they don't exist → gracefully falls back to pure PyTorch.
-# ALWAYS deploy ours — it handles both scenarios correctly.
+# 2. Model module — qwen3_5.py
+# PRD: "条件部署：如果Docker镜像已有>1000字节的qwen3_5.py就不覆盖"
+# Sub168 proof: base image native qwen3_5.py with CoreX dispatch = ZERO NaN, 
+# 16.4 TPS. Our custom one = 99.98% NaN, ERROR spam. DO NOT OVERWRITE.
 _NATIVE_QW="$VLLM/model_executor/models/qwen3_5.py"
-cp ./qwen3_5.py "$_NATIVE_QW" 2>/dev/null && \
-    echo "[patch_ops] qwen3_5.py deployed (CoreX dispatch + PyTorch fallback)" || true
+if [ -f "$_NATIVE_QW" ]; then
+    _NATIVE_SIZE=$(stat -c%s "$_NATIVE_QW" 2>/dev/null || echo 0)
+    if [ "$_NATIVE_SIZE" -gt 1000 ]; then
+        echo "[patch_ops] KEEP base image qwen3_5.py ($_NATIVE_SIZE bytes) — proven by Sub168"
+    else
+        cp ./qwen3_5.py "$_NATIVE_QW" 2>/dev/null && \
+            echo "[patch_ops] qwen3_5.py deployed (base was stub: $_NATIVE_SIZE bytes)" || true
+    fi
+else
+    cp ./qwen3_5.py "$_NATIVE_QW" 2>/dev/null && \
+        echo "[patch_ops] qwen3_5.py deployed (base had no qwen3_5.py)" || true
+fi
 
 # 2b. Registry — only if base image doesn't already have Qwen3_5
 if grep -q "Qwen3_5ForCausalLM" "$VLLM/model_executor/models/registry.py" 2>/dev/null; then
@@ -163,7 +172,17 @@ done
 if [ -n "$VLLM2" ]; then
     echo "[patch_ops] Second vllm at: $VLLM2"
     _NATIVE_QW2="$VLLM2/model_executor/models/qwen3_5.py"
-    cp ./qwen3_5.py "$_NATIVE_QW2" 2>/dev/null || true
+    # Same conditional logic as primary vllm
+    if [ -f "$_NATIVE_QW2" ]; then
+        _SIZE2=$(stat -c%s "$_NATIVE_QW2" 2>/dev/null || echo 0)
+        if [ "$_SIZE2" -gt 1000 ]; then
+            echo "[patch_ops] KEEP VLLM2 qwen3_5.py ($_SIZE2 bytes)"
+        else
+            cp ./qwen3_5.py "$_NATIVE_QW2" 2>/dev/null || true
+        fi
+    else
+        cp ./qwen3_5.py "$_NATIVE_QW2" 2>/dev/null || true
+    fi
     if ! grep -q "Qwen3_5ForCausalLM" "$VLLM2/model_executor/models/registry.py" 2>/dev/null; then
         cp ./registry.py "$VLLM2/model_executor/models/registry.py" 2>/dev/null || true
     fi
@@ -241,7 +260,37 @@ if [ -d "$EX_ENGINE_SRC/python" ]; then
     echo "[patch_ops] EX Engine Python package deployed to $EX_PY_DST"
 fi
 
-# 7. Precompile MoE topk_softmax CUDA kernel (.cu → .so)
+# 7a. JIT compile ix_moe_bridge.cpp → .so (bridge to ixformer::infer C++ API)
+# This is CRITICAL: topk_softmax, group_gemm, etc. are ONLY accessible via C++
+IX_MOE_BRIDGE_CPP="/workspace/ex_engine/csrc/ix_moe_bridge.cpp"
+if [ -f "$IX_MOE_BRIDGE_CPP" ]; then
+    echo "[patch_ops] Pre-compiling ix_moe_bridge.cpp (ixformer C++ bridge)..."
+    python3 -c "
+import torch
+from torch.utils.cpp_extension import load
+try:
+    bridge = load(
+        name='ix_moe_bridge',
+        sources=['$IX_MOE_BRIDGE_CPP'],
+        extra_include_paths=['/usr/local/corex/include'],
+        extra_ldflags=[
+            '-L/usr/local/corex/lib64',
+            '-L/usr/local/corex/lib64/python3/dist-packages/ixformer',
+            '-lixformer',
+            '-Wl,-rpath,/usr/local/corex/lib64/python3/dist-packages/ixformer',
+        ],
+        verbose=True,
+    )
+    print('[patch_ops] ix_moe_bridge compiled successfully')
+    # Test basic function availability
+    print(f'[patch_ops] Bridge functions: {[x for x in dir(bridge) if not x.startswith(\"_\")]}')
+except Exception as e:
+    print(f'[patch_ops] WARNING: ix_moe_bridge compile failed: {e}')
+    print('[patch_ops] topk_softmax will use PyTorch fallback')
+" 2>&1 || echo "[patch_ops] WARNING: ix_moe_bridge pre-compile step failed"
+fi
+
+# 7b. Precompile MoE topk_softmax CUDA kernel (.cu → .so)
 # This replaces the missing ixf_F.vllm_moe_topk_softmax with our own CUDA kernel
 MOE_TOPK_CU="/workspace/ex_engine/csrc/moe_topk_softmax_v3.cu"
 if [ -f "$MOE_TOPK_CU" ]; then
