@@ -789,9 +789,43 @@ def moe_align_block_size(topk_ids: torch.Tensor, num_experts: int,
                          block_size: int, sorted_token_ids: torch.Tensor,
                          experts_ids: torch.Tensor,
                          num_tokens_post_pad: torch.Tensor) -> None:
-    ixf_F.vllm_moe_align_block_size(topk_ids, num_experts, block_size,
-                                      sorted_token_ids, experts_ids,
-                                      num_tokens_post_pad)
+    # PyTorch implementation of moe_align_block_size.
+    # Sort tokens by expert assignment with block-aligned padding.
+    # This is the same logic as vllm's CUDA kernel but in Python.
+    max_num_tokens_padded = sorted_token_ids.numel()
+    num_tokens = topk_ids.numel()
+    
+    # Count tokens per expert
+    tokens_per_expert = torch.zeros(num_experts, dtype=torch.int32, device=topk_ids.device)
+    for i in range(num_tokens):
+        tokens_per_expert[topk_ids.view(-1)[i]] += 1
+    
+    # Compute padded counts (align to block_size)
+    cumsum = 0
+    sorted_idx = 0
+    for expert_id in range(num_experts):
+        # Collect all tokens for this expert
+        cnt = tokens_per_expert[expert_id].item()
+        for i in range(num_tokens):
+            if topk_ids.view(-1)[i].item() == expert_id:
+                if sorted_idx < max_num_tokens_padded:
+                    sorted_token_ids[sorted_idx] = i
+                    sorted_idx += 1
+        # Pad to block_size boundary
+        padded_cnt = ((cnt + block_size - 1) // block_size) * block_size
+        for _ in range(padded_cnt - cnt):
+            if sorted_idx < max_num_tokens_padded:
+                sorted_token_ids[sorted_idx] = num_tokens  # padding sentinel
+                sorted_idx += 1
+        # Expert id for each block
+        num_blocks = padded_cnt // block_size
+        for b in range(num_blocks):
+            block_idx = cumsum // block_size + b
+            if block_idx < experts_ids.numel():
+                experts_ids[block_idx] = expert_id
+        cumsum += padded_cnt
+    
+    num_tokens_post_pad.fill_(sorted_idx)
 
 
 def invoke_fused_moe_kernel(
@@ -812,19 +846,48 @@ def invoke_fused_moe_kernel(
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
 ) -> None:
-    ixf_F.vllm_invoke_fused_moe_kernel(
-        A,
-        B,
-        C,
-        topk_weights,
-        topk_ids,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        mul_routed_weight,
-        top_k,
-        config['BLOCK_SIZE_M']
-    )
+    # PyTorch implementation of fused MoE GEMM kernel.
+    # For each block of sorted tokens belonging to the same expert,
+    # compute C[token] = A[token] @ B[expert].T (optionally weighted).
+    #
+    # This replaces the Triton/CUDA fused_moe_kernel that base image expects
+    # via ixf_F.vllm_invoke_fused_moe_kernel (which doesn't exist).
+    num_tokens = A.shape[0]
+    block_size = config.get('BLOCK_SIZE_M', 64)
+    num_valid = num_tokens_post_padded.item() if isinstance(num_tokens_post_padded, torch.Tensor) else num_tokens_post_padded
+    num_blocks = (num_valid + block_size - 1) // block_size
+    
+    for block_idx in range(min(num_blocks, expert_ids.numel())):
+        expert_id = expert_ids[block_idx].item()
+        start = block_idx * block_size
+        end = min(start + block_size, num_valid)
+        
+        # Get token indices for this block
+        token_indices = sorted_token_ids[start:end]
+        # Filter out padding sentinels (index >= num_tokens)
+        valid_mask = token_indices < num_tokens
+        if not valid_mask.any():
+            continue
+        valid_indices = token_indices[valid_mask].long()
+        
+        # Gather input tokens
+        a_block = A[valid_indices]  # (valid_count, K)
+        # Expert weight: B is (num_experts, N, K) → B[expert_id] is (N, K)
+        w = B[expert_id]  # (N, K)
+        # GEMM: output = input @ weight.T
+        out = torch.matmul(a_block.to(w.dtype), w.t())  # (valid_count, N)
+        
+        if mul_routed_weight:
+            # Apply routing weights
+            # valid_indices are flattened (token_idx * top_k + k)
+            # We need to map back to (token_idx, k) to get the weight
+            token_idx = valid_indices // top_k
+            k_idx = valid_indices % top_k
+            weights = topk_weights[token_idx, k_idx].unsqueeze(1).to(out.dtype)
+            out = out * weights
+        
+        # Scatter back
+        C[valid_indices] = out.to(C.dtype)
 
 
 # ---------- topk_softmax: CUDA kernel → PyTorch fallback ----------
