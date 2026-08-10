@@ -1,5 +1,6 @@
 # Exclude everything not needed for the Docker image
 cccl_upstream/
+upstream_ref/
 vllm/
 muh/
 docs/
@@ -14,4 +15,6 @@ vllm_adapter/
 .gitignore
 __pycache__/
 *.pyc
-# Keep: qwen3_6_scripts/, computility-run.yaml, Dockerfile, launch_service
+debug_*.py
+verify_*.py
+# Keep: qwen3_6_scripts/, computility-run.yaml, Dockerfile, ex_engine/
