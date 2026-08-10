@@ -188,9 +188,12 @@ if [ -d "./flash_qla_sm70" ]; then
     rm -rf "$FLASH_QLA_DST" 2>/dev/null
     cp -r ./flash_qla_sm70 "$FLASH_QLA_DST" 2>/dev/null && \
         echo "[patch_ops] flash_qla_sm70 deployed to $FLASH_QLA_DST" || true
+    # Pre-compile CUDA kernel → .so (skipped if no GPU/compiler at build time)
+    python3 ./precompile_gdn.py "$FLASH_QLA_DST" 2>&1 || \
+        echo "[patch_ops] WARNING: precompile failed — kernel will JIT at runtime"
     # Also deploy to VLLM2 if present
     if [ -n "$VLLM2" ]; then
         rm -rf "$VLLM2/model_executor/models/flash_qla_sm70" 2>/dev/null
-        cp -r ./flash_qla_sm70 "$VLLM2/model_executor/models/flash_qla_sm70" 2>/dev/null || true
+        cp -r "$FLASH_QLA_DST" "$VLLM2/model_executor/models/flash_qla_sm70" 2>/dev/null || true
     fi
 fi

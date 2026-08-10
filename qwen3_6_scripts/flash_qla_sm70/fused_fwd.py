@@ -20,6 +20,24 @@ def _load_ext():
         raise RuntimeError("SM70 FlashQLA backend requires CUDA.")
 
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "7.0;7.5")
+
+    # Try precompiled .so first (built during docker build)
+    build_dir = Path(__file__).with_name("build")
+    if build_dir.is_dir():
+        so_files = list(build_dir.glob("*.so"))
+        if so_files:
+            try:
+                _EXT = load(
+                    name="flash_qla_sm70_gdn_strided",
+                    sources=[],  # empty — just load from build_directory
+                    build_directory=str(build_dir),
+                    verbose=False,
+                )
+                return _EXT
+            except Exception:
+                pass  # fall through to JIT
+
+    # JIT compile (slow, ~2min first time)
     src = Path(__file__).with_name("csrc") / "gdn_forward.cu"
     _EXT = load(
         name="flash_qla_sm70_gdn_strided",
