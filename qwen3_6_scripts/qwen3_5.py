@@ -163,8 +163,8 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 def _ix_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """BI-V100 accelerated matmul via ixformer, fallback to torch."""
-    if _ix_available:
+    """BI-V100 accelerated matmul via ixformer. Only for half — ixformer rejects float32."""
+    if _ix_available and a.dtype == torch.float16:
         try:
             return _ix.matmul(a, b)
         except Exception:
@@ -172,8 +172,8 @@ def _ix_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.matmul(a, b)
 
 def _ix_bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Batched matmul — ixformer.matmul handles batched inputs."""
-    if _ix_available:
+    """Batched matmul — ixformer.matmul handles batched half inputs."""
+    if _ix_available and a.dtype == torch.float16:
         try:
             return _ix.matmul(a, b)
         except Exception:
@@ -181,8 +181,8 @@ def _ix_bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.matmul(a, b)
 
 def _ix_softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """BI-V100 accelerated softmax via ixformer."""
-    if _ix_available:
+    """BI-V100 accelerated softmax via ixformer. Only for half."""
+    if _ix_available and x.dtype == torch.float16:
         try:
             return _ix.softmax(x, dim=dim)
         except Exception:
