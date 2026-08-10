@@ -8,14 +8,17 @@ command:
     - --served-model-name
     - llm
     - --max-model-len
-    - '80000'
+    - '256000'
     - --gpu-memory-utilization
-    - '0.9'
+    - '0.95'
     - --trust-remote-code
     - -tp
     - '4'
     - --max-num-seqs
     - '2'
+    - --max-num-batched-tokens
+    - '4096'
+    - --enable-chunked-prefill
     - --disable-log-requests
     - --disable-frontend-multiprocessing
     - --enforce-eager
@@ -39,17 +42,7 @@ env:
     - name: PYTHONPATH
       value: /usr/local/corex/lib/python3/dist-packages:/usr/local/corex/lib64/python3/dist-packages
     - name: LD_LIBRARY_PATH
-      value: /usr/local/corex/lib64:/usr/local/openmpi/lib
-    - name: VLLM_COREX_FA2_LIBRARY
-      value: /usr/local/corex/lib64/libcorex_fa2.so
-    - name: VLLM_COREX_GDN_LIBRARY
-      value: /usr/local/corex/lib64/libcorex_gdn.so
-    - name: VLLM_COREX_MOE_LIBRARY
-      value: /usr/local/corex/lib64/libcorex_moe.so
-    - name: VLLM_REQUEST_METRICS_FILE
-      value: /tmp/vllm-request-metrics.jsonl
-    - name: VLLM_CACHE_BLOCK_SIZE
-      value: '16'
+      value: /usr/local/corex/lib64:/usr/local/openmpi/lib:/usr/local/corex/lib64/python3/dist-packages/ixformer
     - name: PYTORCH_CUDA_ALLOC_CONF
       value: max_split_size_mb:512
     - name: OMP_NUM_THREADS
