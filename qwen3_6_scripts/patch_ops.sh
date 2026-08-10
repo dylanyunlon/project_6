@@ -21,7 +21,7 @@
 # qwen3_5.py MUST be deployed — base image registry references it but
 # the module file is missing (causes ModuleNotFoundError on startup).
 #
-# DO NOT deploy: model_runner.py, _custom_ops.py,
+# DO NOT deploy: model_runner.py,
 #   sampler.py, scheduler.py, sequence.py, xformers.py, paged_attn.py,
 #   prefix_prefill.py, logits_processor.py, mamba_cache.py, arg_utils.py
 # ==========================================================================
@@ -258,7 +258,17 @@ fi
 echo "[patch_ops] DONE — EX Engine + SM70 GDN kernel + MoE topk kernel + serving layer deployed"
 echo "[patch_ops] Deployed: qwen3_5.py, flash_qla_sm70, ex_engine factors, paged_attn.py, mamba_cache.py, sequence.py, scheduler.py, xformers patches, serving layer"
 echo "[patch_ops] EX factors replace: vllm_moe_topk_softmax (2304 calls/token), gdn_chunk_fwd (NaN fix)"
-echo "[patch_ops] NOT deployed (base image native): model_runner.py, _custom_ops.py, sampler.py, logits_processor.py, arg_utils.py"
+# Deploy patched _custom_ops.py — fixes topk_softmax ERROR log spam
+# Base image ixf_F.vllm_moe_topk_softmax is missing; our patch tries
+# ixformer._C.topk_softmax first, then silent PyTorch fallback.
+cp ./_custom_ops.py "$VLLM/_custom_ops.py" 2>/dev/null && \
+    echo "[patch_ops] _custom_ops.py deployed (topk_softmax fix)" || \
+    echo "[patch_ops] WARNING: _custom_ops.py deploy failed"
+if [ -n "$VLLM2" ]; then
+    cp ./_custom_ops.py "$VLLM2/_custom_ops.py" 2>/dev/null || true
+fi
+
+echo "[patch_ops] NOT deployed (base image native): model_runner.py, sampler.py, logits_processor.py, arg_utils.py"
 
 # Deploy flash_qla SM70 GDN kernel (from 1Cat-vLLM, MIT license)
 # This is a fused CUDA kernel for GatedDeltaNet on SM70/SM75 (V100/BI-V100)
