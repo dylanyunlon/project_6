@@ -7,6 +7,10 @@ COPY ./qwen3_6_scripts /workspace/qwen3_6_scripts
 COPY ./computility-run.yaml /workspace/computility-run.yaml
 COPY ./ex_engine /workspace/ex_engine
 
+RUN apt-get update -qq && \
+    apt-get install -y -qq gcc ninja-build && \
+    rm -rf /var/lib/apt/lists/*
+
 RUN chmod +x /workspace/ex_engine/build.sh && \
     bash /workspace/ex_engine/build.sh --corex
 
