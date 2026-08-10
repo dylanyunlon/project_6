@@ -155,7 +155,12 @@ def _torch_chunk_gated_delta_rule(
     value: torch.Tensor,   # (batch, seq, num_heads, head_v_dim)
     g: torch.Tensor,       # (batch, seq, num_heads)
     beta: torch.Tensor,    # (batch, seq, num_heads)
-    chunk_size: int = 64,
+    # CCCL agent_radix_sort_upsweep overflow pattern: UNROLL_COUNT = min(64, 255/KEYS_PER_THREAD)
+    # prevents counter overflow by limiting accumulation steps.
+    # Same principle: chunk_size limits cumsum steps. With pre-clamp [-5,2]:
+    #   chunk=64: worst cumsum = 64*2 = 128 → exp(128) = inf
+    #   chunk=16: worst cumsum = 16*2 = 32  → clamp(-20,20) catches it
+    chunk_size: int = 16,
     initial_state: Optional[torch.Tensor] = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
