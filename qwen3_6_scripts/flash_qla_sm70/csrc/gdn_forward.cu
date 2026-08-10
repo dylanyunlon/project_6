@@ -135,7 +135,7 @@ __global__ void gdn_forward_kernel(const scalar_t* __restrict__ q,
     float beta_value = 0.0F;
     if (threadIdx.x == 0) {
       const float gate_raw = load_as_float(gate, gate_index);
-      { const float gc = fminf(fmaxf(gate_raw, -5.0F), 2.0F); gate_value = GateIsExp ? fminf(gate_raw, 7.389F) : __expf(gc); }
+      { const float gc = fminf(fmaxf(gate_raw, -5.0F), 0.0F); gate_value = GateIsExp ? fminf(gate_raw, 1.0F) : __expf(gc); }
       beta_value = load_as_float(beta, gate_index);
     }
     gate_value = __shfl_sync(0xffffffffU, gate_value, 0);
@@ -191,7 +191,7 @@ __global__ void gdn_forward_kernel(const scalar_t* __restrict__ q,
       for (int c = 0; c < COLS; ++c) {
         const float new_state =
             fmaf(k_reg[r], delta[c], gate_value * state_shard[c][r]);
-        state_shard[c][r] = fminf(fmaxf(new_state, -65504.0F), 65504.0F);
+        state_shard[c][r] = fminf(fmaxf(new_state, -100.0F), 100.0F);
         attn_partial[c] += new_state * q_reg[r];
       }
     }
@@ -294,7 +294,7 @@ __global__ void gdn_forward_vlk_varlen_kernel(
     float beta_value = 0.0F;
     if (threadIdx.x == 0) {
       const float gate_raw = load_as_float(gate, gate_index);
-      { const float gc = fminf(fmaxf(gate_raw, -5.0F), 2.0F); gate_value = GateIsExp ? fminf(gate_raw, 7.389F) : __expf(gc); }
+      { const float gc = fminf(fmaxf(gate_raw, -5.0F), 0.0F); gate_value = GateIsExp ? fminf(gate_raw, 1.0F) : __expf(gc); }
       beta_value = load_as_float(beta, gate_index);
     }
     gate_value = __shfl_sync(0xffffffffU, gate_value, 0);
@@ -350,7 +350,7 @@ __global__ void gdn_forward_vlk_varlen_kernel(
       for (int c = 0; c < COLS; ++c) {
         const float new_state =
             fmaf(k_reg[r], delta[c], gate_value * state_shard[c][r]);
-        state_shard[c][r] = fminf(fmaxf(new_state, -65504.0F), 65504.0F);
+        state_shard[c][r] = fminf(fmaxf(new_state, -100.0F), 100.0F);
         attn_partial[c] += new_state * q_reg[r];
       }
     }
@@ -543,7 +543,7 @@ __global__ void gdn_decode_mixed_qkv_global_state_kernel(
     for (int c = 0; c < COLS; ++c) {
       const float new_state =
           fmaf(k_reg[r], delta[c], gate_value * state_shard[c][r]);
-      state_shard[c][r] = fminf(fmaxf(new_state, -65504.0F), 65504.0F);
+      state_shard[c][r] = fminf(fmaxf(new_state, -100.0F), 100.0F);
       attn_partial[c] += new_state * q_reg[r];
     }
   }
@@ -765,7 +765,7 @@ __global__ void gdn_decode_mixed_qkv_ddtree_state_kernel(
       for (int c = 0; c < COLS; ++c) {
         const float new_state =
             fmaf(k_reg[r], delta[c], gate_value * state_shard[c][r]);
-        state_shard[c][r] = fminf(fmaxf(new_state, -65504.0F), 65504.0F);
+        state_shard[c][r] = fminf(fmaxf(new_state, -100.0F), 100.0F);
         attn_partial[c] += new_state * q_reg[r];
       }
     }
