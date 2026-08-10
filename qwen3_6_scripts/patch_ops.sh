@@ -90,14 +90,23 @@ find /usr/local/corex/lib64/ -name "*.so" 2>/dev/null | head -20 || echo "[probe
 echo "[probe] ==========================="
 
 # 2. Model module — qwen3_5.py
-# Base image qwen3_5.py (81706 bytes) has NaN in GDN:
-#   CoreXGDN.__init__() got unexpected keyword argument 'num_v_heads'
-#   → all GDN layers fallback to base's PyTorch GDN → NaN frac=0.5000
-# Our version fixes the GDN math (xllm-aligned cumsum + difference form).
-# ALWAYS deploy ours.
+# EVIDENCE: comp 168 uses base image qwen3_5.py (81706 bytes) → 48/52 pass, no NaN, 8.49s d01
+# Our qwen3_5.py LACKS multimodal support → engine death on image request (d05/t13 FAIL)
+# Our qwen3_5.py LACKS proper CoreX GDN/MoE/FA2 integration → 95s d01 (11x slower)
+# KEEP base image version. Only deploy ours if base has no qwen3_5.py.
 _NATIVE_QW="$VLLM/model_executor/models/qwen3_5.py"
-cp ./qwen3_5.py "$_NATIVE_QW" && \
-    echo "[patch_ops] qwen3_5.py deployed (replaces base — fixes GDN NaN)"
+if [ -f "$_NATIVE_QW" ]; then
+    _NATIVE_SIZE=$(stat -c%s "$_NATIVE_QW" 2>/dev/null || echo 0)
+    if [ "$_NATIVE_SIZE" -gt 1000 ]; then
+        echo "[patch_ops] KEEP base image qwen3_5.py ($_NATIVE_SIZE bytes) — proven by comp 168 (48/52 pass)"
+    else
+        cp ./qwen3_5.py "$_NATIVE_QW" && \
+            echo "[patch_ops] qwen3_5.py deployed (base was stub: $_NATIVE_SIZE bytes)"
+    fi
+else
+    cp ./qwen3_5.py "$_NATIVE_QW" && \
+        echo "[patch_ops] qwen3_5.py deployed (base had no qwen3_5.py)"
+fi
 
 # 2b. Registry — only if base image doesn't already have Qwen3_5
 if grep -q "Qwen3_5ForCausalLM" "$VLLM/model_executor/models/registry.py" 2>/dev/null; then
@@ -181,21 +190,33 @@ if [ -n "$VLLM2" ]; then
 fi
 
 # Deploy corex_gdn.py + corex_moe.py + corex_fa2.py → vllm model_executor/models/
-# MUST overwrite: base image's corex_gdn.py produces NaN (GDN frac=0.5000).
-# Our versions have fixed GDN math (fp32 accumulation, cumsum clamp).
-if [ -f "/workspace/ex_engine/python/corex_gdn.py" ]; then
-    cp "/workspace/ex_engine/python/corex_gdn.py" "$VLLM/model_executor/models/corex_gdn.py" && \
-        echo "[patch_ops] corex_gdn.py deployed (overwrites base — fixes NaN)"
-    cp "/workspace/ex_engine/python/corex_moe.py" "$VLLM/model_executor/models/corex_moe.py" && \
-        echo "[patch_ops] corex_moe.py deployed"
-    cp "/workspace/ex_engine/python/corex_fa2.py" "$VLLM/model_executor/models/corex_fa2.py" && \
-        echo "[patch_ops] corex_fa2.py deployed"
-    if [ -n "$VLLM2" ]; then
-        cp "/workspace/ex_engine/python/corex_gdn.py" "$VLLM2/model_executor/models/corex_gdn.py" 2>/dev/null || true
-        cp "/workspace/ex_engine/python/corex_moe.py" "$VLLM2/model_executor/models/corex_moe.py" 2>/dev/null || true
-        cp "/workspace/ex_engine/python/corex_fa2.py" "$VLLM2/model_executor/models/corex_fa2.py" 2>/dev/null || true
+# EVIDENCE: comp 168 uses base image corex modules with real C++ kernels (libcorex_gdn.so)
+# → d01 in 8.49s, corex_gdn.py:56 "Loaded fused CoreX GDN decode operator"
+# Our Python fallback versions are 11x slower (d01 in 95.87s).
+# KEEP base image versions if they exist and are non-trivial.
+for _COREX_MOD in corex_gdn.py corex_moe.py corex_fa2.py; do
+    _NATIVE="$VLLM/model_executor/models/$_COREX_MOD"
+    _OURS="/workspace/ex_engine/python/$_COREX_MOD"
+    if [ -f "$_NATIVE" ]; then
+        _SZ=$(stat -c%s "$_NATIVE" 2>/dev/null || echo 0)
+        if [ "$_SZ" -gt 500 ]; then
+            echo "[patch_ops] KEEP base $_COREX_MOD ($_SZ bytes) — real C++ kernel dispatch"
+        elif [ -f "$_OURS" ]; then
+            cp "$_OURS" "$_NATIVE" && echo "[patch_ops] $_COREX_MOD deployed (base was stub: $_SZ bytes)"
+        fi
+    elif [ -f "$_OURS" ]; then
+        cp "$_OURS" "$_NATIVE" && echo "[patch_ops] $_COREX_MOD deployed (base had none)"
     fi
-fi
+    # Mirror to VLLM2
+    if [ -n "$VLLM2" ]; then
+        _NATIVE2="$VLLM2/model_executor/models/$_COREX_MOD"
+        if [ -f "$_NATIVE2" ]; then
+            _SZ2=$(stat -c%s "$_NATIVE2" 2>/dev/null || echo 0)
+            [ "$_SZ2" -gt 500 ] && continue
+        fi
+        [ -f "$_OURS" ] && cp "$_OURS" "$_NATIVE2" 2>/dev/null || true
+    fi
+done
 
 # Deploy EX Engine Python module + C++ bridge into vllm importable path
 EX_ENGINE_SRC="/workspace/ex_engine"
@@ -268,15 +289,9 @@ fi
 echo "[patch_ops] DONE — EX Engine + SM70 GDN kernel + MoE topk kernel + serving layer deployed"
 echo "[patch_ops] Deployed: qwen3_5.py, flash_qla_sm70, ex_engine factors, paged_attn.py, mamba_cache.py, sequence.py, scheduler.py, xformers patches, serving layer"
 echo "[patch_ops] EX factors replace: vllm_moe_topk_softmax (2304 calls/token), gdn_chunk_fwd (NaN fix)"
-# Deploy patched _custom_ops.py — fixes topk_softmax ERROR log spam
-# Base image ixf_F.vllm_moe_topk_softmax is missing; our patch tries
-# ixformer._C.topk_softmax first, then silent PyTorch fallback.
-cp ./_custom_ops.py "$VLLM/_custom_ops.py" 2>/dev/null && \
-    echo "[patch_ops] _custom_ops.py deployed (topk_softmax fix)" || \
-    echo "[patch_ops] WARNING: _custom_ops.py deploy failed"
-if [ -n "$VLLM2" ]; then
-    cp ./_custom_ops.py "$VLLM2/_custom_ops.py" 2>/dev/null || true
-fi
+# _custom_ops.py — comp 168 has the same topk_softmax ERROR spam but still works (48/52 pass).
+# Do NOT overwrite. The base image handles it via its own fallback chain.
+echo "[patch_ops] KEEP base _custom_ops.py — comp 168 proves ERROR spam is harmless"
 
 echo "[patch_ops] NOT deployed (base image native): model_runner.py, sampler.py, logits_processor.py, arg_utils.py"
 
