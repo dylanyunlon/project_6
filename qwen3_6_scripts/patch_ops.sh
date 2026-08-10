@@ -77,18 +77,30 @@ python3 ./patch_xformers_sdpa_seq.py 2>&1 || true
 python3 ./patch_xformers_sdpa_batch.py 2>&1 || true
 echo "[patch_ops] xformers patches applied"
 
-# 2e. model_runner prefix_cache_hit fix
+# 2e. paged_attn.py — CRITICAL: base image uses Triton context_attention_fwd which hangs BI-V100
+cp ./paged_attn.py "$VLLM/attention/ops/paged_attn.py" && \
+    echo "[patch_ops] paged_attn.py deployed (replaces Triton context_attention_fwd with PyTorch)"
+[ -n "$VLLM2" ] && cp ./paged_attn.py "$VLLM2/attention/ops/paged_attn.py" 2>/dev/null || true
+
+# 2f. prefix_prefill.py — provides context_attention_fwd if anything still imports it
+if [ -f "./prefix_prefill.py" ]; then
+    cp ./prefix_prefill.py "$VLLM/attention/ops/prefix_prefill.py" && \
+        echo "[patch_ops] prefix_prefill.py deployed"
+    [ -n "$VLLM2" ] && cp ./prefix_prefill.py "$VLLM2/attention/ops/prefix_prefill.py" 2>/dev/null || true
+fi
+
+# 2g. model_runner prefix_cache_hit fix
 python3 ./patch_model_runner.py 2>&1 || true
 
-# 2f. mamba_cache (GDN state management)
+# 2h. mamba_cache (GDN state management)
 cp ./mamba_cache.py "$VLLM/model_executor/models/mamba_cache.py" 2>/dev/null && \
     echo "[patch_ops] mamba_cache.py deployed"
 
-# 2g. sequence.py (token count fix)
+# 2i. sequence.py (token count fix)
 cp ./sequence.py "$VLLM/sequence.py" 2>/dev/null && \
     echo "[patch_ops] sequence.py deployed"
 
-# 2h. scheduler.py (cache metrics)
+# 2j. scheduler.py (cache metrics)
 cp ./scheduler.py "$VLLM/core/scheduler.py" 2>/dev/null && \
     echo "[patch_ops] scheduler.py deployed"
 
