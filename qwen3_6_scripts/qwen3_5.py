@@ -737,6 +737,9 @@ class GatedDeltaNet(nn.Module):
                 # Gate + norm + output proj
                 z = z_all[s:e].reshape(seq_len, local_num_v, self.head_v_dim)
                 core_out = core_out.reshape(seq_len, local_num_v, self.head_v_dim)
+                # Force fp16 — ixformer matmul requires kHalf
+                core_out = core_out.to(torch.float16)
+                z = z.to(torch.float16)
                 normed = self.norm(
                     core_out.reshape(-1, self.head_v_dim),
                     z.reshape(-1, self.head_v_dim))
