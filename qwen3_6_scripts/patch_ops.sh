@@ -175,6 +175,22 @@ if [ -n "$VLLM2" ]; then
     cp ./chat_utils.py "$VLLM2/entrypoints/chat_utils.py" 2>/dev/null || true
 fi
 
-echo "[patch_ops] DONE — all patches deployed"
-echo "[patch_ops] Deployed: qwen3_5.py, paged_attn.py, mamba_cache.py, sequence.py, scheduler.py, xformers patches, tool/reasoning parsers, serving layer"
-echo "[patch_ops] NOT deployed (using base image native): model_runner.py, _custom_ops.py, sampler.py, logits_processor.py, arg_utils.py"
+echo "[patch_ops] DONE — SM70 GDN kernel + serving layer + engine patches deployed"
+echo "[patch_ops] Deployed: qwen3_5.py, flash_qla_sm70 (SM70 GDN CUDA kernel), paged_attn.py, mamba_cache.py, sequence.py, scheduler.py, xformers patches, serving layer"
+echo "[patch_ops] SM70 GDN kernel: JIT compiles on first forward pass (~2min), then cached"
+echo "[patch_ops] NOT deployed (base image native): model_runner.py, _custom_ops.py, sampler.py, logits_processor.py, arg_utils.py"
+
+# Deploy flash_qla SM70 GDN kernel (from 1Cat-vLLM, MIT license)
+# This is a fused CUDA kernel for GatedDeltaNet on SM70/SM75 (V100/BI-V100)
+# JIT compiled at runtime via torch.utils.cpp_extension.load()
+FLASH_QLA_DST="$VLLM/model_executor/models/flash_qla_sm70"
+if [ -d "./flash_qla_sm70" ]; then
+    rm -rf "$FLASH_QLA_DST" 2>/dev/null
+    cp -r ./flash_qla_sm70 "$FLASH_QLA_DST" 2>/dev/null && \
+        echo "[patch_ops] flash_qla_sm70 deployed to $FLASH_QLA_DST" || true
+    # Also deploy to VLLM2 if present
+    if [ -n "$VLLM2" ]; then
+        rm -rf "$VLLM2/model_executor/models/flash_qla_sm70" 2>/dev/null
+        cp -r ./flash_qla_sm70 "$VLLM2/model_executor/models/flash_qla_sm70" 2>/dev/null || true
+    fi
+fi

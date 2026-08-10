@@ -76,19 +76,35 @@ _corex_moe_module = None
 _corex_gdn_available = False
 _corex_moe_available = False
 
+# SM70 FlashQLA GDN kernel (from 1Cat-vLLM, MIT license)
+# Fused CUDA kernel for GatedDeltaNet on SM70/SM75 (V100/BI-V100)
+# JIT compiled via torch.utils.cpp_extension.load() on first call
+_flash_qla_sm70 = None
+_flash_qla_available = False
+
+try:
+    from vllm.model_executor.models.flash_qla_sm70 import (
+        chunk_gated_delta_rule_fwd_sm70,
+        chunk_gated_delta_rule_fwd_sm70_vlk_varlen,
+    )
+    _flash_qla_available = True
+    logger.info("FlashQLA SM70 GDN module found — fused CUDA kernel available (JIT on first call)")
+except ImportError as e:
+    logger.warning("FlashQLA SM70 GDN not found (%s) — using PyTorch GDN", e)
+
 try:
     from vllm.model_executor.models import corex_gdn as _corex_gdn_module
     _corex_gdn_available = True
     logger.info("CoreX GDN module found — fused GDN kernels available")
 except ImportError:
-    pass  # expected if not packaged; ixformer ops used instead
+    pass
 
 try:
     from vllm.model_executor.models import corex_moe as _corex_moe_module
     _corex_moe_available = True
     logger.info("CoreX MoE module found — fused MoE kernels available")
 except ImportError:
-    pass  # expected; MoE uses PyTorch loop
+    pass
 
 
 # ---------------------------------------------------------------------------
