@@ -1142,12 +1142,35 @@ def reshape_and_cache_flashinfer(
 def copy_blocks(key_caches: List[torch.Tensor],
                 value_caches: List[torch.Tensor],
                 block_mapping: torch.Tensor) -> None:
-    ixf_F.vllm_copy_cache(key_caches, value_caches, block_mapping)
+    # ixformer vllm_copy_cache expects dict {src_block: [dst_blocks...]}
+    # vllm 0.6.3 passes a Tensor of shape [N, 2] with (src, dst) pairs
+    if isinstance(block_mapping, torch.Tensor):
+        mapping_dict = {}
+        bm = block_mapping.cpu()
+        for i in range(bm.shape[0]):
+            src = int(bm[i, 0])
+            dst = int(bm[i, 1])
+            if src not in mapping_dict:
+                mapping_dict[src] = []
+            mapping_dict[src].append(dst)
+        ixf_F.vllm_copy_cache(key_caches, value_caches, mapping_dict)
+    else:
+        ixf_F.vllm_copy_cache(key_caches, value_caches, block_mapping)
 
 
 def swap_blocks(src: torch.Tensor, dst: torch.Tensor,
                 block_mapping: torch.Tensor) -> None:
-    ixf_F.vllm_swap_blocks(src, dst, block_mapping)
+    # Same issue: ixformer expects dict, vllm passes Tensor
+    if isinstance(block_mapping, torch.Tensor):
+        mapping_dict = {}
+        bm = block_mapping.cpu()
+        for i in range(bm.shape[0]):
+            s = int(bm[i, 0])
+            d = int(bm[i, 1])
+            mapping_dict[s] = d
+        ixf_F.vllm_swap_blocks(src, dst, mapping_dict)
+    else:
+        ixf_F.vllm_swap_blocks(src, dst, block_mapping)
 
 
 def convert_fp8(output: torch.Tensor,
