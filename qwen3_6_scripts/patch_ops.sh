@@ -167,3 +167,66 @@ if [ -d "$_FLASH_SRC" ]; then
 fi
 
 echo "[patch_ops] DONE"
+
+# ---- 8. Deploy ex_engine package + compiled .so to Python path ----
+_SITE="/usr/local/corex/lib/python3/dist-packages"
+if [ -d "$_SITE" ]; then
+    # Deploy ex_engine as importable package
+    _EX_DST="$_SITE/ex_engine"
+    mkdir -p "$_EX_DST/python" "$_EX_DST/build" "$_EX_DST/csrc"
+    
+    # Python files
+    cp /workspace/ex_engine/python/*.py "$_EX_DST/python/" 2>/dev/null || true
+    touch "$_EX_DST/__init__.py"
+    touch "$_EX_DST/python/__init__.py"
+    
+    # Compiled .so files from build.sh
+    if [ -d "/workspace/ex_engine/build" ]; then
+        cp /workspace/ex_engine/build/*.so "$_EX_DST/build/" 2>/dev/null || true
+        # Also copy to package root for easy loading
+        cp /workspace/ex_engine/build/*.so "$_EX_DST/" 2>/dev/null || true
+        echo "[patch_ops] ex_engine .so files deployed: $(ls /workspace/ex_engine/build/*.so 2>/dev/null | wc -l) files"
+    fi
+    
+    # C++ sources for JIT compilation at runtime
+    cp /workspace/ex_engine/csrc/ix_full_bridge.cpp "$_EX_DST/csrc/" 2>/dev/null || true
+    cp /workspace/ex_engine/csrc/moe_topk_softmax_v3.cu "$_EX_DST/csrc/" 2>/dev/null || true
+    if [ -d "/workspace/ex_engine/csrc/moe_v055" ]; then
+        cp -r /workspace/ex_engine/csrc/moe_v055 "$_EX_DST/csrc/" 2>/dev/null || true
+    fi
+    
+    # Also deploy to vllm models dir for import compatibility
+    _EX_VLLM="$VLLM/model_executor/models/ex_engine"
+    mkdir -p "$_EX_VLLM/python" "$_EX_VLLM/csrc"
+    cp /workspace/ex_engine/python/*.py "$_EX_VLLM/python/" 2>/dev/null || true
+    touch "$_EX_VLLM/__init__.py"
+    touch "$_EX_VLLM/python/__init__.py"
+    cp /workspace/ex_engine/csrc/ix_full_bridge.cpp "$_EX_VLLM/csrc/" 2>/dev/null || true
+    if [ -d "/workspace/ex_engine/build" ]; then
+        cp /workspace/ex_engine/build/*.so "$_EX_VLLM/" 2>/dev/null || true
+    fi
+    
+    echo "[patch_ops] ex_engine deployed to $_SITE and $VLLM"
+fi
+
+# ---- 9. Deploy precompiled MoE .so ----
+# moe_topk_softmax_v3.so (from precompile_moe_topk.py)
+for _SO in /workspace/ex_engine/moe_topk_softmax_v3*.so /tmp/torch_extensions/*/moe_topk_softmax_v3*.so; do
+    if [ -f "$_SO" ]; then
+        cp "$_SO" "$_SITE/" 2>/dev/null || true
+        echo "[patch_ops] MoE topk .so deployed: $(basename $_SO)"
+        break
+    fi
+done
+
+# moe_v055 kernels .so (from precompile_moe_kernels.py)  
+for _SO in /workspace/ex_engine/moe_ops_v055*.so /tmp/torch_extensions/*/moe_ops_v055*.so; do
+    if [ -f "$_SO" ]; then
+        cp "$_SO" "$_SITE/" 2>/dev/null || true
+        echo "[patch_ops] MoE v055 .so deployed: $(basename $_SO)"
+        break
+    fi
+done
+
+echo "[patch_ops] FINAL: all .so and Python packages deployed"
+ls -la "$_EX_DST/build/"*.so 2>/dev/null || echo "[patch_ops] WARNING: no .so in ex_engine/build/"
