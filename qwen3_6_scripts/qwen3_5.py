@@ -264,13 +264,12 @@ def _torch_chunk_gated_delta_rule(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
         diagonal=0)
 
-    # CCCL accumulator_t pattern: clamp BEFORE cumsum to prevent overflow
-    # at the source. Without this, individual g values of ±10 accumulate
-    # over 64 positions to ±640 — far beyond float32 exp() safe range (~88).
-    g = g.clamp(-5.0, 2.0)
+    # Match xllm qwen3_gated_delta_net_base.cpp line 170-175:
+    # cumsum first, then difference form (g_i - g_j) which is numerically
+    # stable — the subtraction cancels cumsum growth so exp() stays bounded.
+    # Do NOT clamp g before cumsum — that corrupts gate values and causes NaN.
     g = g.cumsum(dim=-1)
-    g = g.clamp(-20.0, 20.0)
-    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+    decay_mask = (g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().to(torch.float32).tril()
     attn = -((_ix_matmul(k_beta, key.transpose(-1, -2))) * decay_mask).masked_fill(mask_upper, 0)
     for i in range(1, chunk_size):
         row = attn[..., i, :i].clone()
@@ -278,7 +277,7 @@ def _torch_chunk_gated_delta_rule(
         attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
     attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
     value = _ix_matmul(attn, v_beta)
-    k_cumdecay = _ix_matmul(attn, k_beta * g.clamp(-20, 20).exp().unsqueeze(-1))
+    k_cumdecay = _ix_matmul(attn, k_beta * g.exp().unsqueeze(-1))
 
     last_state = (
         torch.zeros(batch, num_heads, k_dim, v_dim, dtype=value.dtype, device=value.device)
@@ -304,22 +303,22 @@ def _torch_chunk_gated_delta_rule(
             * decay_mask[:, :, i]
         ).masked_fill_(mask_upper2, 0)
 
-    # dispatch_scan.cuh Phase 2: sequential state propagation (scan kernel).
-    # Only state-dependent ops remain in this loop.
-    g_exp_cache = g.clamp(-20, 20).exp()  # pre-compute once
-    g_clamped = g.clamp(-20, 20)  # keep raw clamped g for difference computation
+    # State propagation — match xllm qwen3_gated_delta_net_base.cpp line 218-238
     for i in range(num_chunks):
+        q_i = query[:, :, i]
+        k_i = key[:, :, i]
+        v_i = value[:, :, i]
         v_prime = _ix_matmul(k_cumdecay[:, :, i], last_state)
-        v_new = value[:, :, i] - v_prime
-        attn_inter = _ix_matmul(query[:, :, i] * g_exp_cache[:, :, i, :, None], last_state)
+        v_new = v_i - v_prime
+        # attn_inter: q * exp(g) @ state — xllm line 228
+        attn_inter = _ix_matmul(q_i * g[:, :, i].unsqueeze(-1).exp(), last_state)
         core_out[:, :, i] = attn_inter + _ix_matmul(attn_i_all[:, :, i], v_new)
-        # State update uses difference form: exp(g[-1] - g[:]) to avoid division
-        last_state = (
-            last_state * g_exp_cache[:, :, i, -1, None, None]
-            + _ix_matmul(
-                (key[:, :, i] * (g_clamped[:, :, i, -1, None] - g_clamped[:, :, i]).exp()[..., None])
-                .transpose(-1, -2), v_new)
-        )
+        # State update — xllm line 230-237: difference form for numerical stability
+        g_i_last = g[:, :, i, -1].unsqueeze(-1)          # (B, H, 1)
+        g_exp_term = (g_i_last - g[:, :, i]).exp().unsqueeze(-1)  # (B, H, C, 1)
+        k_g_exp = (k_i * g_exp_term).transpose(-1, -2).contiguous()
+        last_state = (last_state * g_i_last.unsqueeze(-1).exp()
+                      + _ix_matmul(k_g_exp, v_new))
 
     if not output_final_state:
         last_state = None
