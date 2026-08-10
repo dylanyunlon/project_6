@@ -127,6 +127,21 @@ try:
 except ImportError:
     pass
 
+# EX Engine: fused MoE topk_softmax CUDA kernel (xllm CUB-based)
+_ex_moe_topk_softmax = None
+_ex_moe_topk_available = False
+try:
+    from ex_engine.python.moe_topk import moe_topk_softmax as _ex_moe_topk_softmax
+    _ex_moe_topk_available = True
+    logger.info("EX Engine MoE topk_softmax kernel available")
+except ImportError:
+    try:
+        from vllm.model_executor.models.ex_engine.moe_topk import moe_topk_softmax as _ex_moe_topk_softmax
+        _ex_moe_topk_available = True
+        logger.info("EX Engine MoE topk_softmax kernel available (vllm path)")
+    except ImportError:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # ixformer-accelerated ops (drop-in replacements for torch ops)
@@ -1065,9 +1080,21 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         Output is partial (pre-all-reduce), same contract as FusedMoE
         with reduce_results=False.
         """
-        # Routing: fused topk+softmax via ixformer C++ bridge (if available)
-        # Falls back to PyTorch softmax → topk → renormalize
-        if _ix_bridge_available:
+        # Routing: fused topk+softmax dispatch chain
+        # Tier 1: EX Engine CUB kernel → Tier 2: ix_bridge → Tier 3: PyTorch
+        if _ex_moe_topk_available:
+            T_tok = router_logits.shape[0]
+            topk_weights = torch.empty(T_tok, self.top_k, dtype=torch.float32,
+                                       device=router_logits.device)
+            topk_ids = torch.empty(T_tok, self.top_k, dtype=torch.int32,
+                                   device=router_logits.device)
+            token_expert_indices = torch.empty(T_tok, self.top_k, dtype=torch.int32,
+                                               device=router_logits.device)
+            _ex_moe_topk_softmax(topk_weights, topk_ids, token_expert_indices,
+                                 router_logits.float(), True)
+            topk_ids = topk_ids.to(torch.long)
+            topk_weights = topk_weights.to(hidden_states.dtype)
+        elif _ix_bridge_available:
             topk_weights, topk_ids = _ix_topk_softmax(
                 router_logits, self.top_k, renormalize=True)
             topk_weights = topk_weights.to(hidden_states.dtype)

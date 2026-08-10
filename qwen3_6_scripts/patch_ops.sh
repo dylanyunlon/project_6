@@ -183,18 +183,23 @@ EX_ENGINE_SRC="/workspace/ex_engine"
 if [ -d "$EX_ENGINE_SRC/python" ]; then
     # Deploy into vllm's model dir so qwen3_5.py can import it
     EX_DST="$VLLM/model_executor/models/ex_engine"
-    mkdir -p "$EX_DST/python"
-    mkdir -p "$EX_DST/csrc"
+    mkdir -p "$EX_DST/python" "$EX_DST/csrc"
     cp "$EX_ENGINE_SRC/python/"*.py "$EX_DST/python/" 2>/dev/null || true
-    # ix_moe_bridge.cpp needs to be next to the python module for JIT compile
+    # ix_moe_bridge.cpp for JIT compile
     cp "$EX_ENGINE_SRC/csrc/ix_moe_bridge.cpp" "$EX_DST/csrc/" 2>/dev/null || true
     cp "$EX_ENGINE_SRC/csrc/ix_moe_bridge.cpp" "$EX_DST/python/" 2>/dev/null || true
-    # Also make ex_engine importable from Python path
     touch "$EX_DST/__init__.py"
     touch "$EX_DST/python/__init__.py"
-    # Copy built .so files if they exist
+    # Copy built .so files
     if [ -d "$EX_ENGINE_SRC/build" ]; then
         cp "$EX_ENGINE_SRC/build/"*.so "$EX_DST/" 2>/dev/null || true
+    fi
+    # Deploy MoE CUDA kernel sources for JIT compilation
+    if [ -d "$EX_ENGINE_SRC/csrc/moe" ]; then
+        mkdir -p "$EX_DST/csrc/moe"
+        cp "$EX_ENGINE_SRC/csrc/moe/"*.cu "$EX_DST/csrc/moe/" 2>/dev/null || true
+        cp "$EX_ENGINE_SRC/csrc/moe/"*.cuh "$EX_DST/csrc/moe/" 2>/dev/null || true
+        echo "[patch_ops] MoE CUDA kernel sources deployed for JIT"
     fi
     echo "[patch_ops] EX Engine deployed to $EX_DST"
     ls -la "$EX_DST/csrc/" 2>/dev/null || true
@@ -205,6 +210,19 @@ if [ -d "$EX_ENGINE_SRC/python" ]; then
     fi
 else
     echo "[patch_ops] WARNING: EX Engine not found — MoE uses slow PyTorch fallback"
+fi
+
+# Also deploy ex_engine Python package to system path for direct import
+EX_PY_DST="/usr/local/corex/lib/python3/dist-packages/ex_engine"
+if [ -d "$EX_ENGINE_SRC/python" ]; then
+    mkdir -p "$EX_PY_DST"
+    cp "$EX_ENGINE_SRC/python/"*.py "$EX_PY_DST/" 2>/dev/null || true
+    if [ -d "$EX_ENGINE_SRC/csrc/moe" ]; then
+        mkdir -p "$EX_PY_DST/../ex_engine/csrc/moe"
+        cp "$EX_ENGINE_SRC/csrc/moe/"*.cu "$EX_PY_DST/../ex_engine/csrc/moe/" 2>/dev/null || true
+        cp "$EX_ENGINE_SRC/csrc/moe/"*.cuh "$EX_PY_DST/../ex_engine/csrc/moe/" 2>/dev/null || true
+    fi
+    echo "[patch_ops] EX Engine Python package deployed to $EX_PY_DST"
 fi
 
 echo "[patch_ops] DONE — EX Engine + SM70 GDN kernel + serving layer deployed"
