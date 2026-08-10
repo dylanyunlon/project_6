@@ -71,14 +71,25 @@ def _python_topk_softmax(gating_output, topk, renormalize=True):
 
 
 # -----------------------------------------------------------------------
-# ixformer.functions Python-level SiLU
+# silu_and_mul acceleration: prefer C++ bridge, fallback to ixformer Python
 # -----------------------------------------------------------------------
-_ixf_silu = None
-try:
-    import ixformer.functions as _ixf_F
-    _ixf_silu = _ixf_F.silu_and_mul
-except (ImportError, AttributeError):
-    pass
+_silu_fn = None
+
+def _get_silu_fn():
+    global _silu_fn
+    if _silu_fn is not None:
+        return _silu_fn
+    # Tier 0: C++ bridge (ixformer_torch_ext::silu_and_mul_forward)
+    if _ensure_bridge() and hasattr(_bridge, 'silu_and_mul'):
+        _silu_fn = _bridge.silu_and_mul
+        return _silu_fn
+    # Tier 1: ixformer Python
+    try:
+        import ixformer.functions as _ixf_F
+        _silu_fn = _ixf_F.silu_and_mul
+    except (ImportError, AttributeError):
+        pass
+    return _silu_fn
 
 
 # -----------------------------------------------------------------------
@@ -182,11 +193,10 @@ def _python_moe_forward(hidden_states, gate_output, w13, w2,
         gate_up = tokens @ w13[eidx].t()
 
         # SiLU activation
-        if _ixf_silu is not None:
-            act = torch.empty(tokens.shape[0], half_inter,
-                              dtype=dtype, device=tokens.device)
+        silu_fn = _get_silu_fn()
+        if silu_fn is not None:
             try:
-                _ixf_silu(gate_up, act)
+                act = silu_fn(gate_up)
             except Exception:
                 gate_out = gate_up[:, :half_inter]
                 up_out = gate_up[:, half_inter:]
