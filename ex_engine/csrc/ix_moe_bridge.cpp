@@ -1,8 +1,13 @@
 // ix_moe_bridge.cpp — Full MoE pipeline bridge to ixformer C++ API
+static const std::optional<torch::Tensor> kNoneTensor = {};
 //
+static const std::optional<torch::Tensor> kNoneTensor = {};
 // Exposes ALL 6 MoE functions from ixformer::infer (ixformer.h):
+static const std::optional<torch::Tensor> kNoneTensor = {};
 //   1. topk_softmax          — fused routing
+static const std::optional<torch::Tensor> kNoneTensor = {};
 //   2. moe_compute_token_index_api — permutation maps (src_dst, dst_src)
+static const std::optional<torch::Tensor> kNoneTensor = {};
 //   3. moe_expand_input      — gather tokens by expert
 //   4. moe_w16a16_group_gemm — batched expert GEMM
 //   5. silu_and_mul           — fused activation
@@ -31,9 +36,9 @@ void moe_compute_token_index_api(
     torch::Tensor& src_dst,
     torch::Tensor& dst_src,
     torch::Tensor& expert_sizes_gpu,
-    const c10::optional<torch::Tensor>& expert_mask,
-    const c10::optional<torch::Tensor>& expert_sizes_cpu,
-    const c10::optional<torch::Tensor>& expand_tokens_gpu,
+    const std::optional<torch::Tensor>& expert_mask,
+    const std::optional<torch::Tensor>& expert_sizes_cpu,
+    const std::optional<torch::Tensor>& expand_tokens_gpu,
     int64_t start_expert_id,
     int64_t end_expert_id,
     int64_t num_experts);
@@ -41,7 +46,7 @@ void moe_compute_token_index_api(
 void moe_expand_input(torch::Tensor outputs,
                       torch::Tensor inputs,
                       torch::Tensor dst_to_src,
-                      const c10::optional<torch::Tensor>& src_to_dst,
+                      const std::optional<torch::Tensor>& src_to_dst,
                       int64_t dst_tokens,
                       int64_t expand_factor);
 
@@ -49,17 +54,17 @@ void moe_w16a16_group_gemm(torch::Tensor output,
                            torch::Tensor inputs,
                            torch::Tensor weights,
                            torch::Tensor tokens_per_experts,
-                           const c10::optional<torch::Tensor>& dst_to_src,
-                           const c10::optional<torch::Tensor>& bias,
+                           const std::optional<torch::Tensor>& dst_to_src,
+                           const std::optional<torch::Tensor>& bias,
                            std::string format,
                            int64_t persistent,
                            int64_t output_n);
 
 void moe_output_reduce_sum(torch::Tensor outputs,
                            torch::Tensor inputs,
-                           const c10::optional<torch::Tensor>& mul_weight,
-                           const c10::optional<torch::Tensor>& mask,
-                           const c10::optional<torch::Tensor>& extra_residual,
+                           const std::optional<torch::Tensor>& mul_weight,
+                           const std::optional<torch::Tensor>& mask,
+                           const std::optional<torch::Tensor>& extra_residual,
                            double scaling_factor);
 
 void silu_and_mul(torch::Tensor& input, torch::Tensor& output);
@@ -110,9 +115,9 @@ std::vector<torch::Tensor> ix_moe_gen_idx(
 
   ixformer::infer::moe_compute_token_index_api(
       expert_id, src_dst, dst_src, expert_sizes_gpu,
-      /*expert_mask=*/c10::nullopt,
-      /*expert_sizes_cpu=*/c10::nullopt,
-      /*expand_tokens_gpu=*/c10::nullopt,
+      /*expert_mask=*/kNoneTensor,
+      /*expert_sizes_cpu=*/kNoneTensor,
+      /*expand_tokens_gpu=*/kNoneTensor,
       0, expert_num, expert_num);
 
   expert_sizes_gpu_cumsum = expert_sizes_gpu.cumsum(-1);
@@ -144,8 +149,8 @@ torch::Tensor ix_group_gemm(
 
   ixformer::infer::moe_w16a16_group_gemm(
       output, inputs, weights, token_count,
-      /*dst_to_src=*/c10::nullopt,
-      /*bias=*/c10::nullopt,
+      /*dst_to_src=*/kNoneTensor,
+      /*bias=*/kNoneTensor,
       /*format=*/"NT",
       /*persistent=*/0,
       /*output_n=*/output_n);
@@ -169,8 +174,8 @@ torch::Tensor ix_moe_combine_result(
 
   ixformer::infer::moe_output_reduce_sum(
       output, input, weight,
-      /*mask=*/c10::nullopt,
-      /*extra_residual=*/c10::nullopt,
+      /*mask=*/kNoneTensor,
+      /*extra_residual=*/kNoneTensor,
       /*scaling_factor=*/1.0);
   return output;
 }

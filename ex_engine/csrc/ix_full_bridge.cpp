@@ -17,6 +17,14 @@
 #include <vector>
 
 // ============================================================================
+// Compatibility: CoreX torch uses c10::optional which may not implicitly
+// convert from kNoneTensor to const std::optional<T>&.
+// Use typed empty optionals instead.
+// ============================================================================
+static const std::optional<torch::Tensor> kNoneTensor = {};
+static const std::optional<bool> kNoneBool = {};
+
+// ============================================================================
 // Forward-declare ixformer::infer namespace — matches ixformer.h exactly
 // We forward-declare instead of #include to avoid build-time dependency
 // on internal headers (ixinfer.h etc) that may not be on include path.
@@ -83,8 +91,8 @@ torch::Tensor ixformer_linear(
 
 torch::Tensor ixformer_linear_ex(
     torch::Tensor& input, torch::Tensor& weight,
-    const c10::optional<torch::Tensor>& bias,
-    const c10::optional<torch::Tensor>& out);
+    const std::optional<torch::Tensor>& bias,
+    const std::optional<torch::Tensor>& out);
 
 // --- MoE ---
 void topk_softmax(
@@ -95,28 +103,28 @@ void topk_softmax(
 void moe_compute_token_index_api(
     torch::Tensor& topk_ids, torch::Tensor& src_dst, torch::Tensor& dst_src,
     torch::Tensor& expert_sizes_gpu,
-    const c10::optional<torch::Tensor>& expert_mask,
-    const c10::optional<torch::Tensor>& expert_sizes_cpu,
-    const c10::optional<torch::Tensor>& expand_tokens_gpu,
+    const std::optional<torch::Tensor>& expert_mask,
+    const std::optional<torch::Tensor>& expert_sizes_cpu,
+    const std::optional<torch::Tensor>& expand_tokens_gpu,
     int64_t start_expert_id, int64_t end_expert_id, int64_t num_experts);
 
 void moe_expand_input(
     torch::Tensor outputs, torch::Tensor inputs, torch::Tensor dst_to_src,
-    const c10::optional<torch::Tensor>& src_to_dst,
+    const std::optional<torch::Tensor>& src_to_dst,
     int64_t dst_tokens, int64_t expand_factor);
 
 void moe_w16a16_group_gemm(
     torch::Tensor output, torch::Tensor inputs, torch::Tensor weights,
     torch::Tensor tokens_per_experts,
-    const c10::optional<torch::Tensor>& dst_to_src,
-    const c10::optional<torch::Tensor>& bias,
+    const std::optional<torch::Tensor>& dst_to_src,
+    const std::optional<torch::Tensor>& bias,
     std::string format, int64_t persistent, int64_t output_n);
 
 void moe_output_reduce_sum(
     torch::Tensor outputs, torch::Tensor inputs,
-    const c10::optional<torch::Tensor>& mul_weight,
-    const c10::optional<torch::Tensor>& mask,
-    const c10::optional<torch::Tensor>& extra_residual,
+    const std::optional<torch::Tensor>& mul_weight,
+    const std::optional<torch::Tensor>& mask,
+    const std::optional<torch::Tensor>& extra_residual,
     double scaling_factor);
 
 }  // namespace infer
@@ -154,7 +162,7 @@ std::vector<torch::Tensor> ix_moe_gen_idx(
   auto expert_sizes_gpu = expert_id.new_empty({expert_num});
   ixformer::infer::moe_compute_token_index_api(
       expert_id, src_dst, dst_src, expert_sizes_gpu,
-      c10::nullopt, c10::nullopt, c10::nullopt, 0, expert_num, expert_num);
+      kNoneTensor, kNoneTensor, kNoneTensor, 0, expert_num, expert_num);
   auto expert_sizes_gpu_cumsum = expert_sizes_gpu.cumsum(-1);
   return {src_dst, dst_src, expert_sizes_gpu, expert_sizes_gpu_cumsum};
 }
@@ -178,7 +186,7 @@ torch::Tensor ix_group_gemm(
   auto output = inputs.new_empty({total_tokens, output_n});
   ixformer::infer::moe_w16a16_group_gemm(
       output, inputs, weights, token_count,
-      c10::nullopt, c10::nullopt, "NT", 0, output_n);
+      kNoneTensor, kNoneTensor, "NT", 0, output_n);
   return output;
 }
 
@@ -195,7 +203,7 @@ torch::Tensor ix_moe_combine_result(torch::Tensor input, torch::Tensor weight) {
   input = input.view({-1, weight.size(1), input.size(1)});
   auto output = input.new_empty({input.size(0), input.size(2)});
   ixformer::infer::moe_output_reduce_sum(
-      output, input, weight, c10::nullopt, c10::nullopt, 1.0);
+      output, input, weight, kNoneTensor, kNoneTensor, 1.0);
   return output;
 }
 
@@ -234,7 +242,7 @@ void ix_paged_attention(
       block_tables, seq_lens, block_size, max_context_len,
       alibi_slopes, /*causal=*/true, /*window_left=*/-1, /*window_right=*/-1,
       /*softcap=*/0.0, /*enable_cuda_graph=*/false, /*use_sqrt_alibi=*/false,
-      /*sinks=*/c10::nullopt);
+      /*sinks=*/kNoneTensor);
 }
 
 // --- Attention: prefill flash (from ilu/attention.cpp batch_prefill) ---
@@ -245,20 +253,20 @@ void ix_flash_attn_prefill(
     int64_t max_query_len, int64_t max_seq_len,
     double scale, bool is_causal,
     int64_t window_left, int64_t window_right) {
-  std::optional<torch::Tensor> lse = c10::nullopt;
+  std::optional<torch::Tensor> lse = {};
   ixformer::infer::ixinfer_flash_attn_unpad_with_block_tables(
       query, key, value, output, block_tables,
       cu_seq_q, cu_seq_k, max_query_len, max_seq_len,
       is_causal, window_left, window_right,
       scale, /*softcap=*/0.0, /*sqrt_alibi=*/false,
-      /*alibi_slopes=*/c10::nullopt, /*sinks=*/c10::nullopt, lse);
+      /*alibi_slopes=*/kNoneTensor, /*sinks=*/kNoneTensor, lse);
 }
 
 // --- Norm: rms_norm (from ilu/norm.cpp) ---
 void ix_rms_norm(
     torch::Tensor output, torch::Tensor input,
     torch::Tensor weight, double eps) {
-  ixformer::infer::rms_norm(input, weight, output, c10::nullopt, eps);
+  ixformer::infer::rms_norm(input, weight, output, kNoneTensor, eps);
 }
 
 // --- Norm: fused residual + rms_norm (from ilu/norm.cpp) ---
@@ -268,7 +276,7 @@ void ix_fused_add_rms_norm(
     torch::Tensor residual_output, double eps) {
   ixformer::infer::residual_rms_norm(
       input, residual, weight, output, residual_output,
-      c10::nullopt, 1.0, eps, false);
+      kNoneTensor, 1.0, eps, false);
 }
 
 // --- RoPE (from ilu/rope.cpp) ---
@@ -297,7 +305,7 @@ torch::Tensor ix_linear(
     torch::Tensor input, torch::Tensor weight,
     const std::optional<torch::Tensor>& bias) {
   return ixformer::infer::ixformer_linear(
-      input, weight, /*act_type=*/0, bias, c10::nullopt, c10::nullopt);
+      input, weight, /*act_type=*/-1, bias, kNoneTensor, kNoneBool);
 }
 
 // ============================================================================
