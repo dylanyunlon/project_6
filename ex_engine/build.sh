@@ -8,7 +8,7 @@
 #   ./ex_engine/build.sh              # auto-detect toolchain
 #   ./ex_engine/build.sh --nvcc       # force nvcc (development)
 
-set -euo pipefail
+set +e  # Don't exit on error — Docker build must not fail on optional compilation
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
