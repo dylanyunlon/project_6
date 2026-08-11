@@ -164,13 +164,12 @@ if [ -d "$_SITE" ]; then
 fi
 
 # ===========================================================
-# 5. XFormers patches — DISABLED
-#    Sub 168 (base image) achieved output_tps=11.9 WITHOUT any xformers patches.
-#    Sub 520 applied these patches → output_tps=2.6 (4.6x slower!)
-#    The patches replace ixformer flash attention with pure PyTorch O(L²) matmul.
-#    Base image ixformer attention works correctly — proven by Sub 168.
+# 5. XFormers patches — head_dim=256 bypass for BI-V100
+#    Comp 168 also had xformers patches (base uses xformers for attention)
 # ===========================================================
-echo "[patch_ops] xformers patches SKIPPED — base ixformer attention works (Sub 168 proof)"
+python3 ./patch_xformers_sdpa_seq.py 2>&1 || true
+python3 ./patch_xformers_sdpa_batch.py 2>&1 || true
+echo "[patch_ops] xformers patches applied"
 
 # ===========================================================
 # 6. model_runner patch (prefix_cache_hit fix)
