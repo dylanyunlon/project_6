@@ -1,57 +1,101 @@
 #!/usr/bin/env bash
-# build_unified_bridge.sh — Compile ix_unified_bridge.so on BI-V100
-# Uses manual compiler flags since torch.utils.cpp_extension is stripped from corex torch.
+# build_unified_bridge.sh — Compile ix_unified_bridge.so
+# Strategy: try torch.utils.cpp_extension.load() first (proven on BI-V100),
+# fall back to manual clang++ if torch extension not available.
 set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC_DIR="${SCRIPT_DIR}/csrc/ilu"
-BUILD_DIR="${SCRIPT_DIR}/build"
+SRC="$SCRIPT_DIR/csrc/ilu/ix_unified_bridge.cpp"
+BUILD_DIR="$SCRIPT_DIR/build"
 mkdir -p "$BUILD_DIR"
 
+if [ ! -f "$SRC" ]; then
+    echo "[build_bridge] ERROR: $SRC not found"
+    exit 1
+fi
+
 PYTHON=${PYTHON:-python3}
+
+# Method 1: torch.utils.cpp_extension.load() — same method that works for moe_topk, _moe_C, gdn
+echo "[build_bridge] Trying torch.utils.cpp_extension.load()..."
+$PYTHON << PYEOF
+import os, sys, glob
+
+src = "$SRC"
+build_dir = "$BUILD_DIR"
+
+try:
+    from torch.utils.cpp_extension import load
+    
+    # Find ixformer include/lib dirs for linking
+    extra_include = ["$SCRIPT_DIR/csrc/ilu"]
+    extra_ldflags = []
+    
+    # ixformer lib dirs — bridge needs these at runtime, not compile time
+    for p in ["/usr/local/corex/lib64/python3/dist-packages/ixformer",
+              "/usr/local/corex/lib64"]:
+        if os.path.isdir(p):
+            sos = glob.glob(os.path.join(p, "*.so"))
+            if sos:
+                extra_ldflags.append(f"-L{p}")
+                extra_ldflags.append(f"-Wl,-rpath,{p}")
+
+    ext = load(
+        name="ix_unified_bridge",
+        sources=[src],
+        extra_include_paths=extra_include,
+        extra_ldflags=extra_ldflags,
+        verbose=True,
+        build_directory=build_dir,
+    )
+    funcs = [x for x in dir(ext) if not x.startswith('_')]
+    print(f"[build_bridge] SUCCESS via cpp_extension: {len(funcs)} functions")
+    print(f"[build_bridge] functions: {funcs}")
+    sys.exit(0)
+except Exception as e:
+    print(f"[build_bridge] cpp_extension failed: {e}")
+    sys.exit(1)
+PYEOF
+
+if [ $? -eq 0 ]; then
+    echo "[build_bridge] torch.utils.cpp_extension succeeded"
+    ls -la "$BUILD_DIR"/ix_unified_bridge*.so 2>/dev/null
+    exit 0
+fi
+
+# Method 2: Manual clang++ (fallback)
+echo "[build_bridge] Falling back to manual clang++..."
 PY_INC=$($PYTHON -c "import sysconfig; print(sysconfig.get_path('include'))")
 PY_SUFFIX=$($PYTHON -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
-
-# Torch paths — manual discovery (no cpp_extension)
 TORCH_ROOT=$($PYTHON -c "import torch; import os; print(os.path.dirname(torch.__file__))")
 TORCH_INC="${TORCH_ROOT}/include"
 TORCH_INC2="${TORCH_ROOT}/include/torch/csrc/api/include"
 TORCH_LIB="${TORCH_ROOT}/lib"
 
-# Compiler: corex clang or system g++
-for _CXX in /usr/local/corex/bin/clang++ /usr/local/corex-3.2.3/bin/clang++ g++; do
+CXX=""
+for _CXX in /usr/local/corex/bin/clang++ g++; do
     [ -x "$_CXX" ] && CXX="$_CXX" && break
 done
-echo "[build] CXX=$CXX"
-echo "[build] TORCH_ROOT=$TORCH_ROOT"
-echo "[build] PY_INC=$PY_INC"
 
 OUT="${BUILD_DIR}/ix_unified_bridge${PY_SUFFIX}"
 
 $CXX -shared -fPIC -O2 -std=c++17 \
-    -I"$SRC_DIR" \
+    -I"$SCRIPT_DIR/csrc/ilu" \
     -I"$PY_INC" \
     -I"$TORCH_INC" \
     -I"$TORCH_INC2" \
     -L"$TORCH_LIB" \
-    -ltorch -ltorch_cpu -lc10 \
+    -ltorch -ltorch_cpu -ltorch_python -lc10 \
     -Wl,--no-as-needed,-rpath,"$TORCH_LIB" \
     -Wl,--unresolved-symbols=ignore-in-shared-libs \
     -D_GLIBCXX_USE_CXX11_ABI=0 \
     -DTORCH_EXTENSION_NAME=ix_unified_bridge \
-    "$SRC_DIR/ix_unified_bridge.cpp" \
+    "$SRC" \
     -o "$OUT" 2>&1
 
 if [ -f "$OUT" ]; then
-    echo "[build] SUCCESS: $OUT ($(du -h "$OUT" | cut -f1))"
-    $PYTHON -c "
-import importlib.util
-spec = importlib.util.spec_from_file_location('ix_unified_bridge', '$OUT')
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
-funcs = [x for x in dir(mod) if not x.startswith('_')]
-print(f'[verify] {len(funcs)} functions: {funcs}')
-" 2>&1 || echo "[verify] import test needs ixformer runtime symbols"
+    echo "[build_bridge] SUCCESS via manual clang: $OUT ($(du -h "$OUT" | cut -f1))"
 else
-    echo "[build] FAILED"
+    echo "[build_bridge] FAILED"
+    exit 1
 fi
