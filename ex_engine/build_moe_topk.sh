@@ -27,7 +27,7 @@ $CXX -shared -fPIC -O2 -std=c++17 \
     -I"$TORCH_INC" \
     -I"$TORCH_INC2" \
     -L"$TORCH_LIB" \
-    -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda \
+    -ltorch -ltorch_cpu -ltorch_cuda -ltorch_python -lc10 -lc10_cuda \
     -Wl,--no-as-needed,-rpath,"$TORCH_LIB" \
     -D_GLIBCXX_USE_CXX11_ABI=0 \
     -DTORCH_EXTENSION_NAME=moe_topk_softmax_v3 \
