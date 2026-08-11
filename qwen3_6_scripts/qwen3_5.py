@@ -143,7 +143,15 @@ from vllm.model_executor.models.interfaces import (HasInnerState, SupportsLoRA,
 
 logger = init_logger(__name__)
 
-_bi100_model_trace("qwen3_5 runtime imports complete")
+# --- ix_unified: bridge to ixformer::infer C++ APIs -------------------------
+try:
+    from ix_unified import ix as _ix_bridge
+    _HAS_IX_BRIDGE = (_ix_bridge._bridge is not None)
+except ImportError:
+    _ix_bridge = None
+    _HAS_IX_BRIDGE = False
+
+_bi100_model_trace(f"qwen3_5 runtime imports complete (ix_bridge={_HAS_IX_BRIDGE})")
 
 _ALLOW_GDN_NAN_ZERO = env_bool("BI100_GDN_ALLOW_NAN_ZERO", False)
 _GDN_FINITE_CHECK = (env_bool("BI100_GDN_FINITE_CHECK", False)
@@ -180,6 +188,7 @@ _USE_COREX_MOE_DIRECT_ROUTED = (
     _corex_moe_direct_routed is not None
     and env_bool("BI100_MOE_COREX_DIRECT_ROUTED", False))
 _USE_FUSED_MOE_ACTIVATION = env_bool("BI100_MOE_FUSED_ACTIVATION", True)
+_USE_IX_BRIDGE_MOE = (_HAS_IX_BRIDGE and env_bool("BI100_MOE_IX_BRIDGE", True))
 
 
 # ---------------------------------------------------------------------------
@@ -1688,18 +1697,32 @@ class Qwen3_5MoeSparseBlock(nn.Module):
                 out = (expert_out * ws.unsqueeze(-1)).sum(
                     0, keepdim=True).to(hidden_states.dtype)   # (1, H)
         else:
-            # General path (prefill / multi-seq): group assignments once. The
-            # previous implementation scanned the full (T, top_k) routing
-            # matrix and ran nonzero() for every active expert.
+            # General path (prefill / multi-seq)
             out = torch.zeros_like(hidden_states)
             flat_eids = topk_ids.reshape(-1)
             order = torch.argsort(flat_eids, stable=True)
             sorted_tok_ids = torch.arange(
                 T, device=topk_ids.device).repeat_interleave(self.top_k)[order]
             sorted_weights = topk_weights.reshape(-1)[order]
-            expert_counts = torch.bincount(
-                flat_eids, minlength=w13.shape[0]).tolist()
+            expert_counts_t = torch.bincount(
+                flat_eids, minlength=w13.shape[0])
 
+            if _USE_IX_BRIDGE_MOE:
+                # ix_bridge path: batched group_gemm instead of per-expert loop
+                try:
+                    sorted_hidden = hidden_states[sorted_tok_ids]
+                    gate_up = _ix_bridge.moe_group_gemm(
+                        sorted_hidden, w13, expert_counts_t)
+                    act = self.act_fn(gate_up)
+                    down = _ix_bridge.moe_group_gemm(
+                        act, w2, expert_counts_t)
+                    down_weighted = down * sorted_weights.unsqueeze(-1)
+                    out.index_add_(0, sorted_tok_ids, down_weighted.to(out.dtype))
+                    return out
+                except Exception as e:
+                    logger.warning("ix_bridge MoE failed (%s), falling back", e)
+
+            expert_counts = expert_counts_t.tolist()
             start = 0
             for eid, count in enumerate(expert_counts):
                 end = start + count
