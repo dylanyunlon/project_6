@@ -1054,9 +1054,11 @@ def _init_moe_topk():
     for pattern in so_patterns:
         for so_path in glob.glob(pattern):
             try:
-                torch.ops.load_library(so_path)
-                # After load_library, the pybind module should be importable
-                import moe_topk_softmax_v3 as ext
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(
+                    "moe_topk_softmax_v3", so_path)
+                ext = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(ext)
                 _moe_topk_ext = ext
                 logger.info("topk_softmax: loaded CUDA kernel from %s", so_path)
                 return

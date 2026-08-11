@@ -179,6 +179,11 @@ fi
 build_stage "installing hash-pinned CoreX 3.2.3 extensions"
 bash ./install_prebuilt_corex.sh "${VLLM_ROOT}"
 
+build_stage "compiling moe_topk_softmax CUDA kernel"
+cd /workspace && bash ex_engine/build_moe_topk.sh 2>&1 || echo "[WARN] moe_topk build failed (non-fatal)"
+# Deploy to workspace search path (_custom_ops.py looks in /workspace/ex_engine/build/)
+cd "${OLDPWD}"
+
 build_stage "installing BI100 runtime modules"
 cp ./bi100_env.py "${VLLM_ROOT}/bi100_env.py"
 cp ./bi100_profile.py "${VLLM_ROOT}/bi100_profile.py"
