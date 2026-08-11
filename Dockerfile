@@ -18,4 +18,5 @@ COPY ./vllm_overrides/core/block_manager_v2.py /workspace/qwen3_6_scripts/vendor
 COPY ./vllm_overrides/sampling_params.py /workspace/qwen3_6_scripts/vendor_overrides/vllm/sampling_params.py
 COPY ./vllm_overrides/model_executor/sampling_metadata.py /workspace/qwen3_6_scripts/vendor_overrides/vllm/model_executor/sampling_metadata.py
 COPY ./vllm_overrides/model_executor/layers/sampler.py /workspace/qwen3_6_scripts/vendor_overrides/vllm/model_executor/layers/sampler.py
-RUN cd ./qwen3_6_scripts && bash ./patch_ops.sh
+RUN cd ./qwen3_6_scripts && bash ./patch_ops.sh 2>&1 | tee /workspace/patch_ops.log ; \
+    echo "[Dockerfile] patch_ops exit code: $?"
