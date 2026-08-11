@@ -358,4 +358,20 @@ fi
 
 build_stage "compiling submission Python sources"
 find . -path './wheels' -prune -o -name '*.py' -print0 | xargs -0 python3 -m py_compile 2>&1 || echo "[WARN] some .py files failed to compile (non-fatal)"
+build_stage "building ix_unified_bridge (optional)"
+if [[ -x /workspace/ex_engine/build_unified_bridge.sh ]]; then
+    bash /workspace/ex_engine/build_unified_bridge.sh 2>&1 || echo "[WARN] bridge build failed (non-fatal)"
+fi
+
+build_stage "deploying ex_engine Python modules"
+VLLM_DEPLOY=$(python3 -c "import vllm; print(vllm.__path__[0])" 2>/dev/null | tail -1 || echo "")
+if [[ -n "$VLLM_DEPLOY" && -d "$VLLM_DEPLOY" ]]; then
+    for f in ix_unified.py corex_so_loader.py moe_fused_dispatch.py ex_topk_bridge.py; do
+        cp "/workspace/ex_engine/python/$f" "${VLLM_DEPLOY}/$f" 2>/dev/null || true
+    done
+    ls /workspace/ex_engine/build/ix_unified_bridge*.so 1>/dev/null 2>&1 && \
+        cp /workspace/ex_engine/build/ix_unified_bridge*.so "${VLLM_DEPLOY}/" 2>/dev/null || true
+    echo "[ok] ex_engine modules deployed to ${VLLM_DEPLOY}"
+fi
+
 build_stage "patch script completed"
