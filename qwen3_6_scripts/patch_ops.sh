@@ -107,6 +107,30 @@ VLLM_OVERRIDE_ROOT="./vendor_overrides/vllm"
     exit 2
 }
 
+# --- Mirror path: base image may have TWO vllm installs ---
+# VLLM_ROOT (from importlib) is typically /usr/local/lib/python3.10/site-packages/vllm
+# but PYTHONPATH puts /usr/local/corex/lib/python3/dist-packages/vllm first at runtime.
+# We must deploy to BOTH or the runtime loads the unpatched copy.
+VLLM2=""
+for _candidate in \
+    /usr/local/corex/lib/python3/dist-packages/vllm \
+    /usr/local/corex/lib64/python3/dist-packages/vllm \
+    /usr/local/lib/python3.10/site-packages/vllm; do
+    [[ -d "$_candidate" && "$_candidate" != "$VLLM_ROOT" ]] && { VLLM2="$_candidate"; break; }
+done
+if [[ -n "$VLLM2" ]]; then
+    echo "VLLM2=${VLLM2} (will mirror all patches)"
+else
+    echo "VLLM2=<none> (single vllm install)"
+fi
+
+# Helper: copy to VLLM_ROOT and VLLM2 (if exists)
+deploy_both() {
+    local src="$1" rel="$2"
+    cp "$src" "${VLLM_ROOT}/${rel}"
+    [[ -n "$VLLM2" ]] && cp "$src" "${VLLM2}/${rel}" 2>/dev/null || true
+}
+
 build_stage "installing authoritative vLLM core block overrides"
 install_patch_file \
     "${VLLM_OVERRIDE_ROOT}/core/evictor_v2.py" \
@@ -241,6 +265,56 @@ installed = Path(sys.argv[2]).read_bytes()
 if source != installed:
     raise SystemExit("runtime api_server overlay identity mismatch")
 PY
+
+# --- Mirror ALL patched files to VLLM2 (if a second vllm install exists) ---
+if [[ -n "$VLLM2" ]]; then
+    build_stage "mirroring patches to VLLM2=${VLLM2}"
+    # Critical: paged_attn.py (context_attention_fwd NameError without this)
+    cp "${VLLM_ROOT}/attention/ops/paged_attn.py" \
+       "${VLLM2}/attention/ops/paged_attn.py" 2>/dev/null || true
+    # Model
+    cp "${VLLM_ROOT}/model_executor/models/qwen3_5.py" \
+       "${VLLM2}/model_executor/models/qwen3_5.py" 2>/dev/null || true
+    cp "${VLLM_ROOT}/model_executor/models/mamba_cache.py" \
+       "${VLLM2}/model_executor/models/mamba_cache.py" 2>/dev/null || true
+    # Runtime modules
+    for f in bi100_env.py bi100_profile.py block_major_kv_cache.py \
+             gdn_prefix.py sequence.py; do
+        cp "${VLLM_ROOT}/${f}" "${VLLM2}/${f}" 2>/dev/null || true
+    done
+    # Core
+    cp "${VLLM_ROOT}/core/scheduler.py" \
+       "${VLLM2}/core/scheduler.py" 2>/dev/null || true
+    # Serving
+    for f in protocol.py cli_args.py serving_chat.py serving_tokenization.py \
+             api_server.py; do
+        cp "${VLLM_ROOT}/entrypoints/openai/${f}" \
+           "${VLLM2}/entrypoints/openai/${f}" 2>/dev/null || true
+    done
+    cp "${VLLM_ROOT}/entrypoints/chat_utils.py" \
+       "${VLLM2}/entrypoints/chat_utils.py" 2>/dev/null || true
+    # Tool parsers
+    cp "${VLLM_ROOT}/entrypoints/openai/tool_parsers/qwen3coder_tool_parser.py" \
+       "${VLLM2}/entrypoints/openai/tool_parsers/qwen3coder_tool_parser.py" 2>/dev/null || true
+    # Reasoning
+    cp -r "${VLLM_ROOT}/reasoning" "${VLLM2}/" 2>/dev/null || true
+    # Prebuilt CoreX .so extensions
+    for so in "${VLLM_ROOT}"/corex_*.so; do
+        [[ -f "$so" ]] && cp "$so" "${VLLM2}/" 2>/dev/null || true
+    done
+    # Block overrides
+    for f in core/evictor_v2.py core/block_manager_v2.py \
+             core/block/cpu_kv_content_cache.py core/block/cpu_gpu_block_allocator.py \
+             core/block/prefix_caching_block.py core/block/block_table.py \
+             model_executor/sampling_metadata.py model_executor/layers/sampler.py \
+             sampling_params.py; do
+        [[ -f "${VLLM_ROOT}/${f}" ]] && {
+            mkdir -p "$(dirname "${VLLM2}/${f}")"
+            cp "${VLLM_ROOT}/${f}" "${VLLM2}/${f}" 2>/dev/null || true
+        }
+    done
+    echo "[ok] mirrored all patches to VLLM2"
+fi
 
 build_stage "compiling submission Python sources"
 find . -path './wheels' -prune -o -name '*.py' -print0 | xargs -0 python3 -m py_compile
