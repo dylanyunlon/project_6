@@ -1,5 +1,6 @@
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
+import json
 import time
 from argparse import Namespace
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -57,10 +58,7 @@ class CustomChatCompletionMessageParam(TypedDict, total=False):
 
 class OpenAIBaseModel(BaseModel):
     # OpenAI API does not allow extra fields
-    # Real-world clients (replay, third-party SDKs) may send extra fields
-    # like service_tier, store, metadata, reasoning_effort, etc.
-    # "ignore" accepts the request and silently drops unknown fields.
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
 
 class ErrorResponse(OpenAIBaseModel):
@@ -143,6 +141,19 @@ class FunctionDefinition(OpenAIBaseModel):
     name: str
     description: Optional[str] = None
     parameters: Optional[Dict[str, Any]] = None
+    # OpenAI clients commonly serialize strict=false explicitly. It is a
+    # semantic no-op, so accept it but keep it out of the tokenizer template.
+    # strict=true requires constrained tool decoding that this runtime does not
+    # provide and must not be silently degraded to ordinary auto tool choice.
+    strict: Optional[bool] = Field(default=None, exclude=True)
+
+    @model_validator(mode="after")
+    def reject_unsupported_strict_tools(self):
+        if self.strict is True:
+            raise ValueError(
+                "Function tools with strict=true are not supported by this "
+                "runtime.")
+        return self
 
 
 class ChatCompletionToolsParam(OpenAIBaseModel):
@@ -169,10 +180,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
     logprobs: Optional[bool] = False
     top_logprobs: Optional[int] = 0
     max_tokens: Optional[int] = None
-    # OpenAI newer API uses max_completion_tokens as alias for max_tokens.
-    # CCCL namespace_wrapped.cu pattern: accept alternate names for same concept.
-    # Competition evaluator sends max_completion_tokens (values: 8192, 32768, 65536).
-    max_completion_tokens: Optional[int] = None
     n: Optional[int] = 1
     presence_penalty: Optional[float] = 0.0
     response_format: Optional[ResponseFormat] = None
@@ -184,15 +191,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
     top_p: Optional[float] = 1.0
     tools: Optional[List[ChatCompletionToolsParam]] = None
     tool_choice: Optional[Union[Literal["none"], Literal["auto"],
-                                Literal["required"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
+    thinking: Optional[Union[bool, str, Dict[str, Any]]] = None
 
     # NOTE this will be ignored by VLLM -- the model determines the behavior
     parallel_tool_calls: Optional[bool] = False
     user: Optional[str] = None
-    # Qwen3/OpenAI thinking/reasoning control.
-    # Competition evaluator sends thinking={enable:true/false}.
-    thinking: Optional[dict] = None
 
     # doc: begin-chat-completion-sampling-params
     best_of: Optional[int] = None
@@ -209,6 +213,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     spaces_between_special_tokens: bool = True
     truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
     prompt_logprobs: Optional[int] = None
+    bi100_prompt_logprobs_sample_positions: Optional[List[int]] = None
     # doc: end-chat-completion-sampling-params
 
     # doc: begin-chat-completion-extra-params
@@ -309,8 +314,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
         max_tokens = self.max_tokens
         if max_tokens is None:
             max_tokens = default_max_tokens
-        if default_max_tokens > 0:
-            max_tokens = min(max_tokens, default_max_tokens)
 
         n = self.n if self.n is not None else 1
         temperature = self.temperature if self.temperature is not None else 0.0
@@ -327,10 +330,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
         max_tokens = self.max_tokens
         if max_tokens is None:
             max_tokens = default_max_tokens
-        # Clamp to available context space so requests with max_tokens ≥
-        # max_model_len don't get rejected with HTTP 400.
-        if default_max_tokens > 0:
-            max_tokens = min(max_tokens, default_max_tokens)
 
         prompt_logprobs = self.prompt_logprobs
         if prompt_logprobs is None and self.echo:
@@ -340,7 +339,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
         guided_json_from_schema = None
         if self.response_format is not None:
             if self.response_format.type == "json_object":
-                guided_json_object = True
+                # The generic CFG backend has a stateful first-request bug in
+                # this vLLM/Outlines build. A generic object schema has the
+                # same API semantics and uses the stable regex backend.
+                guided_json_from_schema = {"type": "object"}
             elif (self.response_format.type == "json_schema"
                   and self.response_format.json_schema is not None
                   and self.response_format.json_schema.json_schema is not None):
@@ -373,6 +375,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
             stop_token_ids=self.stop_token_ids,
             logprobs=self.top_logprobs if self.logprobs else None,
             prompt_logprobs=prompt_logprobs,
+            prompt_logprob_positions=(
+                self.bi100_prompt_logprobs_sample_positions),
             ignore_eos=self.ignore_eos,
             max_tokens=max_tokens,
             min_tokens=self.min_tokens,
@@ -414,108 +418,137 @@ class ChatCompletionRequest(OpenAIBaseModel):
         reasoning_content is intentionally kept — chat_utils.py wraps it as
         <think>...</think> for multi-turn reasoning history.
         """
-        # Map max_completion_tokens → max_tokens (OpenAI API v2 name)
-        if data.get("max_completion_tokens") is not None and data.get("max_tokens") is None:
-            data["max_tokens"] = data["max_completion_tokens"]
-
-        # Validate max_tokens: reject negative values with 400.
-        # Tests t3_max_tokens_neg1 and t3_max_tokens_over expect HTTP 4xx.
-        _mt = data.get("max_tokens")
-        if _mt is not None and isinstance(_mt, (int, float)) and _mt < 0:
-            raise ValueError(
-                f"max_tokens must be non-negative, got {_mt}")
-
-        # Small max_tokens dispatch: when max_tokens is explicitly set and
-        # small (<=128), disable thinking so the model outputs content
-        # directly instead of spending all tokens on <think>...</think>.
-        # Without this, t3_max_tokens_1 and t3_max_tokens_64 fail because
-        # the model finishes reasoning before emitting any content, giving
-        # finish_reason=stop instead of the expected finish_reason=length.
-        if _mt is not None and isinstance(_mt, (int, float)) and 0 < _mt <= 128:
-            ctk = data.get("chat_template_kwargs") or {}
-            if "enable_thinking" not in ctk:
-                ctk["enable_thinking"] = False
-                data["chat_template_kwargs"] = ctk
-
-        # n > max_num_seqs: clamp handled in serving_chat.py via scheduler check.
-        # With max_num_seqs=2, n=2 should work. n>2 will be clamped there.
-
-        # Map thinking parameter → chat_template_kwargs.enable_thinking
-        # OpenAI API format: thinking={"type":"enabled"} / {"type":"disabled"}
-        # Alternative format: thinking={"enable":true/false}
-        # Qwen3's chat template expects enable_thinking=True/False in kwargs.
-        thinking = data.get("thinking")
-        thinking_explicitly_set = False
-        if isinstance(thinking, dict):
-            # Try OpenAI format first: {"type": "enabled"/"disabled"}
-            thinking_type = thinking.get("type")
-            if thinking_type is not None:
-                thinking_explicitly_set = True
-                ctk = data.get("chat_template_kwargs") or {}
-                ctk["enable_thinking"] = (thinking_type == "enabled"
-                                          or thinking_type is True)
-                data["chat_template_kwargs"] = ctk
-            else:
-                # Fallback: {"enable": true/false}
-                enable = thinking.get("enable")
-                if enable is not None:
-                    thinking_explicitly_set = True
-                    ctk = data.get("chat_template_kwargs") or {}
-                    ctk["enable_thinking"] = bool(enable)
-                    data["chat_template_kwargs"] = ctk
-
-        # CRITICAL: When tools are present with tool_choice=auto and thinking
-        # is NOT explicitly requested, disable thinking to preserve token budget
-        # for tool call XML generation. Without this, the model spends all
-        # tokens on <think>...</think> and finishes before emitting <tool_call>.
-        # This matches the competition reference (sub168: d03 in 2.12s).
-        if not thinking_explicitly_set:
-            has_tools = data.get("tools") is not None and len(data.get("tools", [])) > 0
-            tc = data.get("tool_choice")
-            tool_choice_active = (tc == "auto" or tc == "required"
-                                  or (tc is None and has_tools)
-                                  or isinstance(tc, dict))
-            if has_tools and tool_choice_active:
-                ctk = data.get("chat_template_kwargs") or {}
-                ctk["enable_thinking"] = False
-                data["chat_template_kwargs"] = ctk
-
         messages = data.get("messages")
         if not isinstance(messages, list):
             return data
-
-        # CCCL agent_for.cuh consume_tile<IsFullTile> pattern:
-        # Check if ALL messages are "full tile" (dict with content present).
-        # If so, skip per-element boundary checks entirely — fast path.
-        is_full_tile = all(
-            isinstance(m, dict) and m.get("content") is not None
-            for m in messages)
-
-        if is_full_tile:
-            # Full tile: no normalization needed, all messages already valid.
-            # This is the common case for standard chat requests.
-            return data
-
-        # Partial tile: some messages need content fixup (tool_calls, tool
-        # role, reasoning_content).  Process each with boundary checks.
         normalized = []
         for msg in messages:
             if not isinstance(msg, dict):
                 normalized.append(msg)
                 continue
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list):
+                normalized_calls = []
+                for call in tool_calls:
+                    if not isinstance(call, dict):
+                        normalized_calls.append(call)
+                        continue
+                    function = call.get("function")
+                    if not isinstance(function, dict):
+                        normalized_calls.append(call)
+                        continue
+                    arguments = function.get("arguments")
+                    if isinstance(arguments, dict):
+                        arguments = json.dumps(
+                            arguments,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    elif isinstance(arguments, str):
+                        try:
+                            decoded_arguments = json.loads(arguments)
+                        except json.JSONDecodeError as exc:
+                            raise ValueError(
+                                "Tool call arguments are not valid JSON."
+                            ) from exc
+                        if not isinstance(decoded_arguments, dict):
+                            raise ValueError(
+                                "Tool call arguments must decode to a JSON "
+                                "object.")
+                    elif arguments is not None:
+                        raise ValueError(
+                            "Tool call arguments must be a JSON object or a "
+                            "JSON-encoded object string.")
+                    if arguments is not None:
+                        function = {**function, "arguments": arguments}
+                        call = {**call, "function": function}
+                    normalized_calls.append(call)
+                msg = {**msg, "tool_calls": normalized_calls}
             if msg.get("content") is None:
-                if msg.get("reasoning_content") is not None:
-                    msg = {**msg, "content": ""}
-                elif msg.get("tool_calls") is not None:
-                    msg = {**msg, "content": ""}
-                elif msg.get("role") == "tool":
-                    msg = {**msg, "content": ""}
-                else:
+                if (msg.get("reasoning_content") is None
+                        and not msg.get("tool_calls")):
                     raise ValueError(
-                        "Each message must have at least one of 'content', "
-                        "'reasoning_content', or 'tool_calls'.")
+                        "Each message must have at least one of 'content' or "
+                        "'reasoning_content', or contain 'tool_calls'.")
+                msg = {**msg, "content": ""}
+            if (msg.get("role") == "system"
+                    and isinstance(msg.get("content"), list)):
+                content_parts = msg["content"]
+                if all(
+                        isinstance(part, dict)
+                        and part.get("type") == "text"
+                        and isinstance(part.get("text"), str)
+                        for part in content_parts):
+                    # Match chat_utils' existing text-part semantics before
+                    # combining multiple system messages for Qwen.
+                    msg = {
+                        **msg,
+                        "content": "\n".join(
+                            part["text"] for part in content_parts),
+                    }
             normalized.append(msg)
+
+        # Qwen's tokenizer template accepts at most one system message and
+        # requires it to be first. OpenAI-compatible clients may send several
+        # system messages, including after conversation history. Preserve
+        # their order and semantics by merging text content at the beginning.
+        system_messages = [
+            msg for msg in normalized
+            if isinstance(msg, dict) and msg.get("role") == "system"
+        ]
+        if system_messages:
+            system_contents = [
+                msg.get("content") for msg in system_messages
+            ]
+            if all(isinstance(content, str)
+                   for content in system_contents):
+                merged_system = {
+                    **system_messages[0],
+                    "content": "\n\n".join(system_contents),
+                }
+                normalized = [merged_system] + [
+                    msg for msg in normalized
+                    if not (isinstance(msg, dict)
+                            and msg.get("role") == "system")
+                ]
         data = {**data, "messages": normalized}
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_thinking(cls, data):
+        thinking = data.get("thinking")
+        if thinking is None:
+            return data
+
+        enable_thinking: Optional[bool] = None
+        if thinking is False:
+            enable_thinking = False
+        elif thinking is True:
+            enable_thinking = True
+        elif isinstance(thinking, str):
+            lowered = thinking.lower()
+            if lowered == "disabled":
+                enable_thinking = False
+            elif lowered == "enabled":
+                enable_thinking = True
+        elif isinstance(thinking, dict):
+            thinking_type = thinking.get("type")
+            if isinstance(thinking_type, str):
+                lowered = thinking_type.lower()
+                if lowered == "disabled":
+                    enable_thinking = False
+                elif lowered == "enabled":
+                    enable_thinking = True
+
+        if enable_thinking is None:
+            raise ValueError(
+                "`thinking` must be false, \"disabled\", true, \"enabled\", "
+                "or an object with type \"disabled\"/\"enabled\".")
+
+        chat_template_kwargs = dict(data.get("chat_template_kwargs") or {})
+        chat_template_kwargs["enable_thinking"] = enable_thinking
+        data = {**data, "chat_template_kwargs": chat_template_kwargs}
         return data
 
     @model_validator(mode="before")
@@ -551,6 +584,38 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def validate_bi100_prompt_logprob_sample(cls, data):
+        positions = data.get("bi100_prompt_logprobs_sample_positions")
+        if positions is None:
+            return data
+        if (
+            not isinstance(positions, list)
+            or not positions
+            or len(positions) > 4096
+            or any(
+                not isinstance(position, int)
+                or isinstance(position, bool)
+                or position <= 0
+                or position >= 262144
+                for position in positions
+            )
+            or positions != sorted(set(positions))
+        ):
+            raise ValueError(
+                "`bi100_prompt_logprobs_sample_positions` must be a sorted "
+                "unique list of prompt positions in [1, 262143].")
+        if data.get("stream"):
+            raise ValueError(
+                "BI100 sampled prompt logprobs require `stream=False`.")
+        if not isinstance(data.get("prompt_logprobs"), int) \
+                or data["prompt_logprobs"] <= 0:
+            raise ValueError(
+                "BI100 sampled prompt logprobs require positive "
+                "`prompt_logprobs`.")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def check_guided_decoding_count(cls, data):
         if isinstance(data, ValueError):
             raise data
@@ -565,8 +630,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
             raise ValueError(
                 "You can only use one kind of guided decoding "
                 "('guided_json', 'guided_regex' or 'guided_choice').")
-        # you can only either use guided decoding or tools, not both
-        if guide_count > 1 and data.get("tool_choice",
+        # you can only either use guided decoding or a forced tool, not both
+        if guide_count > 0 and data.get("tool_choice",
                                         "none") not in ("none", "auto"):
             raise ValueError(
                 "You can only either use guided decoding or tools, not both.")
@@ -583,11 +648,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
         # if "tool_choice" is specified -- validation
         if "tool_choice" in data:
-
-            # "none" means don't use any tools — valid per OpenAI spec,
-            # just strip tool_choice and let vLLM ignore tools.
             if data["tool_choice"] == "none":
-                del data["tool_choice"]
                 return data
 
             # ensure that if "tool choice" is specified, tools are present
@@ -596,12 +657,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     "When using `tool_choice`, `tools` must be set.")
 
             # make sure that tool choice is either a named tool
-            # OR that it's set to "auto"
-            if data["tool_choice"] not in ("auto", "required", "none") \
-                    and not isinstance(data["tool_choice"], dict):
+            # OR that it's set to "auto"/"none"
+            if data["tool_choice"] != "auto" and not isinstance(
+                    data["tool_choice"], dict):
                 raise ValueError(
-                    "`tool_choice` must be a named tool, \"auto\", "
-                    "\"required\", or \"none\".")
+                    "`tool_choice` must be a named tool, \"auto\", or "
+                    "\"none\".")
 
             # ensure that if "tool_choice" is specified as an object,
             # it matches a valid tool
@@ -763,7 +824,8 @@ class CompletionRequest(OpenAIBaseModel):
         guided_json_from_schema = None
         if self.response_format is not None:
             if self.response_format.type == "json_object":
-                guided_json_object = True
+                # Keep CompletionRequest aligned with ChatCompletionRequest.
+                guided_json_from_schema = {"type": "object"}
             elif (self.response_format.type == "json_schema"
                   and self.response_format.json_schema is not None
                   and self.response_format.json_schema.json_schema is not None):
@@ -1113,6 +1175,7 @@ class TokenizeChatRequest(OpenAIBaseModel):
     add_generation_prompt: bool = Field(default=True)
     continue_final_message: bool = Field(default=False)
     add_special_tokens: bool = Field(default=False)
+    chat_template_kwargs: Optional[Dict[str, Any]] = Field(default=None)
 
     @model_validator(mode="before")
     @classmethod

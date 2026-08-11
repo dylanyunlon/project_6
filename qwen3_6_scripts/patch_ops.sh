@@ -1,191 +1,247 @@
-#!/bin/bash
-# ==========================================================================
-# PATCH_OPS.SH v2 — Align with comp 168 strategy
+#!/usr/bin/env bash
+# BI-V100 patch script for Qwen3.6-35B-A3B (Qwen3_5 MoE architecture)
 #
-# COMP 168 PROOF (dockerrizhi.txt 07-23 lines 310-397):
-#   corex_gdn.py:56   → dlopen libcorex_gdn.so ✅
-#   corex_gdn.py:228  → GDN prefill fused ✅  
-#   corex_gdn.py:138  → GDN decode fused ✅
-#   corex_moe.py:339  → MoE prefill: expert-grouped-wmma ✅
-#   corex_moe.py:249  → MoE decode fused ✅
-#   corex_fa2.py:333  → FA2 packed prefill ✅
-#   corex_fa2.py:507  → FA2 paged chunked prefill ✅
-#   corex_fa2.py:225  → FA2 paged decode ✅
+# Triton situation on BI-V100:
+#   - Standard Triton 2.3.1 is already present in the image.
+#   - HAS_TRITON = False (hardcoded in vendor vllm), but Triton is still used
+#     for TP-mode cache management (custom_cache_manager / libentry).
+#   - The vendor's triton_utils/__init__.py, custom_cache_manager.py, libentry.py
+#     are already correct for standard Triton 2.3.1 — do NOT overwrite them.
+#   - DO NOT install BI-V150 corex Triton 2.1.0 (pkgs/triton): that causes
+#     GPU hang on BI-V100 because the Triton CUDA PTX kernels are incompatible.
+
+# Recommended server start command for TP=4 support 256K, needs chunked prefill
+# CUDA_VISIBLE_DEVICES="4,5,6,7" VLLM_ENGINE_ITERATION_TIMEOUT_S=3600 python3 -m vllm.entrypoints.openai.api_server \
+#     --model /workspace/models/Qwen3.6-35B-A3B --port 1111 --served-model-name llm \
+#     --max-model-len 262144 --trust-remote-code -tp 4 --gpu-memory-utilization 0.90 \
+#     --max-num-seqs 1 --disable-log-requests --disable-frontend-multiprocessing \
+#     --max-num-batched-tokens 8192 --enable-chunked-prefill --enable-prefix-caching \
+#     --max-seq-len-to-capture 32768 --enable-auto-tool-choice \
+#     --tool-call-parser qwen3_coder --reasoning-parser qwen3
 #
-# ALL 3 corex modules are IN THE BASE IMAGE and work correctly.
-# Our Sub508 failed because we OVERWROTE qwen3_5.py, breaking the call chain.
-#
-# STRATEGY: DO NOT TOUCH model layer. Only deploy:
-#   1. transformers config (Qwen3_5Config)
-#   2. serving layer (protocol/serving_chat/api_server/chat_utils/tool_parser/reasoning)
-#   3. ix_bridge.so (fills ixf_F.vllm_moe_topk_softmax gap if base _custom_ops hits it)
-#   4. _custom_ops.py patch (make topk_softmax use ix_bridge instead of crashing)
-# ==========================================================================
+# With prefix caching (GDN align-mode, requires chunked prefill):
+# CUDA_VISIBLE_DEVICES="4,5,6,7" VLLM_ENGINE_ITERATION_TIMEOUT_S=3600 python3 -m vllm.entrypoints.openai.api_server \
+#     --model /workspace/models/Qwen3.6-35B-A3B --port 1111 --served-model-name llm \
+#     --max-model-len 262144 --trust-remote-code -tp 4 --gpu-memory-utilization 0.90 \
+#     --max-num-seqs 1 --disable-log-requests --disable-frontend-multiprocessing \
+#     --max-num-batched-tokens 8192 --enable-chunked-prefill --enable-prefix-caching \
+#     --max-seq-len-to-capture 32768 --enable-auto-tool-choice \
+#     --tool-call-parser qwen3_coder --reasoning-parser qwen3
 
-cd "$(dirname "$0")"
-echo "[patch_ops.v2] START — comp 168 aligned strategy"
+set -euo pipefail
 
-VLLM=""
-for P in /usr/local/corex/lib/python3/dist-packages/vllm \
-         /usr/local/corex/lib64/python3/dist-packages/vllm; do
-    [ -d "$P" ] && VLLM="$P" && echo "[patch_ops] Found vllm at: $VLLM" && break
-done
-[ -z "$VLLM" ] && echo "[patch_ops] ERROR: vllm not found" && exit 1
+build_stage() { printf '[BI100 BUILD] %s\n' "$1" >&2; }
+require_file() {
+    local path=$1
+    [[ -f "$path" ]] || {
+        printf 'required patch source is missing: %s\n' "$path" >&2
+        exit 2
+    }
+}
+install_patch_file() {
+    local source=$1
+    local target=$2
 
-# ---- PROBE ----
-echo "[probe] === Base image state ==="
-_QW="$VLLM/model_executor/models/qwen3_5.py"
-[ -f "$_QW" ] && echo "[probe] qwen3_5.py: $(wc -c < "$_QW") bytes, $(wc -l < "$_QW") lines" || echo "[probe] qwen3_5.py: MISSING"
-for m in corex_gdn.py corex_moe.py corex_fa2.py; do
-    _F="$VLLM/model_executor/models/$m"
-    [ -f "$_F" ] && echo "[probe] $m: $(wc -c < "$_F") bytes" || echo "[probe] $m: MISSING"
-done
-ls -la /usr/local/corex/lib64/libcorex_*.so 2>/dev/null || echo "[probe] no libcorex_*.so"
-echo "[probe] ==========================="
-
-# Find secondary vllm path for mirroring
-VLLM2=""
-for P in /usr/local/corex/lib/python3/dist-packages/vllm \
-         /usr/local/corex/lib64/python3/dist-packages/vllm; do
-    [ -d "$P" ] && [ "$P" != "$VLLM" ] && VLLM2="$P" && break
-done
-
-# Helper: deploy to both vllm paths
-deploy_both() {
-    local src="$1" dst="$2"
-    cp "$src" "$VLLM/$dst" 2>/dev/null || true
-    [ -n "$VLLM2" ] && cp "$src" "$VLLM2/$dst" 2>/dev/null || true
+    require_file "$source"
+    mkdir -p "$(dirname "$target")"
+    install -m 0644 "$source" "$target"
 }
 
-# ===========================================================
-# 1. Transformers config (Qwen3_5Config support)
-# ===========================================================
-TMODELS=""
-for P in /usr/local/lib/python3.10/site-packages/transformers/models \
-         /usr/local/corex/lib/python3/dist-packages/transformers/models; do
-    [ -d "$P" ] && TMODELS="$P" && break
-done
-if [ -n "$TMODELS" ]; then
-    pip install transformers==4.55.3 -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 30 2>&1 || true
-    apt-get update -qq && apt-get install -y -qq ninja-build 2>&1 || true
-    cp -r ./qwen3_5 "$TMODELS/" 2>/dev/null || true
-    cp -r ./qwen3_5_moe "$TMODELS/" 2>/dev/null || true
-    python3 ./patch_transformers_qwen3_5.py 2>&1 || true
-    echo "[patch_ops] transformers config deployed"
+build_stage "patch script entered"
+
+build_stage "checking offline transformers dependency"
+# --- transformers: Qwen3_5 tokenizer / model files --------------------------
+TRANSFORMERS_REQUIRED_VERSION="4.55.3"
+if ! python3 - "$TRANSFORMERS_REQUIRED_VERSION" <<'PY'
+import importlib.metadata
+import sys
+
+required = sys.argv[1]
+try:
+    installed = importlib.metadata.version("transformers")
+except importlib.metadata.PackageNotFoundError:
+    raise SystemExit(1)
+raise SystemExit(0 if installed == required else 1)
+PY
+then
+  WHEEL_DIR="./wheels"
+  if ! ls "${WHEEL_DIR}/transformers-${TRANSFORMERS_REQUIRED_VERSION}"*.whl >/dev/null 2>&1; then
+    echo "transformers ${TRANSFORMERS_REQUIRED_VERSION} is required, but no offline wheel was found in ${WHEEL_DIR}" >&2
+    exit 2
+  fi
+  python3 -m pip install --no-index --no-deps --find-links="${WHEEL_DIR}" \
+    "transformers==${TRANSFORMERS_REQUIRED_VERSION}"
 fi
 
-# ===========================================================
-# 2. MODEL LAYER — CONDITIONAL deployment
-#    If base has qwen3_5.py > 1000 bytes → DO NOT OVERWRITE
-#    This is the comp 168 strategy.
-# ===========================================================
-_QW_SIZE=0
-[ -f "$_QW" ] && _QW_SIZE=$(wc -c < "$_QW")
+python3 - "$TRANSFORMERS_REQUIRED_VERSION" <<'PY'
+import importlib.metadata
+import sys
 
-if [ "$_QW_SIZE" -gt 1000 ]; then
-    echo "[patch_ops] *** BASE IMAGE HAS qwen3_5.py (${_QW_SIZE} bytes) — KEEPING IT ***"
-    echo "[patch_ops] *** This is the comp 168 strategy: don't break corex_* call chain ***"
-    
-    # Only add registry entry if missing
-    if ! grep -q "Qwen3_5ForCausalLM" "$VLLM/model_executor/models/registry.py" 2>/dev/null; then
-        cp ./registry.py "$VLLM/model_executor/models/registry.py" 2>/dev/null && \
-            echo "[patch_ops] registry.py deployed (was missing Qwen3_5)"
-        [ -n "$VLLM2" ] && cp ./registry.py "$VLLM2/model_executor/models/registry.py" 2>/dev/null || true
-    fi
-else
-    echo "[patch_ops] *** BASE IMAGE MISSING qwen3_5.py — deploying ours ***"
-    deploy_both ./qwen3_5.py "model_executor/models/qwen3_5.py"
-    deploy_both ./registry.py "model_executor/models/registry.py"
-    deploy_both ./mamba_cache.py "model_executor/models/mamba_cache.py"
-    
-    # Only deploy corex modules if base doesn't have them
-    for m in corex_gdn.py corex_moe.py corex_fa2.py; do
-        if [ ! -f "$VLLM/model_executor/models/$m" ]; then
-            deploy_both "/workspace/ex_engine/python/$m" "model_executor/models/$m"
-            echo "[patch_ops] deployed $m (was MISSING)"
-        fi
-    done
-    
-    # flash_qla_sm70 (only if we deployed our qwen3_5.py)
-    _FLASH_SRC="/workspace/qwen3_6_scripts/flash_qla_sm70"
-    if [ -d "$_FLASH_SRC" ]; then
-        for _VPATH in "$VLLM" "$VLLM2"; do
-            [ -z "$_VPATH" ] && continue
-            cp -r "$_FLASH_SRC" "$_VPATH/model_executor/models/flash_qla_sm70" 2>/dev/null || true
-        done
-        echo "[patch_ops] flash_qla_sm70 deployed"
-    fi
-fi
+required = sys.argv[1]
+installed = importlib.metadata.version("transformers")
+if installed != required:
+    raise SystemExit(
+        f"transformers version mismatch: expected {required}, got {installed}")
+print(f"[ok] transformers {installed}")
+PY
 
-# ===========================================================
-# 3. SERVING LAYER — always deploy (comp 168 also used custom serving)
-# ===========================================================
-mkdir -p "$VLLM/entrypoints/openai/tool_parsers" 2>/dev/null || true
-[ -n "$VLLM2" ] && mkdir -p "$VLLM2/entrypoints/openai/tool_parsers" 2>/dev/null || true
+build_stage "discovering Python package roots"
+python3 - <<'PY' > /tmp/qwen36_patch_paths.env
+from patch_utils import package_root, shell_env_line
 
-deploy_both ./protocol.py "entrypoints/openai/protocol.py"
-deploy_both ./cli_args.py "entrypoints/openai/cli_args.py"
-deploy_both ./serving_chat.py "entrypoints/openai/serving_chat.py"
-deploy_both ./api_server.py "entrypoints/openai/api_server.py"
-deploy_both ./chat_utils.py "entrypoints/chat_utils.py"
-deploy_both ./qwen3coder_tool_parser.py "entrypoints/openai/tool_parsers/qwen3coder_tool_parser.py"
-deploy_both ./tool_parsers_init.py "entrypoints/openai/tool_parsers/__init__.py"
-python3 ./patch_vllm_tool_parser.py 2>&1 || true
-cp -r ./reasoning "$VLLM/" 2>/dev/null || true
-[ -n "$VLLM2" ] && cp -r ./reasoning "$VLLM2/" 2>/dev/null || true
-echo "[patch_ops] serving layer deployed"
+print(shell_env_line("VLLM_ROOT", package_root("vllm")))
+print(shell_env_line("TRANSFORMERS_ROOT", package_root("transformers")))
+PY
+source /tmp/qwen36_patch_paths.env
 
-# ===========================================================
-# 4. ix_bridge.so — ONLY PURPOSE: fill ixf_F.vllm_moe_topk_softmax gap
-#    Even comp 168 had this issue — the base _custom_ops.py tries to call
-#    ixf_F.vllm_moe_topk_softmax which doesn't exist.
-#    BUT comp 168's corex_moe.py bypasses _custom_ops entirely.
-#    So ix_bridge is only needed if base qwen3_5.py path hits _custom_ops.
-# ===========================================================
-_SITE="/usr/local/corex/lib/python3/dist-packages"
-if [ -d "$_SITE" ]; then
-    _EX_DST="$_SITE/ex_engine"
-    mkdir -p "$_EX_DST/python" "$_EX_DST/build" "$_EX_DST/csrc"
-    cp /workspace/ex_engine/python/*.py "$_EX_DST/python/" 2>/dev/null || true
-    touch "$_EX_DST/__init__.py" "$_EX_DST/python/__init__.py"
-    
-    # Deploy pre-built .so
-    if [ -d "/workspace/ex_engine/build" ]; then
-        cp /workspace/ex_engine/build/*.so "$_EX_DST/build/" 2>/dev/null || true
-        cp /workspace/ex_engine/build/*.so "$_EX_DST/" 2>/dev/null || true
-        echo "[patch_ops] ex_engine .so deployed: $(ls /workspace/ex_engine/build/*.so 2>/dev/null | wc -l) files"
-    fi
-    
-    # C++ sources for JIT
-    cp /workspace/ex_engine/csrc/ix_full_bridge.cpp "$_EX_DST/csrc/" 2>/dev/null || true
-    cp /workspace/ex_engine/csrc/ix_moe_bridge.cpp "$_EX_DST/csrc/" 2>/dev/null || true
-    
-    echo "[patch_ops] ex_engine package deployed to $_SITE"
-fi
+echo "VLLM_ROOT=${VLLM_ROOT}"
+echo "TRANSFORMERS_ROOT=${TRANSFORMERS_ROOT}"
+[[ -d "$VLLM_ROOT" ]] || {
+    printf 'vLLM root does not exist: %s\n' "$VLLM_ROOT" >&2
+    exit 2
+}
 
-# ===========================================================
-# 5. XFormers patches — head_dim=256 bypass for BI-V100
-#    Comp 168 also had xformers patches (base uses xformers for attention)
-# ===========================================================
-python3 ./patch_xformers_sdpa_seq.py 2>&1 || true
-python3 ./patch_xformers_sdpa_batch.py 2>&1 || true
-echo "[patch_ops] xformers patches applied"
+VLLM_OVERRIDE_ROOT="./vendor_overrides/vllm"
+[[ -d "$VLLM_OVERRIDE_ROOT" ]] || {
+    printf 'vLLM override directory missing: %s\n' "$VLLM_OVERRIDE_ROOT" >&2
+    exit 2
+}
 
-# ===========================================================
-# 6. model_runner patch (prefix_cache_hit fix)
-# ===========================================================
-python3 ./patch_model_runner.py 2>&1 || true
-echo "[patch_ops] model_runner patched"
+build_stage "installing authoritative vLLM core block overrides"
+install_patch_file \
+    "${VLLM_OVERRIDE_ROOT}/core/evictor_v2.py" \
+    "${VLLM_ROOT}/core/evictor_v2.py"
+install_patch_file \
+    "${VLLM_OVERRIDE_ROOT}/core/block/cpu_kv_content_cache.py" \
+    "${VLLM_ROOT}/core/block/cpu_kv_content_cache.py"
+install_patch_file \
+    "${VLLM_OVERRIDE_ROOT}/core/block/cpu_gpu_block_allocator.py" \
+    "${VLLM_ROOT}/core/block/cpu_gpu_block_allocator.py"
+install_patch_file \
+    "${VLLM_OVERRIDE_ROOT}/core/block/prefix_caching_block.py" \
+    "${VLLM_ROOT}/core/block/prefix_caching_block.py"
+install_patch_file \
+    "${VLLM_OVERRIDE_ROOT}/core/block/block_table.py" \
+    "${VLLM_ROOT}/core/block/block_table.py"
+install_patch_file \
+    "${VLLM_OVERRIDE_ROOT}/core/block_manager_v2.py" \
+    "${VLLM_ROOT}/core/block_manager_v2.py"
+install_patch_file \
+    "${VLLM_OVERRIDE_ROOT}/sampling_params.py" \
+    "${VLLM_ROOT}/sampling_params.py"
+install_patch_file \
+    "${VLLM_OVERRIDE_ROOT}/model_executor/sampling_metadata.py" \
+    "${VLLM_ROOT}/model_executor/sampling_metadata.py"
+install_patch_file \
+    "${VLLM_OVERRIDE_ROOT}/model_executor/layers/sampler.py" \
+    "${VLLM_ROOT}/model_executor/layers/sampler.py"
 
-# ===========================================================
-# 7. Deploy precompiled .so files
-# ===========================================================
-for _SO in /workspace/ex_engine/moe_topk_softmax_v3*.so /tmp/torch_extensions/*/moe_topk_softmax_v3*.so; do
-    [ -f "$_SO" ] && cp "$_SO" "$_SITE/" 2>/dev/null && echo "[patch_ops] MoE topk .so: $(basename $_SO)" && break
-done
-for _SO in /workspace/ex_engine/moe_ops_v055*.so /tmp/torch_extensions/*/moe_ops_v055*.so; do
-    [ -f "$_SO" ] && cp "$_SO" "$_SITE/" 2>/dev/null && echo "[patch_ops] MoE v055 .so: $(basename $_SO)" && break
-done
+build_stage "installing hash-pinned CoreX 3.2.3 extensions"
+bash ./install_prebuilt_corex.sh "${VLLM_ROOT}"
 
-echo "[patch_ops.v2] DONE — comp 168 aligned"
-echo "[patch_ops.v2] KEY: base qwen3_5.py $([ "$_QW_SIZE" -gt 1000 ] && echo "KEPT" || echo "REPLACED"), serving layer deployed"
+build_stage "installing BI100 runtime modules"
+cp ./bi100_env.py "${VLLM_ROOT}/bi100_env.py"
+cp ./bi100_profile.py "${VLLM_ROOT}/bi100_profile.py"
+cp ./block_major_kv_cache.py "${VLLM_ROOT}/block_major_kv_cache.py"
+cp ./gdn_prefix.py "${VLLM_ROOT}/gdn_prefix.py"
+
+build_stage "installing CoreX paged-KV swap compatibility"
+python3 ./patch_corex_swap_blocks.py
+python3 ./patch_block_major_cache_engine.py
+python3 ./patch_worker_cache_transfer_order.py
+
+# --- paged_attn.py: replace forward_prefix with pure-PyTorch fallback -------
+# The Triton context_attention_fwd kernel hangs BI-V100 GPUs permanently
+# (standard Triton 2.3.1 PTX is not supported by the corex runtime either).
+# Our paged_attn.py bypasses it entirely via _forward_prefix_pytorch, which
+# utilizes K-tiling techniques, and also have _forward_decode_pytorch to bypass kernel
+# when context length is high
+cp ./paged_attn.py "${VLLM_ROOT}/attention/ops/paged_attn.py"
+
+# --- model_runner.py: fix prefix_cache_hit stays True in chunked-prefill chunk 2+ ---
+# Bug: _compute_for_prefix_cache_hit Case 1 (prefix_cache_len <= context_len)
+# leaves prefix_cache_hit=True. Then _add_seq_group uses block_table=computed_block_nums
+# (only the original prefix blocks), ignoring chunk-1 KV cache blocks.
+# _forward_prefix_pytorch then gets an undersized block_tables and crashes with
+# "amax(): Expected reduction dim -1 to have non-zero size" on the 2nd tile.
+# Fix: set prefix_cache_hit=False for Case 1 so the full block_tables is used.
+python3 ./patch_model_runner.py
+
+build_stage "installing executor startup diagnostics"
+python3 ./patch_executor_startup_debug.py
+python3 ./patch_worker_startup_profile_guard.py
+python3 ./patch_block_major_worker_capacity.py
+
+build_stage "installing transformers Qwen3.5 model support"
+cp -r ./qwen3_5 "${TRANSFORMERS_ROOT}/models/"
+cp -r ./qwen3_5_moe "${TRANSFORMERS_ROOT}/models/"
+python3 ./patch_transformers_qwen3_5.py
+
+build_stage "installing vLLM Qwen3.6 model implementation"
+# --- vllm model: Qwen3.6-35B-A3B (Qwen3_5 MoE arch) -------------------------
+cp ./mamba_cache.py "${VLLM_ROOT}/model_executor/models/"
+cp ./qwen3_5.py "${VLLM_ROOT}/model_executor/models/qwen3_5.py"
+python3 ./patch_vllm_qwen3_5.py
+
+# --- sequence.py: fix completion_tokens inflation under chunked prefill ------
+# Bug: get_output_token_ids_to_return(delta=True) with num_new_tokens=0
+# returns _cached_all_token_ids[-0:] == [0:] (the ENTIRE prompt+output list).
+# Each prefill chunk step adds prompt_len to previous_num_tokens, so a 10K
+# prompt processed in 3 chunks inflates completion_tokens by ~30K.
+# Also adds num_cached_tokens field to RequestMetrics for prefix-cache stats.
+cp ./sequence.py "${VLLM_ROOT}/sequence.py"
+
+# --- scheduler.py: record num_cached_tokens in RequestMetrics ----------------
+# Reports only the longest prefix backed by both live KV blocks and an exact
+# GDN restore state. Raw KV-only hits must not inflate cached_tokens.
+# serving_chat.py exposes the value in the OpenAI-compatible usage details.
+cp ./scheduler.py "${VLLM_ROOT}/core/scheduler.py"
+
+build_stage "installing diagnostic initial allocation trace"
+python3 ./patch_block_manager_cache_trace.py
+
+build_stage "installing scheduler and attention patches"
+# --- xformers: bypass cudnnFlashAttnForward (head_dim=256 > 128 limit) ------
+# Injects _run_sdpa_fallback (pure matmul+softmax) into xformers.py.
+# Required because head_dim=256 > 128 and ixformer flash attention either
+# crashes (is_causal=True) or produces wrong output (attn_mask path).
+# The fallback uses query_start_loc to derive actual query lengths, so it
+# works correctly during profiling runs with chunked-prefill-style batches.
+# also bypasses auto chunked prefill on
+python3 ./patch_xformers_sdpa_seq.py
+python3 ./patch_xformers_profile.py
+
+build_stage "installing API parsers and serving modules"
+# --- tool parser: Qwen3 XML tool call format ---------------------------------
+# Registers "qwen3_coder" parser for Qwen3.6 XML-style tool calls:
+#   <tool_call><function=name><parameter=key>\nvalue\n</parameter></function></tool_call>
+# Use at server start: --tool-call-parser qwen3_coder --enable-auto-tool-choice
+cp ./qwen3coder_tool_parser.py "${VLLM_ROOT}/entrypoints/openai/tool_parsers/"
+python3 ./patch_vllm_tool_parser.py
+
+# --- reasoning parser: Qwen3 <think>...</think> split ------------------------
+# Adds --reasoning-parser qwen3 support.
+# Routes thinking tokens to reasoning_content, rest to content in the delta.
+# Works together with --tool-call-parser qwen3_coder (think → tool call flow).
+cp -r ./reasoning "${VLLM_ROOT}/"
+cp ./protocol.py "${VLLM_ROOT}/entrypoints/openai/protocol.py"
+cp ./cli_args.py "${VLLM_ROOT}/entrypoints/openai/cli_args.py"
+cp ./serving_chat.py "${VLLM_ROOT}/entrypoints/openai/serving_chat.py"
+cp ./serving_tokenization.py \
+    "${VLLM_ROOT}/entrypoints/openai/serving_tokenization.py"
+cp ./api_server.py "${VLLM_ROOT}/entrypoints/openai/api_server.py"
+cp ./chat_utils.py "${VLLM_ROOT}/entrypoints/chat_utils.py"
+python3 - ./api_server.py \
+        "${VLLM_ROOT}/entrypoints/openai/api_server.py" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_bytes()
+installed = Path(sys.argv[2]).read_bytes()
+if source != installed:
+    raise SystemExit("runtime api_server overlay identity mismatch")
+PY
+
+build_stage "compiling submission Python sources"
+find . -path './wheels' -prune -o -name '*.py' -print0 | xargs -0 python3 -m py_compile
+build_stage "patch script completed"

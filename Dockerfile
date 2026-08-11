@@ -1,27 +1,21 @@
 FROM git.modelhub.org.cn:9443/enginex-iluvatar/bi100-3.2.3-x86-ubuntu20.04-py3.10-poc-llm-infer:v1.2.3
 
-RUN mkdir -p /workspace
+ENV PATH=/usr/local/corex/bin:/usr/local/corex-3.2.3/bin:/usr/local/openmpi/bin:${PATH}
+ENV PYTHONPATH=/usr/local/corex/lib64/python3/dist-packages:/usr/local/corex/lib/python3/dist-packages
+ENV LD_LIBRARY_PATH=/usr/local/corex/lib:/usr/local/corex/lib64:/usr/local/corex-3.2.3/lib:/usr/local/corex-3.2.3/lib64:/usr/local/openmpi/lib
+ENV VLLM_ENGINE_ITERATION_TIMEOUT_S=3600 PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 BI100_EXECUTOR_STARTUP_DEBUG=1 ENABLE_CUSTOM_IPC=1
+ENV BI100_PREFIX_MODEL_FINGERPRINT=Qwen3.6-35B-A3B BI100_PREFIX_DTYPE=float16 BI100_PREFIX_TP_SIZE=4
+
+RUN mkdir /workspace
 WORKDIR /workspace/
-
-# Copy sources
 COPY ./qwen3_6_scripts /workspace/qwen3_6_scripts
-COPY ./computility-run.yaml /workspace/computility-run.yaml
-COPY ./ex_engine /workspace/ex_engine
-
-# Step 1: Compile ix_moe_bridge.so — dlopen bridge to libixformer.so
-# This is THE critical .so: it exposes topk_softmax + 11 other ixformer::infer
-# functions that the base image's Python binding doesn't expose.
-RUN chmod +x /workspace/ex_engine/build.sh && \
-    bash /workspace/ex_engine/build.sh 2>&1 | tee /workspace/build.log ; \
-    echo "[Docker] build exit code: $?"
-
-# Step 2: Deploy patches (serving layer + conditional model layer)
-# patch_ops.sh v2: does NOT overwrite base qwen3_5.py (comp 168 strategy)
-RUN chmod +x /workspace/qwen3_6_scripts/patch_ops.sh && \
-    bash /workspace/qwen3_6_scripts/patch_ops.sh 2>&1 | tee /workspace/patch_ops.log ; \
-    echo "[Docker] patch_ops exit code: $?"
-
-# Step 3: Precompile GDN kernel (needs vllm in path)
-RUN python3 /workspace/qwen3_6_scripts/precompile_gdn.py \
-    /workspace/qwen3_6_scripts/flash_qla_sm70 2>&1 | tee -a /workspace/build.log ; \
-    echo "[Docker] gdn precompile exit code: $?"
+COPY ./vllm_overrides/core/evictor_v2.py /workspace/qwen3_6_scripts/vendor_overrides/vllm/core/evictor_v2.py
+COPY ./vllm_overrides/core/block/cpu_kv_content_cache.py /workspace/qwen3_6_scripts/vendor_overrides/vllm/core/block/cpu_kv_content_cache.py
+COPY ./vllm_overrides/core/block/cpu_gpu_block_allocator.py /workspace/qwen3_6_scripts/vendor_overrides/vllm/core/block/cpu_gpu_block_allocator.py
+COPY ./vllm_overrides/core/block/prefix_caching_block.py /workspace/qwen3_6_scripts/vendor_overrides/vllm/core/block/prefix_caching_block.py
+COPY ./vllm_overrides/core/block/block_table.py /workspace/qwen3_6_scripts/vendor_overrides/vllm/core/block/block_table.py
+COPY ./vllm_overrides/core/block_manager_v2.py /workspace/qwen3_6_scripts/vendor_overrides/vllm/core/block_manager_v2.py
+COPY ./vllm_overrides/sampling_params.py /workspace/qwen3_6_scripts/vendor_overrides/vllm/sampling_params.py
+COPY ./vllm_overrides/model_executor/sampling_metadata.py /workspace/qwen3_6_scripts/vendor_overrides/vllm/model_executor/sampling_metadata.py
+COPY ./vllm_overrides/model_executor/layers/sampler.py /workspace/qwen3_6_scripts/vendor_overrides/vllm/model_executor/layers/sampler.py
+RUN cd ./qwen3_6_scripts && bash ./patch_ops.sh
