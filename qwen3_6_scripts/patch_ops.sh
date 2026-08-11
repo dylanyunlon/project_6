@@ -94,18 +94,43 @@ except Exception as e:
 PY
 
 build_stage "discovering Python package roots"
-python3 - <<'PY' > /tmp/qwen36_patch_paths.env
+python3 - <<'PY' > /tmp/qwen36_patch_paths.env || true
 from patch_utils import package_root, shell_env_line
 
 print(shell_env_line("VLLM_ROOT", package_root("vllm")))
 print(shell_env_line("TRANSFORMERS_ROOT", package_root("transformers")))
 PY
-source /tmp/qwen36_patch_paths.env
+source /tmp/qwen36_patch_paths.env 2>/dev/null || true
+
+# Fallback: if patch_utils failed, find vllm manually
+if [[ -z "${VLLM_ROOT:-}" ]]; then
+    for _candidate in \
+        /usr/local/corex/lib/python3/dist-packages/vllm \
+        /usr/local/corex/lib64/python3/dist-packages/vllm \
+        /usr/local/lib/python3.10/site-packages/vllm; do
+        if [[ -d "$_candidate" ]]; then
+            VLLM_ROOT="$_candidate"
+            break
+        fi
+    done
+fi
+if [[ -z "${TRANSFORMERS_ROOT:-}" ]]; then
+    for _candidate in \
+        /usr/local/corex/lib/python3/dist-packages/transformers \
+        /usr/local/corex/lib64/python3/dist-packages/transformers \
+        /usr/local/lib/python3.10/site-packages/transformers; do
+        if [[ -d "$_candidate" ]]; then
+            TRANSFORMERS_ROOT="$_candidate"
+            break
+        fi
+    done
+fi
 
 echo "VLLM_ROOT=${VLLM_ROOT}"
 echo "TRANSFORMERS_ROOT=${TRANSFORMERS_ROOT}"
-[[ -d "$VLLM_ROOT" ]] || {
-    printf 'vLLM root does not exist: %s\n' "$VLLM_ROOT" >&2
+[[ -d "${VLLM_ROOT:-}" ]] || {
+    printf '[FATAL] vLLM root does not exist: %s\n' "${VLLM_ROOT:-UNSET}" >&2
+    printf '[FATAL] Tried patch_utils + manual scan, neither found vllm\n' >&2
     exit 2
 }
 
