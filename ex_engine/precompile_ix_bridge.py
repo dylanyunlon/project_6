@@ -85,7 +85,7 @@ def main():
         logger.warning("This is expected if building outside the base image")
     
     # Build flags
-    extra_ldflags = []
+    extra_ldflags = ["-Wl,--unresolved-symbols=ignore-in-shared-libs"]
     for d in lib_dirs:
         extra_ldflags.extend([f"-L{d}", "-Wl,-rpath," + d])
     extra_ldflags.append("-lixformer")
