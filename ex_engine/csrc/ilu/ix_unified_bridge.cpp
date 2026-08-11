@@ -41,7 +41,7 @@ static torch::Tensor py_silu_and_mul(torch::Tensor input) {
 // --- Norm ---
 static void py_rms_norm(torch::Tensor output, torch::Tensor input,
                         torch::Tensor weight, double eps) {
-    std::optional<torch::Tensor> bias = std::nullopt;
+    c10::optional<torch::Tensor> bias = c10::nullopt;
     infer::rms_norm(input, weight, output, bias, eps);
 }
 
@@ -49,7 +49,7 @@ static void py_fused_add_rms_norm(torch::Tensor input, torch::Tensor residual,
                                   torch::Tensor weight, double eps) {
     auto output = torch::empty_like(input);
     auto residual_out = torch::empty_like(input);
-    std::optional<torch::Tensor> bias = std::nullopt;
+    c10::optional<torch::Tensor> bias = c10::nullopt;
     infer::residual_rms_norm(input, residual, weight, output, residual_out,
                              bias, /*alpha=*/1.0, eps, /*is_post=*/false);
     // Copy back in-place
@@ -109,9 +109,9 @@ static torch::Tensor py_flash_attn_prefill(
     int64_t wl = -1, wr = -1;
     double softcap = 0.0;
     bool sqrt_alibi = false;
-    std::optional<torch::Tensor> alibi = std::nullopt;
-    std::optional<torch::Tensor> sinks = std::nullopt;
-    std::optional<torch::Tensor> lse = std::nullopt;
+    c10::optional<torch::Tensor> alibi = c10::nullopt;
+    c10::optional<torch::Tensor> sinks = c10::nullopt;
+    c10::optional<torch::Tensor> lse = c10::nullopt;
     return infer::ixinfer_flash_attn_unpad_with_block_tables(
         query, key_cache, value_cache, output, block_tables,
         cu_seq_q, cu_seq_k, max_seq_q, max_seq_k,
@@ -126,13 +126,13 @@ static torch::Tensor py_paged_attention(
     int64_t num_kv_heads, double scale,
     torch::Tensor block_tables, torch::Tensor context_lens,
     int64_t block_size, int64_t max_context_len) {
-    std::optional<torch::Tensor> alibi = std::nullopt;
+    c10::optional<torch::Tensor> alibi = c10::nullopt;
     bool causal = true;
     int32_t wl = -1, wr = -1;
     double softcap = 0.0;
     bool enable_cuda_graph = false;
     bool sqrt_alibi = false;
-    std::optional<torch::Tensor> sinks = std::nullopt;
+    c10::optional<torch::Tensor> sinks = c10::nullopt;
     return infer::xllm_paged_attention(
         output, query, key_cache, value_cache,
         num_kv_heads, scale, block_tables, context_lens,
@@ -170,9 +170,9 @@ static std::vector<torch::Tensor> py_moe_gen_idx(
 
     infer::moe_compute_token_index_api(
         expert_ids, src_dst, dst_src, expert_sizes,
-        /*expert_mask=*/std::nullopt,
-        /*expert_sizes_cpu=*/std::nullopt,
-        /*expand_tokens_gpu=*/std::nullopt,
+        /*expert_mask=*/c10::nullopt,
+        /*expert_sizes_cpu=*/c10::nullopt,
+        /*expand_tokens_gpu=*/c10::nullopt,
         /*start_expert_id=*/0,
         /*end_expert_id=*/num_experts,
         /*num_experts=*/num_experts);
@@ -200,8 +200,8 @@ static torch::Tensor py_moe_group_gemm(
     auto output = input.new_empty({input.size(0), out_features});
     infer::moe_w16a16_group_gemm(
         output, input, weight, tokens_per_experts,
-        /*dst_to_src=*/std::nullopt,
-        /*bias=*/std::nullopt,
+        /*dst_to_src=*/c10::nullopt,
+        /*bias=*/c10::nullopt,
         /*format=*/"TN",
         /*persistent=*/0,
         /*output_n=*/input.size(0));
@@ -216,8 +216,8 @@ static torch::Tensor py_moe_combine_result(
     auto output = input.new_empty({inp_3d.size(0), inp_3d.size(2)});
     infer::moe_output_reduce_sum(
         output, inp_3d, weights,
-        /*mask=*/std::nullopt,
-        /*extra_residual=*/std::nullopt,
+        /*mask=*/c10::nullopt,
+        /*extra_residual=*/c10::nullopt,
         /*scaling_factor=*/1.0);
     return output;
 }

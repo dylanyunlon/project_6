@@ -7,7 +7,7 @@
 #pragma once
 
 #include <torch/all.h>
-#include <optional>
+// #include <optional>  // use c10::optional instead
 #include <iostream>
 #include <stdexcept>
 
@@ -44,23 +44,23 @@ void act_and_mul(torch::Tensor out,
 
 void reshape_paged_cache(
     torch::Tensor& key,
-    std::optional<torch::Tensor>& value,
+    c10::optional<torch::Tensor>& value,
     torch::Tensor& key_cache,
-    std::optional<torch::Tensor>& value_cache,
+    c10::optional<torch::Tensor>& value_cache,
     torch::Tensor& slot_mapping);
 
 void batch_prefill(torch::Tensor& query,
                    const torch::Tensor& key,
-                   const std::optional<torch::Tensor>& value,
+                   const c10::optional<torch::Tensor>& value,
                    torch::Tensor& output,
-                   std::optional<torch::Tensor>& output_lse,
-                   const std::optional<torch::Tensor>& q_cu_seq_lens,
-                   const std::optional<torch::Tensor>& kv_cu_seq_lens,
-                   const std::optional<torch::Tensor>& alibi_slope,
-                   const std::optional<torch::Tensor>& attn_bias,
-                   const std::optional<torch::Tensor>& q_quant_scale,
-                   const std::optional<torch::Tensor>& k_quant_scale,
-                   const std::optional<torch::Tensor>& v_quant_scale,
+                   c10::optional<torch::Tensor>& output_lse,
+                   const c10::optional<torch::Tensor>& q_cu_seq_lens,
+                   const c10::optional<torch::Tensor>& kv_cu_seq_lens,
+                   const c10::optional<torch::Tensor>& alibi_slope,
+                   const c10::optional<torch::Tensor>& attn_bias,
+                   const c10::optional<torch::Tensor>& q_quant_scale,
+                   const c10::optional<torch::Tensor>& k_quant_scale,
+                   const c10::optional<torch::Tensor>& v_quant_scale,
                    const torch::Tensor& block_tables,
                    int64_t max_query_len,
                    int64_t max_seq_len,
@@ -76,14 +76,14 @@ void batch_decode(torch::Tensor& query,
                   torch::Tensor& output,
                   const torch::Tensor& block_table,
                   const torch::Tensor& seq_lens,
-                  const std::optional<torch::Tensor>& v_cache,
-                  std::optional<torch::Tensor>& output_lse,
-                  const std::optional<torch::Tensor>& q_quant_scale,
-                  const std::optional<torch::Tensor>& k_cache_quant_scale,
-                  const std::optional<torch::Tensor>& v_cache_quant_scale,
-                  const std::optional<torch::Tensor>& out_quant_scale,
-                  const std::optional<torch::Tensor>& alibi_slope,
-                  const std::optional<torch::Tensor>& mask,
+                  const c10::optional<torch::Tensor>& v_cache,
+                  c10::optional<torch::Tensor>& output_lse,
+                  const c10::optional<torch::Tensor>& q_quant_scale,
+                  const c10::optional<torch::Tensor>& k_cache_quant_scale,
+                  const c10::optional<torch::Tensor>& v_cache_quant_scale,
+                  const c10::optional<torch::Tensor>& out_quant_scale,
+                  const c10::optional<torch::Tensor>& alibi_slope,
+                  const c10::optional<torch::Tensor>& mask,
                   const std::string& compute_dtype,
                   int64_t max_seq_len,
                   int64_t window_size_left,
@@ -95,10 +95,10 @@ void batch_decode(torch::Tensor& query,
 
 void residual_layer_norm(torch::Tensor& input,
                          torch::Tensor& output,
-                         std::optional<torch::Tensor>& residual,
+                         c10::optional<torch::Tensor>& residual,
                          torch::Tensor& weight,
-                         std::optional<torch::Tensor>& bias,
-                         std::optional<torch::Tensor>& residual_out,
+                         c10::optional<torch::Tensor>& bias,
+                         c10::optional<torch::Tensor>& residual_out,
                          double eps);
 
 void rms_norm(torch::Tensor& output,
@@ -108,7 +108,7 @@ void rms_norm(torch::Tensor& output,
 
 torch::Tensor matmul(torch::Tensor a,
                      torch::Tensor b,
-                     std::optional<torch::Tensor> bias);
+                     c10::optional<torch::Tensor> bias);
 
 std::tuple<torch::Tensor, torch::Tensor> moe_active_topk(
     const torch::Tensor& input,
@@ -116,11 +116,11 @@ std::tuple<torch::Tensor, torch::Tensor> moe_active_topk(
     int64_t num_expert_group,
     int64_t topk_group,
     bool normalize,
-    const std::optional<torch::Tensor>& mask,
+    const c10::optional<torch::Tensor>& mask,
     const std::string& normed_by,
     const std::string& scoring_func,
     double route_scale,
-    const std::optional<torch::Tensor>& e_score_correction_bias);
+    const c10::optional<torch::Tensor>& e_score_correction_bias);
 
 std::vector<torch::Tensor> moe_gen_idx(torch::Tensor& expert_id,
                                        int64_t expert_num);
@@ -133,7 +133,7 @@ torch::Tensor moe_expand_input(const torch::Tensor& input,
 torch::Tensor group_gemm(torch::Tensor& input,
                          torch::Tensor& weight,
                          torch::Tensor& tokens_per_experts,
-                         const std::optional<torch::Tensor>& dst_to_src,
+                         const c10::optional<torch::Tensor>& dst_to_src,
                          torch::Tensor& output);
 
 torch::Tensor moe_combine_result(torch::Tensor& input, torch::Tensor& weight);
