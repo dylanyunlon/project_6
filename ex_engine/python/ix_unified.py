@@ -30,6 +30,19 @@ def _load_bridge():
     if _bridge is not None:
         return _bridge
 
+    # Pre-load ixformer .so symbols (bridge links against them at runtime)
+    try:
+        import ctypes, glob as _glob
+        for _base in ["/usr/local/corex/lib64/python3/dist-packages/ixformer",
+                      "/usr/local/corex/lib/python3/dist-packages/ixformer"]:
+            for _so in _glob.glob(os.path.join(_base, "**/*.so"), recursive=True):
+                try:
+                    ctypes.CDLL(_so, mode=ctypes.RTLD_GLOBAL)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
     search_paths = []
 
     # 1. Same directory as this file
