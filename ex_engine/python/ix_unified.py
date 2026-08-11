@@ -35,7 +35,7 @@ def _load_bridge():
     # resolved at runtime. Python default import uses RTLD_LOCAL, so we must
     # force RTLD_GLOBAL on the ixformer .so files BEFORE loading our bridge.
     try:
-        import ctypes, glob as _glob
+        import ctypes
 
         # Phase 0: Load torch core libs first — ixformer depends on libc10.so etc.
         try:
@@ -52,33 +52,20 @@ def _load_bridge():
         except ImportError:
             pass
 
-        for _base in ["/usr/local/corex/lib64/python3/dist-packages/ixformer",
-                      "/usr/local/corex/lib/python3/dist-packages/ixformer",
-                      "/usr/local/corex/lib64"]:
-            if not os.path.isdir(_base):
-                continue
-            # Phase 1: lib*.so (libixformer.so, libixattn.so — dependencies first)
-            for _so in sorted(_glob.glob(os.path.join(_base, "lib*.so*"))):
-                try:
-                    ctypes.CDLL(_so, mode=ctypes.RTLD_GLOBAL)
-                except Exception:
-                    pass
-            # Phase 2: _ixformer_torch*.so (contains ixformer::infer::* symbols)
-            for _so in sorted(_glob.glob(os.path.join(_base, "_ixformer_torch*.so"))):
-                try:
-                    ctypes.CDLL(_so, mode=ctypes.RTLD_GLOBAL)
-                    logger.info("Preloaded ixformer: %s", _so)
-                except Exception:
-                    pass
-            # Phase 3: any remaining .so in subdirs
-            for _so in sorted(_glob.glob(os.path.join(_base, "**/*.so"), recursive=True)):
-                bn = os.path.basename(_so)
-                if bn.startswith("lib") or "_ixformer" in bn:
-                    continue
-                try:
-                    ctypes.CDLL(_so, mode=ctypes.RTLD_GLOBAL)
-                except Exception:
-                    pass
+        # Phase 1: libixformer.so (CUDA kernels)
+        # Phase 2: _ixformer_torch.so (torch extension with ixformer_torch_ext::*)
+        # ONLY these two — do NOT recursively load unknown .so (causes segfault)
+        _ixf_base = "/usr/local/corex/lib64/python3/dist-packages/ixformer"
+        if os.path.isdir(_ixf_base):
+            for _name in ["libixformer.so",
+                          "_ixformer_torch.cpython-310-x86_64-linux-gnu.so"]:
+                _p = os.path.join(_ixf_base, _name)
+                if os.path.isfile(_p):
+                    try:
+                        ctypes.CDLL(_p, mode=ctypes.RTLD_GLOBAL)
+                        logger.info("Preloaded: %s", _name)
+                    except Exception:
+                        pass
     except Exception:
         pass
 
