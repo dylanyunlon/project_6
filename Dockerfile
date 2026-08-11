@@ -52,9 +52,10 @@ RUN chmod +x /workspace/qwen3_6_scripts/patch_ops.sh && \
     bash ./patch_ops.sh 2>&1 | tee /workspace/patch_ops.log ; \
     echo "[Dockerfile] patch_ops exit code: $?"
 
-# Step 6: Build ix_unified_bridge.so (links against base image ixformer at runtime)
+# Step 6: Build ix_unified_bridge.so (ixformer::infer symbols resolved at runtime via RTLD_GLOBAL preload)
+# Tolerant: bridge is optional — corex_moe.py has ixformer.functions fallback
 RUN chmod +x /workspace/ex_engine/build_unified_bridge.sh && \
-    bash /workspace/ex_engine/build_unified_bridge.sh 2>&1 | tee -a /workspace/ex_build.log ; \
+    (bash /workspace/ex_engine/build_unified_bridge.sh 2>&1 || echo "[Dockerfile] bridge build FAILED (non-fatal)") | tee -a /workspace/ex_build.log ; \
     echo "[Dockerfile] ix_unified_bridge build exit code: $?"
 
 # Step 7: Deploy ix_unified and ex_engine Python modules to vllm path

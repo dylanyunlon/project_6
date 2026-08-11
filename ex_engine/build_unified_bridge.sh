@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # build_unified_bridge.sh — Compile ix_unified_bridge.so on BI-V100
 # Uses manual compiler flags since torch.utils.cpp_extension is stripped from corex torch.
-set -euo pipefail
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_DIR="${SCRIPT_DIR}/csrc/ilu"
@@ -34,8 +34,9 @@ $CXX -shared -fPIC -O2 -std=c++17 \
     -I"$TORCH_INC" \
     -I"$TORCH_INC2" \
     -L"$TORCH_LIB" \
-    -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda \
+    -ltorch -ltorch_cpu -lc10 \
     -Wl,--no-as-needed,-rpath,"$TORCH_LIB" \
+    -Wl,--unresolved-symbols=ignore-in-shared-libs \
     -D_GLIBCXX_USE_CXX11_ABI=0 \
     -DTORCH_EXTENSION_NAME=ix_unified_bridge \
     "$SRC_DIR/ix_unified_bridge.cpp" \

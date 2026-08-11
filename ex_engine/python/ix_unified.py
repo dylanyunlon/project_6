@@ -30,12 +30,36 @@ def _load_bridge():
     if _bridge is not None:
         return _bridge
 
-    # Pre-load ixformer .so symbols (bridge links against them at runtime)
+    # Pre-load ixformer .so symbols into GLOBAL symbol table.
+    # ix_unified_bridge.so has undefined ixformer::infer::* symbols that get
+    # resolved at runtime. Python default import uses RTLD_LOCAL, so we must
+    # force RTLD_GLOBAL on the ixformer .so files BEFORE loading our bridge.
     try:
         import ctypes, glob as _glob
+
         for _base in ["/usr/local/corex/lib64/python3/dist-packages/ixformer",
-                      "/usr/local/corex/lib/python3/dist-packages/ixformer"]:
-            for _so in _glob.glob(os.path.join(_base, "**/*.so"), recursive=True):
+                      "/usr/local/corex/lib/python3/dist-packages/ixformer",
+                      "/usr/local/corex/lib64"]:
+            if not os.path.isdir(_base):
+                continue
+            # Phase 1: lib*.so (libixformer.so, libixattn.so — dependencies first)
+            for _so in sorted(_glob.glob(os.path.join(_base, "lib*.so*"))):
+                try:
+                    ctypes.CDLL(_so, mode=ctypes.RTLD_GLOBAL)
+                except Exception:
+                    pass
+            # Phase 2: _ixformer_torch*.so (contains ixformer::infer::* symbols)
+            for _so in sorted(_glob.glob(os.path.join(_base, "_ixformer_torch*.so"))):
+                try:
+                    ctypes.CDLL(_so, mode=ctypes.RTLD_GLOBAL)
+                    logger.info("Preloaded ixformer: %s", _so)
+                except Exception:
+                    pass
+            # Phase 3: any remaining .so in subdirs
+            for _so in sorted(_glob.glob(os.path.join(_base, "**/*.so"), recursive=True)):
+                bn = os.path.basename(_so)
+                if bn.startswith("lib") or "_ixformer" in bn:
+                    continue
                 try:
                     ctypes.CDLL(_so, mode=ctypes.RTLD_GLOBAL)
                 except Exception:
@@ -49,6 +73,10 @@ def _load_bridge():
     here = os.path.dirname(os.path.abspath(__file__))
     search_paths.append(os.path.join(here, "..", "build"))
     search_paths.append(here)
+
+    # 2. Workspace build dirs (Docker / real machine)
+    search_paths.append("/workspace/ex_engine/build")
+    search_paths.append("/home/dylan/project_6/ex_engine/build")
 
     # 2. vllm install root (where prebuilt .so are deployed)
     for p in sys.path:
