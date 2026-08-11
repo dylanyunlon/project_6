@@ -1114,7 +1114,18 @@ def topk_softmax(topk_weights: torch.Tensor, topk_ids: torch.Tensor,
         except Exception as e:
             logger.warning("topk_softmax ix_bridge failed (%s), trying CUDA kernel", e)
 
-    # Priority 1: CUDA kernel (_moe_C or moe_topk_softmax_v3)
+    # Priority 1: ex_factor_0.so → CCCL warp-shuffle topk kernel (compiled for BI-V100)
+    try:
+        from ex_engine.python.ex_topk_bridge import ex_topk_softmax as _ex_topk
+        gating = gating_output if isinstance(gating_output, torch.Tensor) else gating_output
+        _ex_topk(topk_weights, topk_ids, token_expert_indicies, gating.float())
+        return
+    except Exception as e:
+        if not getattr(topk_softmax, '_ex_warned', False):
+            logger.warning("ex_factor_0 topk failed (%s), trying _moe_C", e)
+            topk_softmax._ex_warned = True
+
+    # Priority 2: CUDA kernel (_moe_C or moe_topk_softmax_v3)
     if _moe_topk_ext is not None:
         try:
             gating = gating_output if isinstance(gating_output, torch.Tensor) else gating_output

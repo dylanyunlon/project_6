@@ -337,6 +337,25 @@ if [[ -n "$VLLM2" ]]; then
     echo "[ok] mirrored all patches to VLLM2"
 fi
 
+build_stage "deploying ex_engine package to Python path"
+_SITE=""
+for _s in /usr/local/corex/lib64/python3/dist-packages \
+          /usr/local/corex/lib/python3/dist-packages \
+          /usr/local/lib/python3.10/site-packages; do
+    [[ -d "$_s" ]] && _SITE="$_s" && break
+done
+if [[ -n "$_SITE" ]]; then
+    _EX_DST="$_SITE/ex_engine"
+    mkdir -p "$_EX_DST/python" "$_EX_DST/build"
+    touch "$_EX_DST/__init__.py" "$_EX_DST/python/__init__.py"
+    cp /workspace/ex_engine/python/*.py "$_EX_DST/python/" 2>/dev/null || true
+    if [[ -d /workspace/ex_engine/build ]]; then
+        cp /workspace/ex_engine/build/*.so "$_EX_DST/build/" 2>/dev/null || true
+        cp /workspace/ex_engine/build/*.so "$_EX_DST/" 2>/dev/null || true
+    fi
+    echo "[ok] ex_engine deployed to $_EX_DST ($(ls "$_EX_DST/build/"*.so 2>/dev/null | wc -l) .so files)"
+fi
+
 build_stage "compiling submission Python sources"
 find . -path './wheels' -prune -o -name '*.py' -print0 | xargs -0 python3 -m py_compile 2>&1 || echo "[WARN] some .py files failed to compile (non-fatal)"
 build_stage "patch script completed"
