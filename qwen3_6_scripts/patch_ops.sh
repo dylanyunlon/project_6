@@ -110,9 +110,10 @@ echo "TRANSFORMERS_ROOT=${TRANSFORMERS_ROOT}"
 }
 
 VLLM_OVERRIDE_ROOT="./vendor_overrides/vllm"
+_HAS_OVERRIDES=true
 [[ -d "$VLLM_OVERRIDE_ROOT" ]] || {
-    printf 'vLLM override directory missing: %s\n' "$VLLM_OVERRIDE_ROOT" >&2
-    exit 2
+    printf '[WARN] vLLM override directory missing: %s — skipping override installs\n' "$VLLM_OVERRIDE_ROOT" >&2
+    _HAS_OVERRIDES=false
 }
 
 # --- Mirror path: base image may have TWO vllm installs ---
@@ -142,6 +143,7 @@ deploy_both() {
     [[ -n "$VLLM2" ]] && cp "$src" "${VLLM2}/${rel}" 2>/dev/null || true
 }
 
+if $_HAS_OVERRIDES; then
 build_stage "installing authoritative vLLM core block overrides"
 install_patch_file \
     "${VLLM_OVERRIDE_ROOT}/core/evictor_v2.py" \
@@ -170,6 +172,9 @@ install_patch_file \
 install_patch_file \
     "${VLLM_OVERRIDE_ROOT}/model_executor/layers/sampler.py" \
     "${VLLM_ROOT}/model_executor/layers/sampler.py"
+else
+build_stage "skipping vLLM core block overrides (vendor_overrides not found)"
+fi
 
 build_stage "installing hash-pinned CoreX 3.2.3 extensions"
 bash ./install_prebuilt_corex.sh "${VLLM_ROOT}"

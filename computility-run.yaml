@@ -8,37 +8,46 @@ command:
     - --served-model-name
     - llm
     - --max-model-len
-    - '262144'
+    - '80000'
     - --gpu-memory-utilization
-    - '0.9'
+    - '0.95'
     - --trust-remote-code
     - -tp
     - '4'
     - --max-num-seqs
-    - '1'
+    - '2'
+    - --max-num-batched-tokens
+    - '4096'
+    - --enable-chunked-prefill
     - --disable-log-requests
     - --disable-frontend-multiprocessing
-    - --max-num-batched-tokens
-    - '8192'
-    - --enable-chunked-prefill
-    - --max-seq-len-to-capture
-    - '32768'
+    - --enforce-eager
     - --enable-auto-tool-choice
     - --tool-call-parser
     - qwen3_coder
     - --reasoning-parser
     - qwen3
     - --enable-prefix-caching
+    - --max-seq-len-to-capture
+    - '8192'
+    - --dtype
+    - half
 env:
     - name: VLLM_ENGINE_ITERATION_TIMEOUT_S
-      value: 3600
+      value: '3600'
+    - name: VLLM_ATTENTION_BACKEND
+      value: XFORMERS
+    - name: ENABLE_CUSTOM_IPC
+      value: '1'
+    - name: PYTHONPATH
+      value: /usr/local/corex/lib/python3/dist-packages:/usr/local/corex/lib64/python3/dist-packages
+    - name: LD_LIBRARY_PATH
+      value: /usr/local/corex/lib64:/usr/local/openmpi/lib:/usr/local/corex/lib64/python3/dist-packages/ixformer
+    - name: PYTORCH_CUDA_ALLOC_CONF
+      value: max_split_size_mb:512
+    - name: OMP_NUM_THREADS
+      value: '1'
     - name: BI100_MOE_COREX_DIRECT_ROUTED
-      value: 1
+      value: '1'
     - name: BI100_GDN_COREX_PACKED_DECODE
-      value: 1
-    - name: BI100_HYBRID_KV_ACCOUNTING
-      value: full_attention
-    - name: BI100_GDN_CACHE_POLICY
-      value: admission64
-    - name: BI100_GDN_RESTORE_MODE
-      value: hybrid64
+      value: '1'
