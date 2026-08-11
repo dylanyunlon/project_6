@@ -58,7 +58,7 @@ class CustomChatCompletionMessageParam(TypedDict, total=False):
 
 class OpenAIBaseModel(BaseModel):
     # OpenAI API does not allow extra fields
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
 
 class ErrorResponse(OpenAIBaseModel):
@@ -180,6 +180,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     logprobs: Optional[bool] = False
     top_logprobs: Optional[int] = 0
     max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = None
     n: Optional[int] = 1
     presence_penalty: Optional[float] = 0.0
     response_format: Optional[ResponseFormat] = None
@@ -312,6 +313,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
     def to_beam_search_params(self,
                               default_max_tokens: int) -> BeamSearchParams:
         max_tokens = self.max_tokens
+        # OpenAI: max_completion_tokens is the newer alias for max_tokens
+        if max_tokens is None and getattr(self, 'max_completion_tokens', None) is not None:
+            max_tokens = self.max_completion_tokens
         if max_tokens is None:
             max_tokens = default_max_tokens
 
@@ -328,6 +332,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     def to_sampling_params(self, default_max_tokens: int) -> SamplingParams:
         max_tokens = self.max_tokens
+        # OpenAI: max_completion_tokens is the newer alias for max_tokens
+        if max_tokens is None and getattr(self, 'max_completion_tokens', None) is not None:
+            max_tokens = self.max_completion_tokens
         if max_tokens is None:
             max_tokens = default_max_tokens
 
@@ -795,6 +802,9 @@ class CompletionRequest(OpenAIBaseModel):
     def to_beam_search_params(self,
                               default_max_tokens: int) -> BeamSearchParams:
         max_tokens = self.max_tokens
+        # OpenAI: max_completion_tokens is the newer alias for max_tokens
+        if max_tokens is None and getattr(self, 'max_completion_tokens', None) is not None:
+            max_tokens = self.max_completion_tokens
         if max_tokens is None:
             max_tokens = default_max_tokens
 
@@ -811,6 +821,9 @@ class CompletionRequest(OpenAIBaseModel):
 
     def to_sampling_params(self, default_max_tokens: int) -> SamplingParams:
         max_tokens = self.max_tokens
+        # OpenAI: max_completion_tokens is the newer alias for max_tokens
+        if max_tokens is None and getattr(self, 'max_completion_tokens', None) is not None:
+            max_tokens = self.max_completion_tokens
         if max_tokens is None:
             max_tokens = default_max_tokens
 
