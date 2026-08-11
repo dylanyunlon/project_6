@@ -116,8 +116,14 @@ def _load_bridge():
                     _bridge = mod
                     logger.info("ix_unified_bridge loaded from %s", so_path)
                     return _bridge
+                except (ImportError, OSError, SystemError) as e:
+                    logger.warning("Bridge load failed (expected if ixformer "
+                                   "namespace mismatch): %s: %s",
+                                   os.path.basename(so_path), e)
+                    continue
                 except Exception as e:
-                    logger.warning("Failed to load %s: %s", so_path, e)
+                    logger.warning("Bridge load unexpected error: %s", e)
+                    continue
 
     logger.info("ix_unified_bridge.so not found, using fallback dispatch")
     return None
