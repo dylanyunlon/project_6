@@ -17,28 +17,6 @@ from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
                            SequenceStatus)
 from vllm.utils import Device, PyObjectCache
 
-try:
-    from vllm.gdn_prefix import (GdnPrefixKey, GdnPrefixStatePolicy,
-                                 cap_prefill_end_at_capture_boundary,
-                                 canonical_direct_segment_offsets,
-                                 capture_points_for_step,
-                                 final_capture_key,
-                                 gdn_cache_policy_from_env,
-                                 gdn_restore_alignment,
-                                 gdn_restore_mode_from_env,
-                                 keys_from_block_hashes,
-                                 restore_key_is_eligible,
-                                 strict_prefix_block_count)
-except ImportError:  # Local source-tree tests.
-    from qwen3_6_scripts.gdn_prefix import (
-        GdnPrefixKey, GdnPrefixStatePolicy,
-        cap_prefill_end_at_capture_boundary,
-        canonical_direct_segment_offsets, capture_points_for_step,
-        final_capture_key, gdn_cache_policy_from_env,
-        gdn_restore_alignment, gdn_restore_mode_from_env,
-        keys_from_block_hashes, restore_key_is_eligible,
-        strict_prefix_block_count)
-
 logger = init_logger(__name__)
 
 # Test-only. If configured, decode is preempted with
@@ -47,47 +25,6 @@ ENABLE_ARTIFICIAL_PREEMPT = bool(
     os.getenv("VLLM_TEST_ENABLE_ARTIFICIAL_PREEMPT", False))  # noqa
 ARTIFICIAL_PREEMPTION_PROB = 0.5
 ARTIFICIAL_PREEMPTION_MAX_CNT = 500
-
-
-def _plan_gdn_prefix_fast_forward(
-        restore_key: Optional[GdnPrefixKey], num_computed_tokens: int,
-        prompt_len: int, nominal_chunk_size: int,
-        remaining_token_budget: int, block_size: int,
-        logical_chunk_alignment: Optional[int] = None) -> Tuple[int, int]:
-    """Return logical progress and physical query tokens for a direct hit.
-
-    The scheduler normally uses one value for both quantities. A GDN prefix
-    state makes it safe to advance over a much larger logical prefix while
-    sending only the suffix after that checkpoint to the model runner.
-    """
-    fallback = (nominal_chunk_size, nominal_chunk_size)
-    if (restore_key is None or num_computed_tokens != 0 or prompt_len <= 0
-            or nominal_chunk_size <= 0 or remaining_token_budget <= 0
-            or block_size <= 0):
-        return fallback
-
-    checkpoint_tokens = restore_key[0] * block_size
-    logical_limit = checkpoint_tokens + remaining_token_budget
-    if logical_chunk_alignment is not None:
-        if (logical_chunk_alignment <= 0
-                or logical_chunk_alignment % block_size != 0):
-            raise ValueError("logical_chunk_alignment must be a positive "
-                             "multiple of block_size")
-        next_boundary = (
-            checkpoint_tokens // logical_chunk_alignment + 1
-        ) * logical_chunk_alignment
-        logical_limit = min(logical_limit, next_boundary)
-
-    logical_chunk_size = min(prompt_len, logical_limit)
-    physical_query_tokens = logical_chunk_size - checkpoint_tokens
-    if (physical_query_tokens <= 0
-            or physical_query_tokens > remaining_token_budget):
-        return fallback
-    if (logical_chunk_size <= nominal_chunk_size
-            and (logical_chunk_alignment is None
-                 or physical_query_tokens >= nominal_chunk_size)):
-        return fallback
-    return logical_chunk_size, physical_query_tokens
 
 
 class PreemptionMode(enum.Enum):
@@ -119,9 +56,6 @@ class SchedulingBudget:
     _request_ids_num_batched_tokens: Set[str] = field(default_factory=set)
     _request_ids_num_curr_seqs: Set[str] = field(default_factory=set)
     _num_batched_tokens: int = 0
-    _num_scheduled_tokens: int = 0
-    _request_num_scheduled_tokens: Dict[str, int] = field(
-        default_factory=dict)
     _num_curr_seqs: int = 0
 
     def can_schedule(self, *, num_new_tokens: int, num_new_seqs: int):
@@ -133,26 +67,18 @@ class SchedulingBudget:
     def remaining_token_budget(self):
         return self.token_budget - self.num_batched_tokens
 
-    def add_num_batched_tokens(
-            self, req_id: str, num_batched_tokens: int,
-            num_scheduled_tokens: Optional[int] = None):
+    def add_num_batched_tokens(self, req_id: str, num_batched_tokens: int):
         if req_id in self._request_ids_num_batched_tokens:
             return
 
-        if num_scheduled_tokens is None:
-            num_scheduled_tokens = num_batched_tokens
         self._request_ids_num_batched_tokens.add(req_id)
         self._num_batched_tokens += num_batched_tokens
-        self._num_scheduled_tokens += num_scheduled_tokens
-        self._request_num_scheduled_tokens[req_id] = num_scheduled_tokens
 
     def subtract_num_batched_tokens(self, req_id: str,
                                     num_batched_tokens: int):
         if req_id in self._request_ids_num_batched_tokens:
             self._request_ids_num_batched_tokens.remove(req_id)
             self._num_batched_tokens -= num_batched_tokens
-            self._num_scheduled_tokens -= (
-                self._request_num_scheduled_tokens.pop(req_id))
 
     def add_num_seqs(self, req_id: str, num_curr_seqs: int):
         if req_id in self._request_ids_num_curr_seqs:
@@ -169,10 +95,6 @@ class SchedulingBudget:
     @property
     def num_batched_tokens(self):
         return self._num_batched_tokens
-
-    @property
-    def num_scheduled_tokens(self):
-        return self._num_scheduled_tokens
 
     @property
     def num_curr_seqs(self):
@@ -213,8 +135,7 @@ class SchedulerOutputs:
     preempted: int
 
     def __post_init__(self):
-        # Request-level preemption cannot swap both ways in one step. The
-        # content-addressed CPU tier appends its ordered maps after creation.
+        # Swap in and swap out should never happen at the same time.
         assert not (self.blocks_to_swap_in and self.blocks_to_swap_out)
 
         self.num_loras: int = len(self.lora_requests)
@@ -430,19 +351,6 @@ class Scheduler:
         # can and must be released after the current step.
         # This is used to evict the finished requests from the Mamba cache.
         self._finished_requests_ids: List[str] = list()
-        self._gdn_prefix_policy = GdnPrefixStatePolicy(
-            gdn_cache_policy_from_env())
-        self._gdn_restore_mode = gdn_restore_mode_from_env()
-        try:
-            self._gdn_replay_alignment = gdn_restore_alignment(
-                self._gdn_restore_mode, self.cache_config.block_size,
-                scheduler_config.max_num_batched_tokens)
-        except ValueError as exc:
-            raise RuntimeError(str(exc)) from exc
-        self._gdn_request_restore_keys: Dict[
-            str, Optional[GdnPrefixKey]] = {}
-        self._gdn_request_capture_targets: Dict[
-            str, Tuple[GdnPrefixKey, ...]] = {}
         # Time at previous scheduling step
         self.prev_time = 0.0
         # Did we schedule a prompt at previous step?
@@ -515,46 +423,6 @@ class Scheduler:
         # Only for testing purposes.
         self.swapped.append(seq_group)
 
-    def _cap_gdn_capture_boundary(
-            self, seq_group: SequenceGroup, token_chunk_size: int,
-            physical_query_tokens: int) -> Tuple[int, int]:
-        """Align admission64 capture state with a physical model forward."""
-        targets = self._gdn_request_capture_targets.get(
-            seq_group.request_id, ())
-        if (self._gdn_prefix_policy.policy != "admission64"
-                or not targets):
-            return token_chunk_size, physical_query_tokens
-        if token_chunk_size <= 0 or physical_query_tokens <= 0:
-            raise RuntimeError("GDN prefill token counts must be positive")
-
-        seqs = seq_group.get_seqs()
-        if len(seqs) != 1 or not seq_group.is_prefill():
-            raise RuntimeError(
-                "GDN capture boundary requires one prefill sequence")
-        num_computed_tokens = seqs[0].data.get_num_computed_tokens()
-        logical_end_tokens = num_computed_tokens + token_chunk_size
-        logical_start_tokens = logical_end_tokens - physical_query_tokens
-        if logical_start_tokens < num_computed_tokens:
-            raise RuntimeError(
-                "GDN physical query starts before scheduler progress")
-
-        capped_end_tokens = cap_prefill_end_at_capture_boundary(
-            logical_start_tokens, logical_end_tokens, targets,
-            self.cache_config.block_size)
-        if capped_end_tokens == logical_end_tokens:
-            return token_chunk_size, physical_query_tokens
-
-        capped_chunk_size = capped_end_tokens - num_computed_tokens
-        capped_query_tokens = capped_end_tokens - logical_start_tokens
-        if capped_chunk_size <= 0 or capped_query_tokens <= 0:
-            raise RuntimeError("GDN capture boundary produced an empty step")
-        logger.info(
-            "[BI100 GDN CAPTURE BOUNDARY] request=%s logical_start=%d "
-            "logical_end=%d capped_end=%d physical_query_tokens=%d",
-            seq_group.request_id, logical_start_tokens, logical_end_tokens,
-            capped_end_tokens, capped_query_tokens)
-        return capped_chunk_size, capped_query_tokens
-
     def abort_seq_group(self, request_id: Union[str, Iterable[str]]) -> None:
         """Aborts a sequence group with the given ID.
 
@@ -601,16 +469,10 @@ class Scheduler:
     ) -> None:
         """
         Free a sequence group from a cross-attention block table.
-        Also release any request-local multimodal cache namespace.
+        Has no effect on decoder-only models.
         """
-        try:
-            if seq_group.is_encoder_decoder():
-                self.block_manager.free_cross(seq_group)
-        finally:
-            release_namespace = getattr(
-                self.block_manager, "release_request_cache_namespace", None)
-            if release_namespace is not None:
-                release_namespace(seq_group.request_id)
+        if seq_group.is_encoder_decoder():
+            self.block_manager.free_cross(seq_group)
 
     def has_unfinished_seqs(self) -> bool:
         return len(self.waiting) != 0 or len(self.running) != 0 or len(
@@ -686,9 +548,6 @@ class Scheduler:
             if num_running_tokens == 0:
                 # No budget => Stop
                 break
-            if enable_chunking and seq_group.is_prefill():
-                num_running_tokens, _ = self._cap_gdn_capture_boundary(
-                    seq_group, num_running_tokens, num_running_tokens)
 
             running_queue.popleft()
 
@@ -1090,83 +949,6 @@ class Scheduler:
             waiting_queue.popleft()
             self._allocate_and_set_running(seq_group)
 
-            budget_token_count = num_new_tokens
-            if (enable_chunking
-                    and self.cache_config.enable_prefix_caching
-                    and len(waiting_seqs) == 1):
-                prompt_seq = waiting_seqs[0]
-                computed_block_nums = list(
-                    self.block_manager.get_common_computed_block_ids(
-                        waiting_seqs))
-                block_hashes = self.block_manager.get_content_hashes(prompt_seq)
-                max_live_blocks = min(
-                    len(computed_block_nums), len(block_hashes),
-                    strict_prefix_block_count(
-                        prompt_seq.data.get_len(),
-                        self.cache_config.block_size))
-                live_keys = keys_from_block_hashes(
-                    block_hashes[:max_live_blocks])
-                direct_final_key = final_capture_key(
-                    block_hashes, prompt_seq.data.get_len(),
-                    self.cache_config.block_size, "direct",
-                    self.cache_config.block_size)
-                live_keys = [
-                    key for key in live_keys
-                    if restore_key_is_eligible(
-                        key, prompt_seq.data.get_len(),
-                        self.cache_config.block_size,
-                        self._gdn_restore_mode,
-                        self._gdn_replay_alignment,
-                        direct_final_key=(
-                            direct_final_key
-                            if self._gdn_restore_mode == "hybrid64" else None))
-                ]
-                restore_key = self._gdn_prefix_policy.select_restore(
-                    live_keys, len(live_keys))
-                self._gdn_request_restore_keys[
-                    seq_group.request_id] = restore_key
-
-                capture_targets = []
-                branch_key = self._gdn_prefix_policy.repeated_branch_candidate(
-                    live_keys, len(live_keys))
-                if branch_key is not None:
-                    capture_targets.append(branch_key)
-                final_key = final_capture_key(
-                    block_hashes, prompt_seq.data.get_len(),
-                    self.cache_config.block_size, self._gdn_restore_mode,
-                    self._gdn_replay_alignment)
-                if (final_key is not None
-                        and final_key not in capture_targets
-                        and self._gdn_prefix_policy.should_capture_final(
-                            final_key)):
-                    capture_targets.append(final_key)
-                self._gdn_request_capture_targets[seq_group.request_id] = tuple(
-                    capture_targets)
-
-                num_new_tokens, budget_token_count = (
-                    _plan_gdn_prefix_fast_forward(
-                        restore_key,
-                        prompt_seq.data.get_num_computed_tokens(),
-                        prompt_seq.data.get_len(),
-                        num_new_tokens,
-                        budget.remaining_token_budget(),
-                        self.cache_config.block_size,
-                        logical_chunk_alignment=(
-                            self.scheduler_config.max_num_batched_tokens
-                            if self._gdn_restore_mode == "hybrid64" else None)))
-                if budget_token_count != num_new_tokens:
-                    logger.info(
-                        "[BI100 GDN FAST-FORWARD] request=%s "
-                        "checkpoint_tokens=%d logical_tokens=%d "
-                        "physical_query_tokens=%d",
-                        seq_group.request_id,
-                        num_new_tokens - budget_token_count,
-                        num_new_tokens,
-                        budget_token_count)
-                num_new_tokens, budget_token_count = (
-                    self._cap_gdn_capture_boundary(
-                        seq_group, num_new_tokens, budget_token_count))
-
             if enable_chunking and self.scheduler_config.is_multi_step:
                 blocks_to_copy: List[Tuple[int, int]] = []
                 # init_multi_step_from_lookahead_slots happens in append_slots
@@ -1187,10 +969,7 @@ class Scheduler:
             seq_groups.append(
                 ScheduledSequenceGroup(seq_group=seq_group,
                                        token_chunk_size=num_new_tokens))
-            budget.add_num_batched_tokens(
-                seq_group.request_id,
-                budget_token_count,
-                num_scheduled_tokens=num_new_tokens)
+            budget.add_num_batched_tokens(seq_group.request_id, num_new_tokens)
             budget.add_num_seqs(seq_group.request_id, num_new_seqs)
 
         # Queue requests that couldn't be scheduled.
@@ -1298,7 +1077,7 @@ class Scheduler:
         return SchedulerOutputs(
             scheduled_seq_groups=scheduled_seq_groups,
             num_prefill_groups=num_prefill_groups,
-            num_batched_tokens=budget.num_scheduled_tokens,
+            num_batched_tokens=budget.num_batched_tokens,
             blocks_to_swap_in=swapped_in.blocks_to_swap_in,
             blocks_to_swap_out=running_scheduled.blocks_to_swap_out,
             blocks_to_copy=blocks_to_copy,
@@ -1379,7 +1158,7 @@ class Scheduler:
             num_prefill_groups=(len(prefills.seq_groups) +
                                 len(swapped_in.prefill_seq_groups) +
                                 len(running_scheduled.prefill_seq_groups)),
-            num_batched_tokens=budget.num_scheduled_tokens,
+            num_batched_tokens=budget.num_batched_tokens,
             blocks_to_swap_in=swapped_in.blocks_to_swap_in,
             blocks_to_swap_out=running_scheduled.blocks_to_swap_out,
             blocks_to_copy=running_scheduled.blocks_to_copy +
@@ -1438,25 +1217,7 @@ class Scheduler:
         # such as self.running, self.swapped, and self.waiting.
         scheduler_start_time = time.perf_counter()
 
-        begin_prefix_cache_step = getattr(
-            self.block_manager, "begin_prefix_cache_step", None)
-        if callable(begin_prefix_cache_step):
-            begin_prefix_cache_step()
         scheduler_outputs: SchedulerOutputs = self._schedule()
-        drain_prefix_swaps = getattr(
-            self.block_manager, "get_and_reset_prefix_swaps", None)
-        if callable(drain_prefix_swaps):
-            prefix_swap_in, prefix_swap_out = drain_prefix_swaps()
-            if prefix_swap_in or prefix_swap_out:
-                if (scheduler_outputs.blocks_to_swap_in
-                        or scheduler_outputs.blocks_to_swap_out):
-                    raise RuntimeError(
-                        "content-addressed CPU KV transfers cannot share a "
-                        "scheduler step with request-level preemption swap")
-                # Both directions are valid for this tier: a GPU victim is
-                # preserved before that same physical slot is reused by H2D.
-                scheduler_outputs.blocks_to_swap_in.extend(prefix_swap_in)
-                scheduler_outputs.blocks_to_swap_out.extend(prefix_swap_out)
         now = time.time()
 
         if not self.cache_config.enable_prefix_caching:
@@ -1501,111 +1262,28 @@ class Scheduler:
                 block_tables[seq_id] = self.block_manager.get_block_table(seq)
                 self.block_manager.access_all_blocks_in_seq(seq, now)
 
-            common_computed_block_nums = []
             if self.cache_config.enable_prefix_caching:
-                raw_computed_block_nums = list(
+                common_computed_block_nums = (
                     self.block_manager.get_common_computed_block_ids(
                         seq_group.get_seqs(status=SequenceStatus.RUNNING)))
-                if not seq_group.is_prefill():
-                    common_computed_block_nums = raw_computed_block_nums
 
             do_sample = True
             is_prompt = seq_group.is_prefill()
             # We should send the metadata to workers when the first prefill
             # is sent. Subsequent requests could be chunked prefill or decode.
             is_first_prefill = False
-            gdn_restore_key = None
-            gdn_capture_points = None
-            gdn_evict_keys = None
-            gdn_segment_offsets = None
             if is_prompt:
-                gdn_capture_points = []
-                gdn_evict_keys = []
-                gdn_segment_offsets = []
                 seqs = seq_group.get_seqs()
                 # Prefill has only 1 sequence.
                 assert len(seqs) == 1
                 num_computed_tokens = seqs[0].data.get_num_computed_tokens()
                 is_first_prefill = num_computed_tokens == 0
-                logical_end_tokens = min(
-                    seqs[0].data.get_len(),
-                    num_computed_tokens + token_chunk_size)
-                if self.cache_config.enable_prefix_caching:
-                    restore_key = self._gdn_request_restore_keys.get(
-                        seq_group.request_id)
-                    if is_first_prefill and restore_key is not None:
-                        gdn_restore_key = restore_key
-                        common_computed_block_nums = raw_computed_block_nums[
-                            :restore_key[0]]
-                        if len(common_computed_block_nums) != restore_key[0]:
-                            raise RuntimeError(
-                                "GDN restore key exceeds the live KV prefix")
-                    else:
-                        # Once this request has started, the request-local Mamba
-                        # state is authoritative. Never let a longer raw KV hit
-                        # skip ahead without a matching recurrent state.
-                        max_context_blocks = (num_computed_tokens
-                                              // self.cache_config.block_size)
-                        common_computed_block_nums = raw_computed_block_nums[
-                            :max_context_blocks]
-
-                    restore_tokens = (
-                        restore_key[0] * self.cache_config.block_size
-                        if is_first_prefill and restore_key is not None else 0)
-                    if seq_group.metrics is not None and restore_tokens:
-                        seq_group.metrics.num_cached_tokens = max(
-                            seq_group.metrics.num_cached_tokens or 0,
-                            restore_tokens)
-
-                    capture_targets = list(
-                        self._gdn_request_capture_targets.get(
-                            seq_group.request_id, ()))
-                    if self._gdn_prefix_policy.policy == "fine32":
-                        step_key = final_capture_key(
-                            self.block_manager.get_content_hashes(seqs[0]),
-                            logical_end_tokens, self.cache_config.block_size,
-                            self._gdn_restore_mode,
-                            self._gdn_replay_alignment)
-                        capture_targets = ([step_key]
-                                           if step_key is not None else [])
-                    if self._gdn_prefix_policy.policy != "off":
-                        physical_context_tokens = (
-                            restore_tokens if is_first_prefill
-                            else num_computed_tokens)
-                        if (self._gdn_restore_mode == "hybrid64"
-                                and self._gdn_prefix_policy.policy
-                                == "admission64"):
-                            gdn_segment_offsets = list(
-                                canonical_direct_segment_offsets(
-                                    self.block_manager.get_content_hashes(
-                                        seqs[0]),
-                                    physical_context_tokens,
-                                    logical_end_tokens,
-                                    self.cache_config.block_size,
-                                    self.scheduler_config.max_num_batched_tokens))
-                        gdn_capture_points = list(capture_points_for_step(
-                            capture_targets, physical_context_tokens,
-                            logical_end_tokens, self.cache_config.block_size))
-                        gdn_evict_keys = list(
-                            self._gdn_prefix_policy.admit(
-                                key for _, key in gdn_capture_points))
-                    trace_update = getattr(
-                        self.block_manager, "_bi100_update_cache_trace", None)
-                    if callable(trace_update):
-                        capture_actions = []
-                        for _, key in gdn_capture_points:
-                            if self._gdn_prefix_policy.policy == "fine32":
-                                reason = "fine32_chunk"
-                            elif (capture_targets
-                                  and key == capture_targets[-1]):
-                                reason = "final_prefill"
-                            else:
-                                reason = "repeated_branch"
-                            capture_actions.append((key, reason))
-                        trace_update(
-                            seqs[0], len(raw_computed_block_nums),
-                            gdn_restore_key, capture_actions,
-                            gdn_evict_keys, self._gdn_prefix_policy.policy)
+                if (is_first_prefill
+                        and self.cache_config.enable_prefix_caching
+                        and seq_group.metrics is not None):
+                    seq_group.metrics.num_cached_tokens = (
+                        len(common_computed_block_nums)
+                        * self.cache_config.block_size)
                 # In the next iteration, all prompt tokens are not computed.
                 # It means the prefill is chunked, and we don't need sampling.
                 # NOTE: We use get_len instead of get_prompt_len because when
@@ -1614,12 +1292,6 @@ class Scheduler:
                 if (token_chunk_size + num_computed_tokens <
                         seqs[0].data.get_len()):
                     do_sample = False
-
-                if logical_end_tokens >= seqs[0].data.get_len():
-                    self._gdn_request_restore_keys.pop(seq_group.request_id,
-                                                       None)
-                    self._gdn_request_capture_targets.pop(seq_group.request_id,
-                                                          None)
 
             # It assumes the scheduled_seq_groups is ordered by
             # prefill < decoding.
@@ -1646,10 +1318,6 @@ class Scheduler:
                     if scheduler_outputs.num_prefill_groups > 0 else None,
                     mm_processor_kwargs=seq_group.mm_processor_kwargs,
                     prompt_adapter_request=seq_group.prompt_adapter_request,
-                    gdn_restore_key=gdn_restore_key,
-                    gdn_capture_points=gdn_capture_points,
-                    gdn_evict_keys=gdn_evict_keys,
-                    gdn_segment_offsets=gdn_segment_offsets,
                 )
             else:
                 # When SPMD mode is enabled, we only send delta data except for
@@ -1665,10 +1333,6 @@ class Scheduler:
                     do_sample=do_sample,
                     token_chunk_size=token_chunk_size,
                     computed_block_nums=common_computed_block_nums,
-                    gdn_restore_key=gdn_restore_key,
-                    gdn_capture_points=gdn_capture_points,
-                    gdn_evict_keys=gdn_evict_keys,
-                    gdn_segment_offsets=gdn_segment_offsets,
                 )
             seq_group_metadata_list.append(seq_group_metadata)
 
@@ -1722,9 +1386,6 @@ class Scheduler:
         if seq_group.is_finished():
             # Free cross-attention block table, if it exists
             self._free_seq_group_cross_attn_blocks(seq_group)
-
-            self._gdn_request_restore_keys.pop(seq_group.request_id, None)
-            self._gdn_request_capture_targets.pop(seq_group.request_id, None)
 
             # Add the finished requests to the finished requests list.
             # This list will be used to update the Mamba cache in the

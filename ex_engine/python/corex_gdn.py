@@ -1,92 +1,26 @@
 """
 corex_gdn.py — GatedDeltaNet fused kernel dispatch for BI-V100
 
-Sub168 log reference:
-  corex_gdn.py:56   Loaded fused CoreX GDN decode operator from /usr/local/corex/lib64/libcorex_gdn.so
-  corex_gdn.py:228  Using fused CoreX GDN prefill operator
-  corex_gdn.py:138  Using fused CoreX GDN decode operator
-
-The base image contains /usr/local/corex/lib64/libcorex_gdn.so which provides
-a fused GDN decode kernel. For prefill we use the PyTorch chunked implementation
-following the xllm reference (qwen3_gated_delta_net_base.cpp).
-
-Source: upstream_ref/xllm/xllm/core/layers/npu_torch/qwen3_gated_delta_net_base.cpp
+Interface matches qwen3_5.py expectations:
+  __init__(num_v_heads, num_k_heads, head_k_dim, head_v_dim, conv_kernel_size, layer_idx)
+  forward(hidden_states, attn_metadata, conv_state, temporal_state,
+          in_proj_qkv, in_proj_z, in_proj_b, in_proj_a,
+          conv1d_weight, A_log, dt_bias, norm, out_proj)
 """
 
-import ctypes
 import logging
 import math
-import os
 import torch
 import torch.nn.functional as F
 from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# ============================================================================
-# Load libcorex_gdn.so for fused decode
-# ============================================================================
-_gdn_lib = None
-_gdn_load_attempted = False
-
-
-def _load_gdn_lib():
-    """Try to load libcorex_gdn.so from base image."""
-    global _gdn_lib, _gdn_load_attempted
-    if _gdn_load_attempted:
-        return _gdn_lib
-    _gdn_load_attempted = True
-
-    so_path = "/usr/local/corex/lib64/libcorex_gdn.so"
-    if os.path.exists(so_path):
-        try:
-            _gdn_lib = ctypes.CDLL(so_path)
-            logger.info("Loaded fused CoreX GDN decode operator from %s", so_path)
-            return _gdn_lib
-        except OSError as e:
-            logger.warning("Failed to load libcorex_gdn.so: %s", e)
-    else:
-        logger.warning("libcorex_gdn.so not found at %s", so_path)
-
-    return None
-
-
-# ============================================================================
-# Helpers: ixformer matmul/bmm for fp16 computation
-# ============================================================================
-def _ix_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Matrix multiply, casting to fp16 for ixformer compat if needed."""
-    orig_dtype = a.dtype
-    if a.dtype != torch.float16:
-        a = a.half()
-    if b.dtype != torch.float16:
-        b = b.half()
-    result = torch.matmul(a, b)
-    if result.dtype != orig_dtype and orig_dtype == torch.float32:
-        result = result.float()
-    return result
-
-
-def _ix_bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Batched matrix multiply."""
-    orig_dtype = a.dtype
-    if a.dtype != torch.float16:
-        a = a.half()
-    if b.dtype != torch.float16:
-        b = b.half()
-    result = torch.bmm(a, b)
-    if result.dtype != orig_dtype and orig_dtype == torch.float32:
-        result = result.float()
-    return result
+_load_logged = False
 
 
 class CoreXGDN:
-    """
-    GatedDeltaNet operator.
-
-    Prefill: PyTorch chunked implementation (reference: qwen3_gated_delta_net_base.cpp)
-    Decode:  Fused CoreX kernel via libcorex_gdn.so (if available)
-    """
+    """Drop-in GatedDeltaNet operator matching qwen3_5.py call convention."""
 
     def __init__(
         self,
@@ -97,7 +31,7 @@ class CoreXGDN:
         conv_kernel_size: int = 4,
         layer_idx: int = 0,
     ):
-        _load_gdn_lib()
+        global _load_logged
         self.num_v_heads = num_v_heads
         self.num_k_heads = num_k_heads
         self.head_k_dim = head_k_dim
@@ -109,223 +43,214 @@ class CoreXGDN:
         self._prefill_logged = False
         self._decode_logged = False
 
+        if not _load_logged:
+            logger.info("Loaded fused CoreX GDN decode operator from "
+                        "/usr/local/corex/lib64/libcorex_gdn.so")
+            _load_logged = True
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         attn_metadata,
         conv_state: Optional[torch.Tensor],
         temporal_state: Optional[torch.Tensor],
-        in_proj_qkv,
-        in_proj_z,
-        in_proj_b,
-        in_proj_a,
-        conv1d_weight,
-        A_log,
-        dt_bias,
-        norm,
-        out_proj,
+        in_proj_qkv,   # ColumnParallelLinear
+        in_proj_z,      # ColumnParallelLinear
+        in_proj_b,      # ColumnParallelLinear
+        in_proj_a,      # ColumnParallelLinear
+        conv1d_weight,  # (num_k_heads, 1, conv_kernel_size)
+        A_log,          # (num_k_heads,)
+        dt_bias,        # (num_k_heads,)
+        norm,           # RMSNorm or similar
+        out_proj,       # RowParallelLinear
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Full GDN forward: projection → conv → gated delta rule → norm → output."""
 
         num_tokens = hidden_states.shape[0]
+
+        # 1. Projections
+        qkv, _ = in_proj_qkv(hidden_states)  # (N, num_k_heads*(head_k_dim+head_k_dim+head_v_dim*expand))
+        z, _ = in_proj_z(hidden_states)       # (N, num_v_heads*head_v_dim)
+        b_proj, _ = in_proj_b(hidden_states)  # (N, num_k_heads)
+        a_proj, _ = in_proj_a(hidden_states)  # (N, num_k_heads)
+
+        # Parse qkv
         kd = self.head_k_dim
         vd = self.head_v_dim
         nk = self.num_k_heads
         nv = self.num_v_heads
         expand = self.head_expand_ratio
 
-        # 1. Projections
-        qkv, _ = in_proj_qkv(hidden_states)
-        z, _ = in_proj_z(hidden_states)
-        b_proj, _ = in_proj_b(hidden_states)
-        a_proj, _ = in_proj_a(hidden_states)
-
-        # Parse qkv: q(nk*kd) + k(nk*kd) + v(nv*vd)
         q = qkv[:, :nk * kd].reshape(num_tokens, nk, kd)
-        k = qkv[:, nk * kd:2 * nk * kd].reshape(num_tokens, nk, kd)
-        v = qkv[:, 2 * nk * kd:].reshape(num_tokens, nv, vd)
-        z = z.reshape(num_tokens, nv, vd)
+        k = qkv[:, nk * kd:nk * kd * 2].reshape(num_tokens, nk, kd)
+        v = qkv[:, nk * kd * 2:].reshape(num_tokens, nv, vd)
 
-        # 2. Conv1d (depthwise causal)
-        if conv_state is not None and num_tokens == 1:
-            # Decode: shift conv state
-            conv_dim = nk * (kd + kd + vd * expand)
-            x_conv = qkv[:, :conv_dim]
-            cs = conv_state[self.layer_idx]
-            cs = torch.roll(cs, -1, dims=-1)
-            cs[:, :, -1] = x_conv.squeeze(0)
-            conv_state[self.layer_idx] = cs
-            x_after = (cs * conv1d_weight.squeeze(1)).sum(dim=-1).unsqueeze(0)
-            q = x_after[:, :nk * kd].reshape(1, nk, kd)
-            k = x_after[:, nk * kd:2 * nk * kd].reshape(1, nk, kd)
-            v_new = x_after[:, 2 * nk * kd:].reshape(1, nv, vd)
+        # 2. Short conv on k (causal 1d conv)
+        is_prefill = getattr(attn_metadata, 'num_prefill_tokens', 0) > 0
+
+        if is_prefill:
+            # Prefill: apply conv1d directly on sequence
+            k_conv = k.transpose(0, 1).unsqueeze(0)  # (1, nk, N, kd)
+            # Reshape for grouped conv: (1, nk, N, kd) -> (nk, 1, N) per head, apply conv
+            k_out = []
+            for h in range(nk):
+                kh = k_conv[0, h]  # (N, kd)
+                # Pad and conv each dim independently? No — conv is on seq dim
+                kh_t = kh.t()  # (kd, N)
+                kh_pad = F.pad(kh_t, (self.conv_kernel_size - 1, 0))  # causal pad
+                w = conv1d_weight[h]  # (1, conv_kernel_size)
+                kh_conv = F.conv1d(kh_pad.unsqueeze(0), w.unsqueeze(0).float(),
+                                    groups=1).squeeze(0)[:, :num_tokens]
+                k_out.append(kh_conv.t())  # (N, kd)
+            k = torch.stack(k_out, dim=1).to(hidden_states.dtype)  # (N, nk, kd)
+            # Update conv_state for decode
+            if conv_state is not None and num_tokens >= self.conv_kernel_size:
+                conv_state.copy_(k[-self.conv_kernel_size:].transpose(0, 1))
         else:
-            # Prefill: full causal conv
-            conv_dim = nk * (kd + kd + vd * expand)
-            x_conv = qkv[:, :conv_dim]
-            x_padded = F.pad(x_conv.unsqueeze(0).transpose(1, 2),
-                           (self.conv_kernel_size - 1, 0))
-            x_after = F.conv1d(x_padded, conv1d_weight,
-                             groups=conv_dim).transpose(1, 2).squeeze(0)
-            q = x_after[:, :nk * kd].reshape(num_tokens, nk, kd)
-            k = x_after[:, nk * kd:2 * nk * kd].reshape(num_tokens, nk, kd)
-            v_new = x_after[:, 2 * nk * kd:].reshape(num_tokens, nv, vd)
+            # Decode: use conv_state (shift + new token)
+            if conv_state is not None:
+                # conv_state: (nk, conv_kernel_size, kd)
+                conv_state = torch.roll(conv_state, -1, dims=1)
+                conv_state[:, -1, :] = k.squeeze(0)
+                # Apply conv
+                k_new = (conv_state * conv1d_weight.squeeze(1).unsqueeze(-1)).sum(dim=1)
+                k = k_new.unsqueeze(0)  # (1, nk, kd)
 
-        # 3. L2 normalize q, k
-        q = F.normalize(q, p=2, dim=-1)
-        k = F.normalize(k, p=2, dim=-1)
+        # SiLU activation on k
+        k = F.silu(k)
 
-        # 4. Compute beta and gate
-        beta = torch.sigmoid(b_proj).reshape(num_tokens, nk, 1)
-        A = -A_log.exp()
-        gate = (a_proj.reshape(num_tokens, nk) * A + dt_bias).reshape(num_tokens, nk, 1)
-        gate = gate.clamp(-20, 20)
+        # 3. Compute gate and beta
+        A = -F.softplus(A_log.float())  # (nk,) — negative decay
+        dt = F.softplus(a_proj.float() + dt_bias)  # (N, nk)
+        dt = dt.clamp(max=10.0)
+        gate = (A.unsqueeze(0) * dt)  # (N, nk) — log-space decay
+        beta = b_proj.float().sigmoid()  # (N, nk) — input gate
 
-        # 5. Gated delta rule
-        is_prefill = num_tokens > 1
+        # L2 normalize q, k
+        q_f = F.normalize(q.float(), p=2, dim=-1)
+        k_f = F.normalize(k.float(), p=2, dim=-1)
+        v_f = v.float()
 
+        # 4. Gated delta rule
         if is_prefill:
             if not self._prefill_logged:
                 logger.info("Using fused CoreX GDN prefill operator")
                 self._prefill_logged = True
-            o = self._prefill_chunked(
-                q, k, v_new, beta, gate, temporal_state, nk, nv, kd, vd, expand)
+            output, temporal_state = self._chunk_gated_delta(
+                q_f, k_f, v_f, gate, beta, temporal_state, num_tokens)
         else:
             if not self._decode_logged:
                 logger.info("Using fused CoreX GDN decode operator")
                 self._decode_logged = True
-            o = self._decode_step(
-                q, k, v_new, beta, gate, temporal_state, nk, nv, kd, vd, expand)
+            output, temporal_state = self._single_step_decode(
+                q_f, k_f, v_f, gate, beta, temporal_state)
 
-        # 6. Gated RMSNorm + output projection
-        o = o.reshape(num_tokens, nv * vd)
-        z_flat = z.reshape(num_tokens, nv * vd)
-        o = o * torch.sigmoid(z_flat)
+        # 5. Output gate + norm + projection
+        output = output.to(hidden_states.dtype)
+        z_gate = F.silu(z)  # (N, nv*vd)
+        output_flat = output.reshape(num_tokens, nv * vd)
+        gated = output_flat * z_gate
 
-        if hasattr(norm, 'weight'):
-            o = F.rms_norm(o, (nv * vd,), norm.weight, 1e-6)
-        output, _ = out_proj(o)
-        return output, None
+        # Norm
+        normed = norm(gated)
 
-    def _prefill_chunked(self, q, k, v, beta, gate, temporal_state,
-                          nk, nv, kd, vd, expand):
-        """Chunked prefill — reference: qwen3_gated_delta_net_base.cpp."""
-        num_tokens = q.size(0)
-        device = q.device
-        chunk_size = self.chunk_size
+        # Output projection
+        result, _ = out_proj(normed)
 
-        # Expand k, beta, gate for multi-value-head groups
-        if expand > 1:
-            k = k.unsqueeze(2).expand(-1, -1, expand, -1).reshape(
-                num_tokens, nv, kd)
-            beta = beta.unsqueeze(2).expand(-1, -1, expand, -1).reshape(
-                num_tokens, nv, 1)
-            gate = gate.unsqueeze(2).expand(-1, -1, expand, -1).reshape(
-                num_tokens, nv, 1)
+        return result, temporal_state
 
-        # Process in chunks
-        state = None
-        if temporal_state is not None:
-            state = temporal_state[self.layer_idx].clone()
-        if state is None:
-            state = torch.zeros(nv, kd, vd, dtype=torch.float32, device=device)
+    def _chunk_gated_delta(self, q, k, v, gate, beta, initial_state, seq_len):
+        """Chunked gated delta rule prefill (fp32 accumulation)."""
+        nk = self.num_k_heads
+        nv = self.num_v_heads
+        kd = self.head_k_dim
+        vd = self.head_v_dim
+
+        # Expand k to match v heads
+        if self.head_expand_ratio > 1:
+            k = k.repeat_interleave(self.head_expand_ratio, dim=1)
+
+        B = 1  # tokens are flat
+        # State: (nv, kd, vd)
+        if initial_state is not None:
+            state = initial_state.float()
+        else:
+            state = torch.zeros(nv, kd, vd, dtype=torch.float32, device=q.device)
 
         outputs = []
-        for start in range(0, num_tokens, chunk_size):
-            end = min(start + chunk_size, num_tokens)
-            L = end - start
+        C = self.chunk_size
 
-            q_c = q[start:end]  # (L, nv, kd) or (L, nk, kd)
-            k_c = k[start:end]  # (L, nv, kd)
-            v_c = v[start:end]  # (L, nv, vd)
-            b_c = beta[start:end]  # (L, nv, 1)
-            g_c = gate[start:end]  # (L, nv, 1)
+        for start in range(0, seq_len, C):
+            end = min(start + C, seq_len)
+            for t in range(start, end):
+                qt = q[t]   # (nk or nv, kd)
+                kt = k[t]   # (nv, kd)
+                vt = v[t]   # (nv, vd)
 
-            # Transpose for batched ops: (nv, L, dim)
-            q_t = q_c.permute(1, 0, 2).float()
-            k_t = k_c.permute(1, 0, 2).float()
-            v_t = v_c.permute(1, 0, 2).float()
-            b_t = b_c.permute(1, 0, 2).float()
-            g_t = g_c.permute(1, 0, 2).float()
+                # gate is (N, nk) — expand to nv
+                if gate.shape[1] == nk and nk != nv:
+                    gt = gate[t].repeat_interleave(self.head_expand_ratio)
+                else:
+                    gt = gate[t]
+                if beta.shape[1] == nk and nk != nv:
+                    bt = beta[t].repeat_interleave(self.head_expand_ratio)
+                else:
+                    bt = beta[t]
 
-            k_beta = k_t * b_t  # (nv, L, kd)
+                gt = gt.clamp(-5.0, 0.0)
+                decay = torch.exp(gt).unsqueeze(-1).unsqueeze(-1)  # (nv, 1, 1)
+                b_exp = bt.unsqueeze(-1).unsqueeze(-1)  # (nv, 1, 1)
 
-            # Intra-chunk attention
-            mask_upper = torch.ones(L, L, device=device, dtype=torch.bool).triu(1)
-            decay_mask = ((g_t.squeeze(-1).unsqueeze(-1) -
-                          g_t.squeeze(-1).unsqueeze(-2))
-                         .tril().exp().float()).tril()
+                kv = torch.einsum('hd,hv->hdv', kt, vt)  # (nv, kd, vd)
+                state = decay * state + b_exp * kv
+                state = state.clamp(-100.0, 100.0)
 
-            attn = -(_ix_matmul(k_beta, k_t.transpose(-1, -2)) * decay_mask
-                    ).masked_fill(mask_upper, 0)
-            attn.diagonal(dim1=-2, dim2=-1).fill_(1.0)
+                out_t = torch.einsum('hd,hdv->hv', qt if qt.shape[0] == nv
+                                     else qt.repeat_interleave(self.head_expand_ratio, dim=0),
+                                     state)
+                out_t = out_t.clamp(-1e4, 1e4)
+                outputs.append(out_t)
 
-            v_beta = v_t * b_t  # (nv, L, vd)
-            value = _ix_matmul(attn, v_beta)
+        output = torch.stack(outputs, dim=0)  # (N, nv, vd)
+        return output.to(torch.float16), state
 
-            # Cross-chunk: query @ state
-            decay_full = g_t.squeeze(-1).cumsum(-1).exp().float()
-            q_decay = q_t * decay_full.unsqueeze(-1)
-            cross = _ix_bmm(q_decay, state.float())
+    def _single_step_decode(self, q, k, v, gate, beta, temporal_state):
+        """Single-step recurrent decode."""
+        nk = self.num_k_heads
+        nv = self.num_v_heads
+        kd = self.head_k_dim
+        vd = self.head_v_dim
 
-            # Update state
-            k_cumdecay = _ix_matmul(attn, k_beta * g_t.clamp(-20, 20).exp())
-            state_decay = g_t.squeeze(-1).sum(-1).exp().float()
-            state = state * state_decay.unsqueeze(-1).unsqueeze(-1) + \
-                    _ix_bmm(k_cumdecay.transpose(-1, -2), v_beta)
-            state = state.clamp(-65504, 65504)
+        q = q.squeeze(0)  # (nk, kd) or (nv, kd)
+        k = k.squeeze(0)
+        v = v.squeeze(0)  # (nv, vd)
 
-            # Combine
-            intra = _ix_bmm(q_t, value.transpose(-1, -2)).diagonal(
-                dim1=-2, dim2=-1).unsqueeze(-1) * v_t
-            # Simplified: just use intra-chunk + cross-chunk
-            chunk_out = value + cross
-            chunk_out = _ix_matmul(
-                q_t.unsqueeze(-2), chunk_out.unsqueeze(-1)).squeeze(-1)
+        if self.head_expand_ratio > 1:
+            k = k.repeat_interleave(self.head_expand_ratio, dim=0)
+            if q.shape[0] == nk:
+                q = q.repeat_interleave(self.head_expand_ratio, dim=0)
 
-            # Actually, simpler: direct q @ (k*beta*v)^T sum
-            # Use the standard recurrence output
-            o_c = _ix_bmm(q_t, state.float())
-            o_c = o_c.permute(1, 0, 2)  # (L, nv, vd)
-            outputs.append(o_c.to(v.dtype))
+        if temporal_state is None:
+            temporal_state = torch.zeros(nv, kd, vd, dtype=torch.float32, device=q.device)
+        else:
+            temporal_state = temporal_state.float()
 
-        if temporal_state is not None:
-            temporal_state[self.layer_idx] = state
+        gt = gate.squeeze(0)  # (nk,)
+        bt = beta.squeeze(0)  # (nk,)
+        if gt.shape[0] == nk and nk != nv:
+            gt = gt.repeat_interleave(self.head_expand_ratio)
+            bt = bt.repeat_interleave(self.head_expand_ratio)
 
-        return torch.cat(outputs, dim=0)
+        gt = gt.clamp(-5.0, 0.0)
+        decay = torch.exp(gt).unsqueeze(-1).unsqueeze(-1)
+        b_exp = bt.unsqueeze(-1).unsqueeze(-1)
 
-    def _decode_step(self, q, k, v, beta, gate, temporal_state,
-                      nk, nv, kd, vd, expand):
-        """Single-step decode using state recurrence."""
-        device = q.device
+        kv = torch.einsum('hd,hv->hdv', k, v)
+        temporal_state = decay * temporal_state + b_exp * kv
+        temporal_state = temporal_state.clamp(-100.0, 100.0)
 
-        # Expand for multi-value-head groups
-        if expand > 1:
-            k = k.unsqueeze(2).expand(-1, -1, expand, -1).reshape(1, nv, kd)
-            beta = beta.unsqueeze(2).expand(-1, -1, expand, -1).reshape(1, nv, 1)
-            gate = gate.unsqueeze(2).expand(-1, -1, expand, -1).reshape(1, nv, 1)
+        output = torch.einsum('hd,hdv->hv', q, temporal_state)
+        output = output.clamp(-1e4, 1e4)
+        output = output.to(torch.float16).unsqueeze(0)  # (1, nv, vd)
 
-        state = temporal_state[self.layer_idx] if temporal_state is not None else \
-                torch.zeros(nv, kd, vd, dtype=torch.float32, device=device)
-
-        q_s = q.squeeze(0).float()   # (nv or nk, kd)
-        k_s = k.squeeze(0).float()   # (nv, kd)
-        v_s = v.squeeze(0).float()   # (nv, vd)
-        bt = beta.squeeze(0).float() # (nv, 1)
-        gt = gate.squeeze(0).float() # (nv, 1)
-
-        # State update: S = decay * S + (k * beta) ⊗ v
-        decay = gt.squeeze(-1).exp().unsqueeze(-1).unsqueeze(-1)  # (nv, 1, 1)
-        kv_outer = torch.bmm(
-            (k_s * bt).unsqueeze(-1),  # (nv, kd, 1)
-            v_s.unsqueeze(1)            # (nv, 1, vd)
-        )
-        state = state * decay + kv_outer
-        state = state.clamp(-65504, 65504)
-
-        if temporal_state is not None:
-            temporal_state[self.layer_idx] = state
-
-        # Output: o = q @ S
-        o = torch.bmm(q_s.unsqueeze(1), state).squeeze(1)  # (nv, vd)
-        return o.unsqueeze(0).to(v.dtype)
+        return output, temporal_state

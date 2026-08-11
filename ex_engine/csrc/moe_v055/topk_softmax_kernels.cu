@@ -23,7 +23,7 @@
 
 #ifndef USE_ROCM
     #include <cub/util_type.cuh>
-    #include <cub/block/block_reduce.cuh>
+    #include <cub/cub.cuh>
 #else
     #include <hipcub/util_type.hpp>
     #include <hipcub/hipcub.hpp>
