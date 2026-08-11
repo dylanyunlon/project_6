@@ -141,6 +141,19 @@ except ImportError:
 from vllm.model_executor.models.interfaces import (HasInnerState, SupportsLoRA,
                                                    SupportsMultiModal)
 
+# FlashQLA SM70: GDN prefill CUDA kernel (compiled in Dockerfile Step 7)
+# System design: xllm uses xllm::kernel::chunk_gated_delta_rule for prefill
+# We use the equivalent flash_qla_sm70_gdn_strided.so
+_flash_qla_sm70_available = False
+_chunk_gated_delta_rule_fwd_sm70 = None
+try:
+    from vllm.model_executor.models.flash_qla_sm70 import (
+        chunk_gated_delta_rule_fwd_sm70 as _chunk_gated_delta_rule_fwd_sm70,
+    )
+    _flash_qla_sm70_available = True
+except Exception:
+    pass
+
 logger = init_logger(__name__)
 
 # --- ix_unified: bridge to ixformer::infer C++ APIs -------------------------
@@ -1083,19 +1096,18 @@ class GatedDeltaNet(nn.Module):
                 v = v.reshape(1, seq_len, local_num_v, self.head_v_dim)
 
                 beta = b_all[s:e].sigmoid().unsqueeze(0)  # (1, seq_len, local_num_v)
+                # xllm fused_gdn_gating: threshold=20.0f — clamp gate at source
                 g = (-self.A_log.float().exp()
                      * F.softplus(a_all[s:e].float() + self.dt_bias)
-                     ).unsqueeze(0)  # (1, seq_len, local_num_v)
+                     ).clamp(-20.0, 20.0).unsqueeze(0)  # (1, seq_len, local_num_v)
 
                 # Expand k/q to match num_v_heads
                 q = q.repeat_interleave(self.head_expand_ratio, dim=2)
                 k = k.repeat_interleave(self.head_expand_ratio, dim=2)
 
-                # Sub-sequence chunking: call _torch_chunk_gated_delta_rule
-                # on _DNN_CHUNK tokens at a time to cap peak memory.
-                # Full 18K: tensors [1,6,282,64,64]=220 MB each → ~990 MB/call.
-                # With _DNN_CHUNK=4096: [1,6,64,64,64]=6 MB each → ~137 MB/call.
-                # State is chained via initial_state / output_final_state.
+                # System design: prefill via flash_qla_sm70 CUDA kernel
+                # (xllm equivalent: xllm::kernel::chunk_gated_delta_rule)
+                # Fallback: _torch_chunk_gated_delta_rule (Python, with clamp)
                 cur_state = temporal_state[si:si + 1].clone()
                 core_out_parts = []
                 segment_ends = _gdn_segment_ends(
@@ -1103,6 +1115,38 @@ class GatedDeltaNet(nn.Module):
                     seq_capture_offsets | seq_segment_offsets)
                 sc_start = 0
                 with bi100_timer(f"L{self.layer_idx}.gdn.prefill"):
+                  if (_flash_qla_sm70_available
+                      and not seq_capture_offsets
+                      and len(segment_ends) == 1):
+                    # Single segment, no captures: use fused CUDA kernel
+                    try:
+                        core_out, cur_state = _chunk_gated_delta_rule_fwd_sm70(
+                            q, k, v, g, beta,
+                            initial_state=cur_state,
+                            output_final_state=True,
+                            gate_is_exp=False,
+                        )
+                        core_out_parts.append(core_out)
+                    except Exception as _e:
+                        if not getattr(self, '_flash_qla_warned', False):
+                            logger.warning("flash_qla_sm70 failed (%s), using PyTorch", _e)
+                            self._flash_qla_warned = True
+                        core_out_parts = []
+                        sc_start = 0
+                        for sc_end in segment_ends:
+                            c_out, cur_state = _torch_chunk_gated_delta_rule(
+                                q[:, sc_start:sc_end],
+                                k[:, sc_start:sc_end],
+                                v[:, sc_start:sc_end],
+                                g[:, sc_start:sc_end],
+                                beta[:, sc_start:sc_end],
+                                initial_state=cur_state,
+                                output_final_state=True,
+                                use_qk_l2norm_in_kernel=True,
+                            )
+                            core_out_parts.append(c_out)
+                            sc_start = sc_end
+                  else:
                     for sc_end in segment_ends:
                         c_out, cur_state = _torch_chunk_gated_delta_rule(
                             q[:, sc_start:sc_end],
@@ -1216,7 +1260,7 @@ class GatedDeltaNet(nn.Module):
                 else:
                     beta = b_all.sigmoid()
                     g = (-self.A_log.float().exp()
-                         * F.softplus(a_all.float() + self.dt_bias))
+                         * F.softplus(a_all.float() + self.dt_bias)).clamp(-20.0, 20.0)
                     bt = beta.float()
                     g_t = g.float().exp_()
 
