@@ -37,6 +37,21 @@ def _load_bridge():
     try:
         import ctypes, glob as _glob
 
+        # Phase 0: Load torch core libs first — ixformer depends on libc10.so etc.
+        try:
+            import torch as _torch
+            _torch_lib = os.path.join(os.path.dirname(_torch.__file__), "lib")
+            for _name in ["libc10.so", "libtorch_cpu.so", "libtorch.so",
+                          "libc10_cuda.so", "libtorch_cuda.so", "libtorch_python.so"]:
+                _p = os.path.join(_torch_lib, _name)
+                if os.path.isfile(_p):
+                    try:
+                        ctypes.CDLL(_p, mode=ctypes.RTLD_GLOBAL)
+                    except Exception:
+                        pass
+        except ImportError:
+            pass
+
         for _base in ["/usr/local/corex/lib64/python3/dist-packages/ixformer",
                       "/usr/local/corex/lib/python3/dist-packages/ixformer",
                       "/usr/local/corex/lib64"]:
