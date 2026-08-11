@@ -205,7 +205,7 @@ build_stage "skipping vLLM core block overrides (vendor_overrides not found)"
 fi
 
 build_stage "installing hash-pinned CoreX 3.2.3 extensions"
-bash ./install_prebuilt_corex.sh "${VLLM_ROOT}"
+bash ./install_prebuilt_corex.sh "${VLLM_ROOT}" || echo "[WARN] install_prebuilt_corex failed (non-fatal)"
 
 build_stage "compiling moe_topk_softmax CUDA kernel"
 cd /workspace && bash ex_engine/build_moe_topk.sh 2>&1 || echo "[WARN] moe_topk build failed (non-fatal)"

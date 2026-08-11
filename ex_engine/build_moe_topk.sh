@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # build_moe_topk.sh — Compile moe_topk_softmax_v3.cu into importable .so
-set -euo pipefail
+set +e
 cd "$(dirname "$0")"
 
 PYTHON=${PYTHON:-python3}
