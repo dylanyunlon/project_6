@@ -77,6 +77,45 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.mamba_cache import MambaCacheManager
 from vllm.model_executor.models.qwen2_vl import (Qwen2VisionAttention,
                                                  Qwen2VisionRotaryEmbedding)
+
+# BI-V100: monkey-patch Qwen2VisionAttention.forward to avoid xops varlen_fwd.
+# The base qwen2_vl.py has 3 paths: flash_attn, CPU (PyTorch SDPA), xops.
+# On BI-V100 GPU the xops path crashes. We redirect to the CPU/SDPA path
+# which uses F.scaled_dot_product_attention — correct on any backend.
+_orig_qwen2vl_fwd = Qwen2VisionAttention.forward
+
+def _safe_qwen2vl_fwd(self, x, cu_seqlens, rotary_pos_emb=None):
+    """Qwen2 Vision attention with PyTorch SDPA instead of xops."""
+    from einops import rearrange
+    from vllm.model_executor.models.qwen2_vl import (
+        apply_rotary_pos_emb_vision, dist_utils)
+    x, _ = self.qkv(x)
+    new_shape = x.size()[:-1] + (
+        self.num_attention_heads_per_partition,
+        3 * self.hidden_size_per_attention_head)
+    x = x.view(*new_shape)
+    q, k, v = dist_utils.split_tensor_along_last_dim(x, 3)
+    batch_size = q.shape[1]
+    q, k, v = [rearrange(t, "s b ... -> b s ...").contiguous()
+                for t in (q, k, v)]
+    if rotary_pos_emb is not None:
+        q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
+        k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
+    # Use PyTorch SDPA (same as the is_cpu() path in base qwen2_vl.py)
+    seq_length = q.size(1)
+    q, k, v = [rearrange(t, "b s h d -> b h s d") for t in [q, k, v]]
+    attention_mask = torch.zeros([1, seq_length, seq_length],
+                                 device=q.device, dtype=torch.bool)
+    for i in range(1, len(cu_seqlens)):
+        attention_mask[..., cu_seqlens[i-1]:cu_seqlens[i],
+                       cu_seqlens[i-1]:cu_seqlens[i]] = True
+    output = torch.nn.functional.scaled_dot_product_attention(
+        q, k, v, attention_mask, dropout_p=0.0)
+    context_layer = rearrange(output, "b h s d -> s b (h d)").contiguous()
+    out, _ = self.proj(context_layer)
+    return out
+
+Qwen2VisionAttention.forward = _safe_qwen2vl_fwd
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.inputs import INPUT_REGISTRY, InputContext, LLMInputs
@@ -2318,7 +2357,27 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
             num_placeholders = int(image_mask.sum().item())
             if num_placeholders:
                 inputs_embeds = self.model.embed_tokens(input_ids)
-                image_embeds = self._process_image_input(image_input)
+                try:
+                    image_embeds = self._process_image_input(image_input)
+                except TypeError as _vision_err:
+                    # BI-V100: qwen2_vl.py vision encoder calls
+                    # xops.memory_efficient_attention_forward → varlen_fwd
+                    # which has incompatible args on ixformer. During profiling
+                    # this is dummy data; return zero embeddings so KV cache
+                    # sizing proceeds.
+                    if "varlen_fwd" in str(_vision_err):
+                        logger.warning(
+                            "Vision encoder varlen_fwd failed (%s); "
+                            "using zero embeddings (profiling safe)",
+                            _vision_err)
+                        image_embeds = torch.zeros(
+                            num_placeholders,
+                            self.config.hidden_size,
+                            dtype=inputs_embeds.dtype,
+                            device=inputs_embeds.device,
+                        )
+                    else:
+                        raise
                 if num_placeholders > image_embeds.shape[0]:
                     raise ValueError(
                         f"image token count ({num_placeholders}) exceeds "
