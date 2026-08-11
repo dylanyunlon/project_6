@@ -33,6 +33,10 @@
 # (xformers, diagnostics) may legitimately fail if the base image differs.
 set -uo pipefail
 
+# Always cd to script directory so relative paths (./qwen3_5.py, ./vendor_overrides, etc) work
+cd "$(dirname "$0")"
+build_stage "patch_ops.sh running from $(pwd)"
+
 build_stage() { printf '[BI100 BUILD] %s\n' "$1" >&2; }
 require_file() {
     local path=$1
