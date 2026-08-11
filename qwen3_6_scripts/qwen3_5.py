@@ -85,36 +85,40 @@ from vllm.model_executor.models.qwen2_vl import (Qwen2VisionAttention,
 _orig_qwen2vl_fwd = Qwen2VisionAttention.forward
 
 def _safe_qwen2vl_fwd(self, x, cu_seqlens, rotary_pos_emb=None):
-    """Qwen2 Vision attention with PyTorch SDPA instead of xops.
+    """Qwen2 Vision attention — ported from xllm compute_qwen2_vision_attention_cuda.
     Replaces xops.memory_efficient_attention_forward which calls
     _C_flashattention.varlen_fwd (incompatible arg count on BI-V100).
+    Reference: upstream_ref/xllm/xllm/core/layers/common/qwen2_vision_attention.cpp
     """
     from vllm.model_executor.models.qwen2_vl import apply_rotary_pos_emb_vision
     from vllm.distributed import utils as dist_utils
+    seq_len = x.size(0)
     x, _ = self.qkv(x)
-    new_shape = x.size()[:-1] + (
-        self.num_attention_heads_per_partition,
-        3 * self.hidden_size_per_attention_head)
-    x = x.view(*new_shape)
+    x = x.view(seq_len, self.num_attention_heads_per_partition,
+               3 * self.hidden_size_per_attention_head)
     q, k, v = dist_utils.split_tensor_along_last_dim(x, 3)
-    # q,k,v shape: (seq, batch, heads, dim) → (batch, seq, heads, dim)
-    q, k, v = [t.transpose(0, 1).contiguous() for t in (q, k, v)]
+    # (seq, heads, dim) → (1, seq, heads, dim) for rotary
+    q, k, v = [t.unsqueeze(0) for t in (q, k, v)]
     if rotary_pos_emb is not None:
         q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
         k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
-    seq_length = q.size(1)
-    # (batch, seq, heads, dim) → (batch, heads, seq, dim)
-    q, k, v = [t.transpose(1, 2) for t in (q, k, v)]
-    attention_mask = torch.zeros([1, seq_length, seq_length],
-                                 device=q.device, dtype=torch.bool)
+    q, k, v = [t.squeeze(0) for t in (q, k, v)]
+    # xllm: per-sequence matmul+softmax attention (compute_qwen2_vision_attention_cuda)
+    scale = self.hidden_size_per_attention_head ** -0.5
+    output = torch.zeros_like(q)
     for i in range(1, len(cu_seqlens)):
-        attention_mask[..., cu_seqlens[i-1]:cu_seqlens[i],
-                       cu_seqlens[i-1]:cu_seqlens[i]] = True
-    output = torch.nn.functional.scaled_dot_product_attention(
-        q, k, v, attention_mask, dropout_p=0.0)
-    # (batch, heads, seq, dim) → (seq, batch, heads*dim)
-    output = output.transpose(1, 2).transpose(0, 1).contiguous()
-    context_layer = output.view(output.size(0), output.size(1), -1)
+        start, end = int(cu_seqlens[i-1]), int(cu_seqlens[i])
+        if end <= start:
+            continue
+        q_i = q[start:end].permute(1, 0, 2)   # (H, L, D)
+        k_i = k[start:end].permute(1, 0, 2)
+        v_i = v[start:end].permute(1, 0, 2)
+        scores = torch.matmul(q_i * scale, k_i.transpose(1, 2))
+        attn = torch.softmax(scores, dim=-1)
+        out_i = torch.matmul(attn, v_i).permute(1, 0, 2).contiguous()
+        output[start:end] = out_i
+    # (seq, heads, dim) → (seq, 1, heads*dim) for proj
+    context_layer = output.view(seq_len, 1, -1)
     out, _ = self.proj(context_layer)
     return out
 
