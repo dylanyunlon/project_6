@@ -116,7 +116,10 @@ for _candidate in \
     /usr/local/corex/lib/python3/dist-packages/vllm \
     /usr/local/corex/lib64/python3/dist-packages/vllm \
     /usr/local/lib/python3.10/site-packages/vllm; do
-    [[ -d "$_candidate" && "$_candidate" != "$VLLM_ROOT" ]] && { VLLM2="$_candidate"; break; }
+    if [[ -d "$_candidate" && "$_candidate" != "$VLLM_ROOT" ]]; then
+        VLLM2="$_candidate"
+        break
+    fi
 done
 if [[ -n "$VLLM2" ]]; then
     echo "VLLM2=${VLLM2} (will mirror all patches)"
@@ -308,10 +311,10 @@ if [[ -n "$VLLM2" ]]; then
              core/block/prefix_caching_block.py core/block/block_table.py \
              model_executor/sampling_metadata.py model_executor/layers/sampler.py \
              sampling_params.py; do
-        [[ -f "${VLLM_ROOT}/${f}" ]] && {
+        if [[ -f "${VLLM_ROOT}/${f}" ]]; then
             mkdir -p "$(dirname "${VLLM2}/${f}")"
             cp "${VLLM_ROOT}/${f}" "${VLLM2}/${f}" 2>/dev/null || true
-        }
+        fi
     done
     echo "[ok] mirrored all patches to VLLM2"
 fi
