@@ -28,10 +28,9 @@
 #     --max-seq-len-to-capture 32768 --enable-auto-tool-choice \
 #     --tool-call-parser qwen3_coder --reasoning-parser qwen3
 
-# NOTE: intentionally NO set -e — individual patch failures must NOT abort
+# NOTE: intentionally NO set -e or set -o pipefail — individual patch failures must NOT abort
 # the entire build.  Each step logs its own errors, and non-critical patches
 # (xformers, diagnostics) may legitimately fail if the base image differs.
-set -o pipefail
 
 # Always cd to script directory so relative paths (./qwen3_5.py, ./vendor_overrides, etc) work
 cd "$(dirname "$0")"
