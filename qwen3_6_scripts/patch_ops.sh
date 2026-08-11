@@ -31,13 +31,13 @@
 # NOTE: intentionally NO set -e — individual patch failures must NOT abort
 # the entire build.  Each step logs its own errors, and non-critical patches
 # (xformers, diagnostics) may legitimately fail if the base image differs.
-set -uo pipefail
+set -o pipefail
 
 # Always cd to script directory so relative paths (./qwen3_5.py, ./vendor_overrides, etc) work
 cd "$(dirname "$0")"
-build_stage "patch_ops.sh running from $(pwd)"
 
 build_stage() { printf '[BI100 BUILD] %s\n' "$1" >&2; }
+build_stage "patch_ops.sh running from $(pwd)"
 require_file() {
     local path=$1
     [[ -f "$path" ]] || {
