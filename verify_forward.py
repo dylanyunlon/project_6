@@ -11,7 +11,7 @@ os.environ.setdefault("BI100_GDN_COREX_PACKED_DECODE", "1")
 import torch
 print(f"torch {torch.__version__}, CUDA {torch.cuda.is_available()}")
 if torch.cuda.is_available():
-    print(f"GPU: {torch.cuda.get_device_name(0)}, {torch.cuda.get_device_properties(0).total_mem // 1024**2} MB")
+    print(f"GPU: {torch.cuda.get_device_name(0)}, {torch.cuda.get_device_properties(0).total_memory // 1024**2} MB")
 
 # Step 1: 验证所有.so加载
 print("\n=== Step 1: .so加载 ===")
