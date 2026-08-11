@@ -8,31 +8,17 @@ COPY ./qwen3_6_scripts /workspace/qwen3_6_scripts
 COPY ./computility-run.yaml /workspace/computility-run.yaml
 COPY ./ex_engine /workspace/ex_engine
 
-# Step 1: Build EX Engine .so libraries
-RUN chmod +x /workspace/ex_engine/build.sh && \
-    bash /workspace/ex_engine/build.sh --corex 2>&1 | tee /workspace/ex_build.log ; \
-    echo "[Dockerfile] ex_engine build exit code: $?"
+# Step 1: Compile _moe_C (CUB-based topk_softmax + moe_align_block_size)
+# Proven on real BI-V100: WARP_SIZE=64, -cl-fast-relaxed-math, cub/block/block_reduce.cuh
+RUN python3 /workspace/ex_engine/precompile_moe_kernels.py 2>&1 | tee /workspace/ex_build.log ; \
+    echo "[Dockerfile] _moe_C precompile exit code: $?"
 
-# Step 2: Precompile MoE CUDA kernels
-RUN python3 /workspace/ex_engine/precompile_moe_topk.py 2>&1 | tee -a /workspace/ex_build.log ; \
-    echo "[Dockerfile] moe_topk precompile exit code: $?"
-
-# Step 3: Precompile vllm v0.5.5 MoE kernels
-RUN python3 /workspace/ex_engine/precompile_moe_kernels.py 2>&1 | tee -a /workspace/ex_build.log ; \
-    echo "[Dockerfile] moe_v055 precompile exit code: $?"
-
-# Step 4: Deploy patches (serving + engine fixes)
+# Step 2: Deploy patches (serving + engine fixes)
 RUN chmod +x /workspace/qwen3_6_scripts/patch_ops.sh && \
     bash /workspace/qwen3_6_scripts/patch_ops.sh 2>&1 | tee /workspace/patch_ops.log ; \
     echo "[Dockerfile] patch_ops exit code: $?"
 
-# Step 5: Precompile ix_moe_bridge.cpp → links to ixformer::infer::topk_softmax()
-# This is the C++ pybind bridge that makes ixformer SDK callable from Python.
-# Source: upstream_ref/xllm/xllm/core/kernels/ilu/fused_moe.cpp call pattern
-RUN python3 /workspace/ex_engine/precompile_ix_bridge.py 2>&1 | tee -a /workspace/ex_build.log ; \
-    echo "[Dockerfile] ix_bridge precompile exit code: $?"
-
-# Step 6: Precompile GDN kernel (needs vllm in path, so after patch_ops)
+# Step 3: Precompile GDN kernel (needs vllm in path, so after patch_ops)
 RUN python3 /workspace/qwen3_6_scripts/precompile_gdn.py \
     /workspace/qwen3_6_scripts/flash_qla_sm70 2>&1 | tee -a /workspace/ex_build.log ; \
     echo "[Dockerfile] gdn precompile exit code: $?"
