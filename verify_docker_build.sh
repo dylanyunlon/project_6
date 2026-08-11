@@ -86,7 +86,7 @@ fi
 # --- Step 7: Deploy ex_engine Python modules ---
 echo ""
 echo "[STEP 7] Deploy ex_engine Python modules..."
-VLLM_ROOT=$(python3 -c "import vllm; print(vllm.__path__[0])" 2>/dev/null || echo "/usr/local/corex/lib/python3/dist-packages/vllm")
+VLLM_ROOT=$(python3 -c "import vllm; print(vllm.__path__[0])" 2>/dev/null | tail -1 || echo "/usr/local/corex/lib64/python3/dist-packages/vllm")
 for f in ix_unified.py corex_so_loader.py moe_fused_dispatch.py; do
     cp "./ex_engine/python/$f" "${VLLM_ROOT}/$f" 2>/dev/null && echo "  ✓ $f" || echo "  ✗ $f"
 done

@@ -58,11 +58,12 @@ RUN chmod +x /workspace/ex_engine/build_unified_bridge.sh && \
     echo "[Dockerfile] ix_unified_bridge build exit code: $?"
 
 # Step 7: Deploy ix_unified and ex_engine Python modules to vllm path
-RUN VLLM_ROOT=$(python3 -c "import vllm; print(vllm.__path__[0])" 2>/dev/null || echo "/usr/local/corex/lib/python3/dist-packages/vllm") && \
+RUN VLLM_ROOT=$(python3 -c "import vllm; print(vllm.__path__[0])" 2>/dev/null | tail -1 || echo "/usr/local/corex/lib64/python3/dist-packages/vllm") && \
+    echo "VLLM_ROOT=${VLLM_ROOT}" && \
     cp /workspace/ex_engine/python/ix_unified.py "${VLLM_ROOT}/ix_unified.py" 2>/dev/null || true && \
     cp /workspace/ex_engine/python/corex_so_loader.py "${VLLM_ROOT}/corex_so_loader.py" 2>/dev/null || true && \
     cp /workspace/ex_engine/python/moe_fused_dispatch.py "${VLLM_ROOT}/moe_fused_dispatch.py" 2>/dev/null || true && \
-    if [ -f /workspace/ex_engine/build/ix_unified_bridge*.so ]; then \
+    if ls /workspace/ex_engine/build/ix_unified_bridge*.so 1>/dev/null 2>&1; then \
         cp /workspace/ex_engine/build/ix_unified_bridge*.so "${VLLM_ROOT}/" 2>/dev/null || true ; \
     fi ; \
     echo "[Dockerfile] ex_engine Python modules deployed"
