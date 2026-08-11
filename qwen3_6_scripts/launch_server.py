@@ -45,5 +45,9 @@ def _force_patch():
 
 _force_patch()
 
-# Now run the standard vllm api_server with our patched version
-from vllm.entrypoints.openai.api_server import *
+# execvp replaces this process with vllm api_server, passing all CLI args through.
+# This is the safest approach: no import issues, our patched files are already on disk.
+print("[launch] Starting vllm api_server with args:", sys.argv[1:], file=sys.stderr)
+os.execvp(sys.executable, [
+    sys.executable, "-m", "vllm.entrypoints.openai.api_server"
+] + sys.argv[1:])
