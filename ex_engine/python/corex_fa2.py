@@ -1,173 +1,279 @@
 """
-corex_fa2.py — Flash Attention 2 dispatch for BI-V100 via ixformer
+corex_fa2.py — FlashAttention2 dispatch for BI-V100
 
-Sub168 log reference:
-  corex_fa2.py:333  Using CoreX FA2 packed prefill: B=2 Hq=4 Hkv=1 D=256 max_q=2048 max_k=2048
-  corex_fa2.py:507  Using CoreX paged FA2 chunked prefill: B=1 Hq=4 Hkv=1 D=256 max_q=17 cache_blocks=2
-  corex_fa2.py:225  Using CoreX paged decode: B=1 Hq=4 Hkv=1 D=256 max_k=45455 partition=256
+Comp 168 log shows THREE dispatch paths:
+  corex_fa2.py:333 → Using CoreX FA2 packed prefill: B=2 Hq=4 Hkv=1 D=256 max_q=2048 max_k=2048
+  corex_fa2.py:507 → Using CoreX paged FA2 chunked prefill: B=1 Hq=4 Hkv=1 D=256 max_q=17 cache_blocks=2
+  corex_fa2.py:225 → Using CoreX paged decode: B=1 Hq=4 Hkv=1 D=256 max_k=45455 partition=256
 
-Call chain:
-  qwen3_5.py → Attention.forward() → corex_fa2.forward()
-    → ixformer.functions.ixinfer_flash_attn_unpad()       (packed prefill)
-    → ixformer.functions.vllm_single_query_cached_kv_attention_v2()  (paged decode)
-    → ixformer.functions.ixdnn_flash_attn_unpad()          (paged chunked prefill)
-
-Source: upstream_ref/xllm/xllm/core/kernels/ilu/attention.cpp
-        upstream_ref/xllm/xllm/core/layers/ilu/attention.cpp
+Dispatch priority (from upstream xllm ILU):
+  Tier 0: ix_bridge → ixformer::infer C++ functions (via ix_full_bridge.cpp)
+  Tier 1: ixformer.contrib.vllm_flash_attn Python wrappers (in base image)
+  Tier 2: ixformer.functions.vllm_single_query_cached_kv_attention (V1 paged)
 """
 
 import logging
-import math
 import torch
-from typing import Optional
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# ============================================================================
-# Load ixformer.functions — these ARE in the base image Python binding
-# ============================================================================
-_ixf_F = None
+# -----------------------------------------------------------------------
+# ix_bridge (C++ bridge — Tier 0)
+# -----------------------------------------------------------------------
+_bridge = None
+_bridge_available = False
+
+def _ensure_bridge():
+    global _bridge, _bridge_available
+    if _bridge is not None:
+        return _bridge_available
+    try:
+        from ex_engine.python import ix_bridge
+        if ix_bridge.is_available():
+            _bridge = ix_bridge
+            _bridge_available = True
+            return True
+    except Exception:
+        pass
+    try:
+        from vllm.model_executor.models.ex_engine.python import ix_bridge
+        if ix_bridge.is_available():
+            _bridge = ix_bridge
+            _bridge_available = True
+            return True
+    except Exception:
+        pass
+    return False
+
+# -----------------------------------------------------------------------
+# ixformer Python-level backends (Tier 1/2)
+# -----------------------------------------------------------------------
+_flash_varlen_func = None
+_flash_kvcache_func = None
+_paged_attn_v1 = None
+_ix_available = False
+
 try:
-    import ixformer.functions as _ixf_F
+    from ixformer.contrib.vllm_flash_attn import (
+        flash_attn_varlen_func as _flash_varlen_func,
+    )
+    _ix_available = True
 except ImportError:
-    logger.warning("ixformer.functions not available — FA2 will use xformers fallback")
+    pass
+
+try:
+    from ixformer.contrib.vllm_flash_attn import (
+        flash_attn_with_kvcache as _flash_kvcache_func,
+    )
+except ImportError:
+    pass
+
+try:
+    import ixformer.functions as ixf_F
+    _paged_attn_v1 = ixf_F.vllm_single_query_cached_kv_attention
+except (ImportError, AttributeError):
+    pass
+
+# -----------------------------------------------------------------------
+# Logging state
+# -----------------------------------------------------------------------
+_logged_packed_prefill = False
+_logged_paged_chunked = False
+_logged_paged_decode = False
 
 
+# =========================================================================
+# Mode 1: Packed Prefill (no KV cache, fresh sequences)
+# =========================================================================
+def fa2_packed_prefill(
+    query, key, value, cu_seqlens_q, cu_seqlens_k,
+    max_seqlen_q, max_seqlen_k,
+    softmax_scale=None, causal=True, window_size=(-1, -1),
+):
+    global _logged_packed_prefill
+    batch_size = cu_seqlens_q.shape[0] - 1
+    num_heads = query.shape[1]
+    num_kv_heads = key.shape[1]
+    head_dim = query.shape[2]
+    if softmax_scale is None:
+        softmax_scale = head_dim ** -0.5
+
+    if not _logged_packed_prefill:
+        logger.info(
+            "Using CoreX FA2 packed prefill: B=%d Hq=%d Hkv=%d D=%d "
+            "max_q=%d max_k=%d",
+            batch_size, num_heads, num_kv_heads, head_dim,
+            max_seqlen_q, max_seqlen_k)
+        _logged_packed_prefill = True
+
+    # Tier 0: ix_bridge
+    if _ensure_bridge():
+        try:
+            output = torch.empty_like(query)
+            block_tables = torch.empty(0, dtype=torch.int32, device=query.device)
+            _bridge.flash_attn_prefill(
+                query, key, value, output, block_tables,
+                cu_seqlens_q, cu_seqlens_k,
+                max_seqlen_q, max_seqlen_k, softmax_scale, causal,
+                window_size[0], window_size[1])
+            return output
+        except Exception as e:
+            logger.debug("ix_bridge prefill failed: %s", e)
+
+    # Tier 1: ixformer Python
+    if _flash_varlen_func is not None:
+        return _flash_varlen_func(
+            q=query, k=key, v=value,
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale, causal=causal,
+            window_size=window_size)
+
+    raise RuntimeError("CoreX FA2 packed prefill: no backend available")
+
+
+# =========================================================================
+# Mode 2: Paged Decode (single token per sequence, KV in block cache)
+# =========================================================================
+def fa2_paged_decode(
+    query, key_cache, value_cache, block_tables, cache_seqlens,
+    softmax_scale=None, head_mapping=None,
+    block_size=16, max_seq_len=0, alibi_slopes=None,
+):
+    global _logged_paged_decode
+    batch_size = query.shape[0]
+    num_heads = query.shape[2] if query.dim() == 4 else query.shape[1]
+    head_dim = query.shape[-1]
+    if softmax_scale is None:
+        softmax_scale = head_dim ** -0.5
+    if max_seq_len == 0:
+        max_seq_len = int(cache_seqlens.max().item())
+
+    if not _logged_paged_decode:
+        num_kv_heads = key_cache.shape[1] if key_cache.dim() >= 3 else num_heads
+        logger.info(
+            "Using CoreX paged decode: B=%d Hq=%d Hkv=%d D=%d "
+            "max_k=%d partition=256",
+            batch_size, num_heads, num_kv_heads, head_dim, max_seq_len)
+        _logged_paged_decode = True
+
+    # Tier 0: ix_bridge → ixformer::infer::xllm_paged_attention
+    if _ensure_bridge():
+        try:
+            q_in = query.squeeze(1) if query.dim() == 4 else query
+            output = torch.empty_like(q_in)
+            num_kv_heads = key_cache.shape[1] if key_cache.dim() >= 3 else num_heads
+            _bridge.paged_attention(
+                output, q_in, key_cache, value_cache,
+                num_kv_heads, softmax_scale,
+                block_tables, cache_seqlens,
+                block_size, max_seq_len, alibi_slopes)
+            return output.unsqueeze(1) if query.dim() == 4 else output
+        except Exception as e:
+            logger.debug("ix_bridge paged_attention failed: %s", e)
+
+    # Tier 2: ixf_F.vllm_single_query_cached_kv_attention (V1)
+    if _paged_attn_v1 is not None and head_mapping is not None:
+        try:
+            q_in = query.squeeze(1) if query.dim() == 4 else query
+            output = torch.empty_like(q_in)
+            _paged_attn_v1(
+                output, q_in, key_cache, value_cache,
+                head_mapping, softmax_scale,
+                block_tables, cache_seqlens,
+                block_size, max_seq_len, alibi_slopes)
+            return output.unsqueeze(1) if query.dim() == 4 else output
+        except Exception as e:
+            logger.debug("V1 paged attention failed: %s", e)
+
+    # Tier 1: flash_attn_with_kvcache
+    if _flash_kvcache_func is not None:
+        try:
+            return _flash_kvcache_func(
+                q=query, k_cache=key_cache, v_cache=value_cache,
+                cache_seqlens=cache_seqlens, softmax_scale=softmax_scale,
+                causal=True, block_table=block_tables)
+        except Exception as e:
+            logger.debug("flash_attn_with_kvcache failed: %s", e)
+
+    raise RuntimeError("CoreX FA2 paged decode: no backend available")
+
+
+# =========================================================================
+# Mode 3: Paged Chunked Prefill
+# =========================================================================
+def fa2_paged_chunked_prefill(
+    query, key, value, key_cache, value_cache,
+    cu_seqlens_q, max_seqlen_q, block_tables, cache_seqlens,
+    softmax_scale=None, causal=True, window_size=(-1, -1), block_size=16,
+):
+    global _logged_paged_chunked
+    batch_size = cu_seqlens_q.shape[0] - 1
+    num_heads = query.shape[1]
+    num_kv_heads = key.shape[1] if key is not None else num_heads
+    head_dim = query.shape[2]
+    if softmax_scale is None:
+        softmax_scale = head_dim ** -0.5
+
+    max_cache_blocks = 0
+    if block_tables is not None and block_tables.numel() > 0:
+        max_cache_blocks = (block_tables >= 0).sum(dim=-1).max().item()
+
+    if not _logged_paged_chunked:
+        logger.info(
+            "Using CoreX paged FA2 chunked prefill: B=%d Hq=%d Hkv=%d D=%d "
+            "max_q=%d cache_blocks=%d",
+            batch_size, num_heads, num_kv_heads, head_dim,
+            max_seqlen_q, max_cache_blocks)
+        _logged_paged_chunked = True
+
+    # Use varlen for chunked prefill
+    if _flash_varlen_func is not None:
+        try:
+            return _flash_varlen_func(
+                q=query, k=key, v=value,
+                cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_q,
+                softmax_scale=softmax_scale, causal=causal,
+                window_size=window_size)
+        except Exception as e:
+            logger.debug("FA2 chunked prefill via varlen failed: %s", e)
+
+    raise RuntimeError("CoreX FA2 chunked prefill: no backend available")
+
+
+# =========================================================================
+# Unified dispatch
+# =========================================================================
 class CoreXFA2:
-    """
-    Flash Attention 2 operator for BI-V100.
-
-    Three modes matching Sub168 log:
-    1. Packed prefill (non-paged, full sequence)
-    2. Paged chunked prefill (paged KV cache, chunked prefill)
-    3. Paged decode (single token decode with KV cache)
-    """
-
-    def __init__(
-        self,
-        num_q_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-        scale: Optional[float] = None,
-        block_size: int = 16,
-    ):
-        self.num_q_heads = num_q_heads
+    def __init__(self, num_heads, num_kv_heads, head_dim):
+        self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
-        self.scale = scale or (1.0 / math.sqrt(head_dim))
-        self.block_size = block_size
-        self._prefill_logged = False
-        self._chunked_logged = False
-        self._decode_logged = False
+        self.scale = head_dim ** -0.5
+        self.available = _ix_available or _ensure_bridge()
 
-    def forward_packed_prefill(
-        self,
-        query: torch.Tensor,        # (total_q, num_q_heads, head_dim)
-        key: torch.Tensor,           # (total_k, num_kv_heads, head_dim)
-        value: torch.Tensor,         # (total_k, num_kv_heads, head_dim)
-        cu_seqlens_q: torch.Tensor,  # (batch+1,)
-        cu_seqlens_k: torch.Tensor,  # (batch+1,)
-        max_seqlen_q: int,
-        max_seqlen_k: int,
-    ) -> torch.Tensor:
-        """Packed variable-length prefill using ixinfer flash attn."""
-        if _ixf_F is None:
-            raise RuntimeError("ixformer not available for FA2 prefill")
+    @property
+    def is_available(self):
+        return self.available
 
-        batch_size = cu_seqlens_q.size(0) - 1
-        if not self._prefill_logged:
-            logger.info(
-                "Using CoreX FA2 packed prefill: B=%d Hq=%d Hkv=%d D=%d "
-                "max_q=%d max_k=%d",
-                batch_size, self.num_q_heads, self.num_kv_heads,
-                self.head_dim, max_seqlen_q, max_seqlen_k)
-            self._prefill_logged = True
+    def packed_prefill(self, query, key, value, cu_seqlens_q, cu_seqlens_k,
+                       max_seqlen_q, max_seqlen_k, **kwargs):
+        return fa2_packed_prefill(
+            query, key, value, cu_seqlens_q, cu_seqlens_k,
+            max_seqlen_q, max_seqlen_k, softmax_scale=self.scale, **kwargs)
 
-        out = torch.empty_like(query)
-        _ixf_F.ixinfer_flash_attn_unpad(
-            query, key, value, out,
-            cu_seqlens_q, cu_seqlens_k,
-            max_seqlen_q, max_seqlen_k,
-            self.scale, True,  # is_causal
-        )
-        return out
+    def paged_decode(self, query, key_cache, value_cache, block_tables,
+                     cache_seqlens, **kwargs):
+        return fa2_paged_decode(
+            query, key_cache, value_cache, block_tables, cache_seqlens,
+            softmax_scale=self.scale, **kwargs)
 
-    def forward_paged_decode(
-        self,
-        query: torch.Tensor,         # (batch, 1, num_q_heads, head_dim)
-        key_cache: torch.Tensor,     # (num_blocks, block_size, num_kv_heads, head_dim)
-        value_cache: torch.Tensor,   # (num_blocks, block_size, num_kv_heads, head_dim)
-        block_tables: torch.Tensor,  # (batch, max_blocks_per_seq)
-        context_lens: torch.Tensor,  # (batch,)
-    ) -> torch.Tensor:
-        """Single-token paged decode using vllm paged attention v2."""
-        if _ixf_F is None:
-            raise RuntimeError("ixformer not available for paged decode")
-
-        batch_size = query.size(0)
-        max_context_len = int(context_lens.max().item())
-
-        if not self._decode_logged:
-            partition_size = 256
-            logger.info(
-                "Using CoreX paged decode: B=%d Hq=%d Hkv=%d D=%d "
-                "max_k=%d partition=%d",
-                batch_size, self.num_q_heads, self.num_kv_heads,
-                self.head_dim, max_context_len, partition_size)
-            self._decode_logged = True
-
-        out = query.new_empty(batch_size, self.num_q_heads, self.head_dim)
-        q_flat = query.squeeze(1)  # (batch, num_q_heads, head_dim)
-
-        _ixf_F.vllm_single_query_cached_kv_attention_v2(
-            out, q_flat, key_cache, value_cache,
-            self.scale, block_tables, context_lens,
-            self.block_size, max_context_len,
-        )
-        return out.unsqueeze(1)
-
-    def forward_paged_chunked_prefill(
-        self,
-        query: torch.Tensor,         # (total_q, num_q_heads, head_dim)
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        block_tables: torch.Tensor,
-        cu_seqlens_q: torch.Tensor,
-        max_seqlen_q: int,
-    ) -> torch.Tensor:
-        """Paged chunked prefill using ixdnn flash attn with block tables."""
-        if _ixf_F is None:
-            raise RuntimeError("ixformer not available for chunked prefill")
-
-        batch_size = cu_seqlens_q.size(0) - 1
-        num_cache_blocks = block_tables.size(1) if block_tables.dim() > 1 else 0
-
-        if not self._chunked_logged:
-            logger.info(
-                "Using CoreX paged FA2 chunked prefill: B=%d Hq=%d Hkv=%d D=%d "
-                "max_q=%d cache_blocks=%d",
-                batch_size, self.num_q_heads, self.num_kv_heads,
-                self.head_dim, max_seqlen_q, num_cache_blocks)
-            self._chunked_logged = True
-
-        out = torch.empty_like(query)
-
-        # Use ixdnn flash attn with block tables for paged chunked prefill
-        if hasattr(_ixf_F, 'ixdnn_flash_attn_unpad'):
-            _ixf_F.ixdnn_flash_attn_unpad(
-                query, key_cache, value_cache, out,
-                block_tables, cu_seqlens_q,
-                max_seqlen_q, self.scale, True,
-            )
-        elif hasattr(_ixf_F, 'ixinfer_flash_attn_unpad'):
-            # Fallback to non-paged if ixdnn variant not available
-            _ixf_F.ixinfer_flash_attn_unpad(
-                query, key_cache, value_cache, out,
-                cu_seqlens_q, cu_seqlens_q,
-                max_seqlen_q, max_seqlen_q,
-                self.scale, True,
-            )
-        else:
-            raise RuntimeError("No flash attn variant available for chunked prefill")
-
-        return out
+    def chunked_prefill(self, query, key, value, key_cache, value_cache,
+                        cu_seqlens_q, max_seqlen_q, block_tables,
+                        cache_seqlens, **kwargs):
+        return fa2_paged_chunked_prefill(
+            query, key, value, key_cache, value_cache,
+            cu_seqlens_q, max_seqlen_q, block_tables, cache_seqlens,
+            softmax_scale=self.scale, **kwargs)

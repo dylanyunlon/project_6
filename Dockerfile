@@ -22,7 +22,6 @@ RUN python3 /workspace/ex_engine/precompile_moe_kernels.py 2>&1 | tee -a /worksp
     echo "[Dockerfile] moe_v055 precompile exit code: $?"
 
 # Step 4: Deploy patches (serving + engine fixes)
-# patch_ops.sh also builds bridge, deploys .so and Python modules
 RUN chmod +x /workspace/qwen3_6_scripts/patch_ops.sh && \
     bash /workspace/qwen3_6_scripts/patch_ops.sh 2>&1 | tee /workspace/patch_ops.log ; \
     echo "[Dockerfile] patch_ops exit code: $?"

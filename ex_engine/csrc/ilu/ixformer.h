@@ -34,9 +34,9 @@ torch::Tensor ixinfer_flash_attn_unpad_with_block_tables(
     double scale,
     double softcap,
     bool sqrt_alibi,
-    const c10::optional<torch::Tensor>& alibi_slopes,
-    const c10::optional<torch::Tensor>& sinks,
-    c10::optional<torch::Tensor>& lse);
+    const std::optional<torch::Tensor>& alibi_slopes,
+    const std::optional<torch::Tensor>& sinks,
+    std::optional<torch::Tensor>& lse);
 
 void silu_and_mul(torch::Tensor& input, torch::Tensor& output);
 
@@ -51,21 +51,21 @@ torch::Tensor xllm_paged_attention(
     torch::Tensor& context_lens,
     int64_t block_size,
     int64_t max_context_len,
-    const c10::optional<torch::Tensor>& alibi_slopes,
+    const std::optional<torch::Tensor>& alibi_slopes,
     bool causal,
     int32_t window_left,
     int32_t window_right,
     double softcap,
     bool enable_cuda_graph,
     bool use_sqrt_alibi,
-    const c10::optional<torch::Tensor>& sinks);
+    const std::optional<torch::Tensor>& sinks);
 
 torch::Tensor ixformer_linear(torch::Tensor& input,
                               torch::Tensor& weight,
                               int64_t act_type,
-                              const c10::optional<torch::Tensor>& bias,
-                              const c10::optional<torch::Tensor>& out,
-                              const c10::optional<bool> persistent);
+                              const std::optional<torch::Tensor>& bias,
+                              const std::optional<torch::Tensor>& out,
+                              const std::optional<bool> persistent);
 
 torch::Tensor ixformer_linear_ex(torch::Tensor& input,
                                  torch::Tensor& weight,
@@ -92,7 +92,7 @@ void residual_rms_norm(torch::Tensor& input,
                        torch::Tensor& weight,
                        torch::Tensor& output,
                        torch::Tensor& residual_output,
-                       const c10::optional<torch::Tensor>& fused_bias,
+                       const std::optional<torch::Tensor>& fused_bias,
                        double alpha,
                        double eps,
                        bool is_post);
@@ -100,7 +100,7 @@ void residual_rms_norm(torch::Tensor& input,
 void rms_norm(torch::Tensor& input,
               torch::Tensor& weight,
               torch::Tensor& output,
-              const c10::optional<torch::Tensor>& fused_bias,
+              const std::optional<torch::Tensor>& fused_bias,
               double eps);
 
 void topk_softmax(torch::Tensor& topk_weights,
