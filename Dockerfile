@@ -34,8 +34,8 @@ RUN if [ -f /workspace/ex_engine/build_unified_bridge.sh ]; then \
     echo "[Dockerfile] bridge build done"
 
 # Step 6: Deploy ix_unified Python modules to vllm path (tolerant)
-RUN VLLM_ROOT="$(python3 -c 'import vllm; print(vllm.__path__[0])' 2>/dev/null | grep -v '^INFO\|^WARNING\|^DEBUG' | tail -1)" && \
-    [ -z "$VLLM_ROOT" ] && VLLM_ROOT="/usr/local/corex/lib64/python3/dist-packages/vllm" ; \
+RUN VLLM_ROOT="$(python3 -c 'import vllm; print(vllm.__path__[0])' 2>/dev/null | grep -v '^INFO\|^WARNING\|^DEBUG' | tail -1)" ; \
+    if [ -z "$VLLM_ROOT" ]; then VLLM_ROOT="/usr/local/corex/lib64/python3/dist-packages/vllm"; fi ; \
     echo "[Dockerfile] VLLM_ROOT=${VLLM_ROOT}" && \
     for f in ix_unified.py corex_so_loader.py moe_fused_dispatch.py corex_moe.py; do \
         [ -f "/workspace/ex_engine/python/$f" ] && cp "/workspace/ex_engine/python/$f" "${VLLM_ROOT}/$f" 2>/dev/null || true ; \
