@@ -55,8 +55,8 @@ class FusedMoEImpl : public torch::nn::Module {
     torch::Tensor reduce_weight;
     torch::Tensor combine_idx;
     torch::Tensor token_count_slice;
-    std::optional<torch::Tensor> cusum_token_count;
-    std::optional<torch::Tensor> input_scale;
+    c10::optional<torch::Tensor> cusum_token_count;
+    c10::optional<torch::Tensor> input_scale;
   };
 
   // initial steps for MoE computation, select the experts for each token

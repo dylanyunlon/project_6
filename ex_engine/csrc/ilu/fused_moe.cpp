@@ -25,11 +25,11 @@ std::tuple<torch::Tensor, torch::Tensor> moe_active_topk(
     int64_t num_expert_group,
     int64_t topk_group,
     bool normalize,
-    const std::optional<torch::Tensor>& mask,
+    const c10::optional<torch::Tensor>& mask,
     const std::string& normed_by,
     const std::string& scoring_func,
     double route_scale,
-    const std::optional<torch::Tensor>& e_score_correction_bias) {
+    const c10::optional<torch::Tensor>& e_score_correction_bias) {
   torch::Tensor input_ = input.to(torch::kFloat32);
   auto reduce_weight =
       torch::empty({input.size(0), topk},
@@ -61,9 +61,9 @@ std::vector<torch::Tensor> moe_gen_idx(torch::Tensor& expert_id,
                                      src_dst,
                                      dst_src,
                                      expert_sizes_gpu,
-                                     /*expert_mask=*/std::nullopt,
-                                     /*expert_sizes_cpu*/ std::nullopt,
-                                     /*expert_sizes_gpu*/ std::nullopt,
+                                     /*expert_mask=*/c10::nullopt,
+                                     /*expert_sizes_cpu*/ c10::nullopt,
+                                     /*expert_sizes_gpu*/ c10::nullopt,
                                      0,
                                      expert_num,
                                      expert_num);
@@ -90,8 +90,8 @@ torch::Tensor moe_combine_result(torch::Tensor& input, torch::Tensor& weight) {
   infer::moe_output_reduce_sum(output,
                                input,
                                weight,
-                               /*mask=*/std::nullopt,
-                               /*extra_residual*/ std::nullopt,
+                               /*mask=*/c10::nullopt,
+                               /*extra_residual*/ c10::nullopt,
                                /*scaling_factor=*/1.0);
   return output;
 }

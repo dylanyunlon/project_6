@@ -296,7 +296,7 @@ torch::Tensor FusedMoEImpl::select_experts(
     SelectedExpertInfo& selected_expert_info,
     bool enable_all2all_communication) {
   // prepare the parameters for select_experts
-  std::optional<torch::Tensor> e_score_correction_bias = std::nullopt;
+  c10::optional<torch::Tensor> e_score_correction_bias = c10::nullopt;
   if (e_score_correction_bias_.defined()) {
     e_score_correction_bias = e_score_correction_bias_;
   }
@@ -324,7 +324,7 @@ torch::Tensor FusedMoEImpl::select_experts(
   torch::Tensor gather_idx;
   torch::Tensor combine_idx;
   torch::Tensor token_count;
-  std::optional<torch::Tensor> cusum_token_count;
+  c10::optional<torch::Tensor> cusum_token_count;
   {
     xllm::kernel::MoeGenIdxParams moe_gen_idx_params;
     moe_gen_idx_params.expert_id = expert_id;
@@ -337,7 +337,7 @@ torch::Tensor FusedMoEImpl::select_experts(
     // during all2all communication, we do not need cusum_token_count in the
     // following computation
     if (enable_all2all_communication) {
-      cusum_token_count = std::nullopt;
+      cusum_token_count = c10::nullopt;
     } else {
       cusum_token_count = output_vec[3];
     }
@@ -438,7 +438,7 @@ torch::Tensor FusedMoEImpl::forward_experts(const torch::Tensor& hidden_states,
     stream_initialized_ = true;
   }
 
-  std::optional<torch::Tensor> e_score_correction_bias = std::nullopt;
+  c10::optional<torch::Tensor> e_score_correction_bias = c10::nullopt;
   if (e_score_correction_bias_.defined()) {
     e_score_correction_bias = e_score_correction_bias_;
   }
@@ -478,7 +478,7 @@ torch::Tensor FusedMoEImpl::forward_experts(const torch::Tensor& hidden_states,
     // 2. Process Result: Generate indices and unpack to computation buffer
     // use the buffer during initialization for the output
     expand_hidden_states = dispatch_recv_token_tensor_head_;
-    std::optional<torch::Tensor> output_tail = std::nullopt;
+    c10::optional<torch::Tensor> output_tail = c10::nullopt;
     if (is_smoothquant_) {
       output_tail = dispatch_recv_token_tensor_tail_;
       // update selected_expert_info with the tail (input scale)
@@ -527,7 +527,7 @@ torch::Tensor FusedMoEImpl::forward_experts(const torch::Tensor& hidden_states,
     group_gemm_params.trans_b = true;
     group_gemm_params.a_quant_bit = is_smoothquant_ ? 8 : -1;
     group_gemm_params.output = gemm1_out;
-    group_gemm_params.combine_idx = std::nullopt;
+    group_gemm_params.combine_idx = c10::nullopt;
     gemm1_out = xllm::kernel::group_gemm(group_gemm_params);
   }
 
@@ -639,7 +639,7 @@ torch::Tensor FusedMoEImpl::forward_experts(const torch::Tensor& hidden_states,
   // After group gemm is finished, some tensors are no
   // longer needed. We must explicitly release the memory.
   expand_hidden_states = torch::Tensor();
-  selected_expert_info.input_scale = std::nullopt;
+  selected_expert_info.input_scale = c10::nullopt;
   act_out = torch::Tensor();
 
   // Step 7: combine the intermediate results and get the final hidden states
@@ -655,7 +655,7 @@ torch::Tensor FusedMoEImpl::forward_experts(const torch::Tensor& hidden_states,
         selected_expert_info.cusum_token_count;
     moe_combine_result_params.start_expert_id = start_expert_id_;
     moe_combine_result_params.expert_size = expert_size;
-    moe_combine_result_params.bias = std::nullopt;
+    moe_combine_result_params.bias = c10::nullopt;
     // if all2all communication is enabled and shared output is provided,
     //  we will fused the add up to combine result
     if (enable_all2all_communication && n_shared_experts_ > 0) {

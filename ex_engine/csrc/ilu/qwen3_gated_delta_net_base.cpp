@@ -34,7 +34,7 @@ std::tuple<torch::Tensor, torch::Tensor> torch_recurrent_gated_delta_rule(
     torch::Tensor value,
     torch::Tensor g,
     torch::Tensor beta,
-    std::optional<torch::Tensor> initial_state,
+    c10::optional<torch::Tensor> initial_state,
     bool output_final_state = true,
     bool use_qk_l2norm_in_kernel = true) {
   auto initial_dtype = query.dtype();
@@ -390,8 +390,8 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     conv1d_params.weight = conv_weight;
     conv1d_params.conv_state_indices = linear_state_indices;
     conv1d_params.block_idx_last_scheduled_token =
-        std::optional<torch::Tensor>();
-    conv1d_params.initial_state_idx = std::optional<torch::Tensor>();
+        c10::optional<torch::Tensor>();
+    conv1d_params.initial_state_idx = c10::optional<torch::Tensor>();
     conv1d_params.query_start_loc = attn_metadata.q_cu_seq_lens;
     conv1d_params.max_query_len = attn_metadata.max_query_len;
     mixed_qkv = xllm::kernel::causal_conv1d_update(conv1d_params);

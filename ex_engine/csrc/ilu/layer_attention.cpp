@@ -62,13 +62,13 @@ AttentionImpl::AttentionImpl(int64_t num_heads,
   }
 }
 
-std::tuple<torch::Tensor, std::optional<torch::Tensor>> AttentionImpl::forward(
+std::tuple<torch::Tensor, c10::optional<torch::Tensor>> AttentionImpl::forward(
     const AttentionMetadata& attn_metadata,
     torch::Tensor& query,
     torch::Tensor& key,
     torch::Tensor& value,
     KVCache& kv_cache) {
-  std::optional<torch::Tensor> output_lse = std::nullopt;
+  c10::optional<torch::Tensor> output_lse = c10::nullopt;
   torch::Tensor output;
   if (enable_mla_) {
     output = torch::empty({query.size(0), num_heads_ * v_head_dim_},
@@ -84,8 +84,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> AttentionImpl::forward(
       attn_metadata.is_prefill || attn_metadata.is_chunked_prefill;
   int64_t num_kv_heads = (enable_mla_ && !only_prefill) ? 1 : num_kv_heads_;
   torch::Tensor k_cache = kv_cache.get_k_cache();
-  std::optional<torch::Tensor> v_cache;
-  std::optional<torch::Tensor> v;
+  c10::optional<torch::Tensor> v_cache;
+  c10::optional<torch::Tensor> v;
   if (!enable_mla_) {
     v = value.view({-1, num_kv_heads, head_size_});
     v_cache = kv_cache.get_v_cache();
@@ -118,10 +118,10 @@ void AttentionImpl::prefill_forward(torch::Tensor& query,
                                     torch::Tensor& value,
                                     torch::Tensor& output,
                                     const torch::Tensor& k_cache,
-                                    const std::optional<torch::Tensor>& v_cache,
+                                    const c10::optional<torch::Tensor>& v_cache,
                                     const AttentionMetadata& attn_metadata) {
   int64_t head_size_v = enable_mla_ ? v_head_dim_ : head_size_;
-  std::optional<torch::Tensor> output_lse = std::nullopt;
+  c10::optional<torch::Tensor> output_lse = c10::nullopt;
   query = query.view({-1, num_heads_, head_size_});
   output = output.view({-1, num_heads_, head_size_v});
   // torch::Tensor k_cache_ = k_cache;
@@ -133,11 +133,11 @@ void AttentionImpl::prefill_forward(torch::Tensor& query,
                                    output_lse,
                                    attn_metadata.q_cu_seq_lens,
                                    attn_metadata.kv_cu_seq_lens,
-                                   /*alibi_slope=*/std::nullopt,
-                                   /*attn_bias=*/std::nullopt,
-                                   /*q_quant_scale=*/std::nullopt,
-                                   /*k_quant_scale=*/std::nullopt,
-                                   /*v_quant_scale=*/std::nullopt,
+                                   /*alibi_slope=*/c10::nullopt,
+                                   /*attn_bias=*/c10::nullopt,
+                                   /*q_quant_scale=*/c10::nullopt,
+                                   /*k_quant_scale=*/c10::nullopt,
+                                   /*v_quant_scale=*/c10::nullopt,
                                    attn_metadata.block_table,
                                    attn_metadata.max_query_len,
                                    attn_metadata.max_seq_len,
@@ -152,12 +152,12 @@ void AttentionImpl::prefill_forward(torch::Tensor& query,
 void AttentionImpl::decoder_forward(torch::Tensor& query,
                                     torch::Tensor& output,
                                     const torch::Tensor& k_cache,
-                                    const std::optional<torch::Tensor>& v_cache,
+                                    const c10::optional<torch::Tensor>& v_cache,
                                     const AttentionMetadata& attn_metadata) {
   int64_t head_size_v = enable_mla_ ? v_head_dim_ : head_size_;
   query = query.view({-1, 1, num_heads_, head_size_});
   output = output.view({-1, 1, num_heads_, head_size_v});
-  std::optional<torch::Tensor> output_lse = std::nullopt;
+  c10::optional<torch::Tensor> output_lse = c10::nullopt;
 
   int64_t block_aligned_max_seq_len =
       attn_metadata.block_table.size(-1) * k_cache.size(2);
@@ -169,11 +169,11 @@ void AttentionImpl::decoder_forward(torch::Tensor& query,
                                   attn_metadata.kv_seq_lens,
                                   v_cache,
                                   output_lse,
-                                  /*q_quant_scale=*/std::nullopt,
-                                  /*k_quant_scale=*/std::nullopt,
-                                  /*v_quant_scale=*/std::nullopt,
-                                  /*out_quant_scale=*/std::nullopt,
-                                  /*alibi_slope=*/std::nullopt,
+                                  /*q_quant_scale=*/c10::nullopt,
+                                  /*k_quant_scale=*/c10::nullopt,
+                                  /*v_quant_scale=*/c10::nullopt,
+                                  /*out_quant_scale=*/c10::nullopt,
+                                  /*alibi_slope=*/c10::nullopt,
                                   attn_metadata.attn_mask,
                                   attn_metadata.compute_dtype,
                                   block_aligned_max_seq_len,

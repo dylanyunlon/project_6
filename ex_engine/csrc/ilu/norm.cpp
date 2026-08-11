@@ -22,10 +22,10 @@ namespace xllm::kernel::ilu {
 
 void residual_layer_norm(torch::Tensor& input,
                          torch::Tensor& output,
-                         std::optional<torch::Tensor>& residual,
+                         c10::optional<torch::Tensor>& residual,
                          torch::Tensor& weight,
-                         std::optional<torch::Tensor>& bias,
-                         std::optional<torch::Tensor>& residual_out,
+                         c10::optional<torch::Tensor>& bias,
+                         c10::optional<torch::Tensor>& residual_out,
                          double eps) {
   auto residual_ = residual.value_or(torch::zeros_like(input));
   torch::Tensor residual_out_ = residual_out.value_or(torch::zeros_like(input));
@@ -44,7 +44,7 @@ void rms_norm(torch::Tensor& output,
               torch::Tensor& input,
               torch::Tensor& weight,
               double eps) {
-  std::optional<torch::Tensor> fused_bias = std::nullopt;
+  c10::optional<torch::Tensor> fused_bias = c10::nullopt;
   infer::rms_norm(input, weight, output, fused_bias, eps);
 }
 

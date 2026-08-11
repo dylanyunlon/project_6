@@ -43,7 +43,7 @@ bool gemv_conditions(const torch::Tensor& input,
 
 torch::Tensor matmul(torch::Tensor a,
                      torch::Tensor b,
-                     std::optional<torch::Tensor> bias) {
+                     c10::optional<torch::Tensor> bias) {
   int64_t act_type = -1;
   bool persistent = false;
   std::vector<int64_t> output_shape = a.sizes().vec();

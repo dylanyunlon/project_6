@@ -44,7 +44,7 @@ class AttentionImpl : public torch::nn::Module {
                 bool enable_lighting_indexer,
                 bool enable_mla);
 
-  std::tuple<torch::Tensor, std::optional<torch::Tensor>> forward(
+  std::tuple<torch::Tensor, c10::optional<torch::Tensor>> forward(
       const AttentionMetadata& attn_metadata,
       torch::Tensor& query,
       torch::Tensor& key,
@@ -56,13 +56,13 @@ class AttentionImpl : public torch::nn::Module {
                        torch::Tensor& value,
                        torch::Tensor& output,
                        const torch::Tensor& k_cache,
-                       const std::optional<torch::Tensor>& v_cache,
+                       const c10::optional<torch::Tensor>& v_cache,
                        const AttentionMetadata& attn_metadata);
 
   void decoder_forward(torch::Tensor& query,
                        torch::Tensor& output,
                        const torch::Tensor& k_cache,
-                       const std::optional<torch::Tensor>& v_cache,
+                       const c10::optional<torch::Tensor>& v_cache,
                        const AttentionMetadata& attn_metadata);
 
  private:
