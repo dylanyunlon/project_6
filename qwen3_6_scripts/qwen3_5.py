@@ -85,25 +85,26 @@ from vllm.model_executor.models.qwen2_vl import (Qwen2VisionAttention,
 _orig_qwen2vl_fwd = Qwen2VisionAttention.forward
 
 def _safe_qwen2vl_fwd(self, x, cu_seqlens, rotary_pos_emb=None):
-    """Qwen2 Vision attention with PyTorch SDPA instead of xops."""
-    from einops import rearrange
-    from vllm.model_executor.models.qwen2_vl import (
-        apply_rotary_pos_emb_vision, dist_utils)
+    """Qwen2 Vision attention with PyTorch SDPA instead of xops.
+    Replaces xops.memory_efficient_attention_forward which calls
+    _C_flashattention.varlen_fwd (incompatible arg count on BI-V100).
+    """
+    from vllm.model_executor.models.qwen2_vl import apply_rotary_pos_emb_vision
+    from vllm.distributed import utils as dist_utils
     x, _ = self.qkv(x)
     new_shape = x.size()[:-1] + (
         self.num_attention_heads_per_partition,
         3 * self.hidden_size_per_attention_head)
     x = x.view(*new_shape)
     q, k, v = dist_utils.split_tensor_along_last_dim(x, 3)
-    batch_size = q.shape[1]
-    q, k, v = [rearrange(t, "s b ... -> b s ...").contiguous()
-                for t in (q, k, v)]
+    # q,k,v shape: (seq, batch, heads, dim) → (batch, seq, heads, dim)
+    q, k, v = [t.transpose(0, 1).contiguous() for t in (q, k, v)]
     if rotary_pos_emb is not None:
         q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
         k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
-    # Use PyTorch SDPA (same as the is_cpu() path in base qwen2_vl.py)
     seq_length = q.size(1)
-    q, k, v = [rearrange(t, "b s h d -> b h s d") for t in [q, k, v]]
+    # (batch, seq, heads, dim) → (batch, heads, seq, dim)
+    q, k, v = [t.transpose(1, 2) for t in (q, k, v)]
     attention_mask = torch.zeros([1, seq_length, seq_length],
                                  device=q.device, dtype=torch.bool)
     for i in range(1, len(cu_seqlens)):
@@ -111,7 +112,9 @@ def _safe_qwen2vl_fwd(self, x, cu_seqlens, rotary_pos_emb=None):
                        cu_seqlens[i-1]:cu_seqlens[i]] = True
     output = torch.nn.functional.scaled_dot_product_attention(
         q, k, v, attention_mask, dropout_p=0.0)
-    context_layer = rearrange(output, "b h s d -> s b (h d)").contiguous()
+    # (batch, heads, seq, dim) → (seq, batch, heads*dim)
+    output = output.transpose(1, 2).transpose(0, 1).contiguous()
+    context_layer = output.view(output.size(0), output.size(1), -1)
     out, _ = self.proj(context_layer)
     return out
 
