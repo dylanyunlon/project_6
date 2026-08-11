@@ -8,7 +8,7 @@ command:
     - --served-model-name
     - llm
     - --max-model-len
-    - '80000'
+    - '256000'
     - --gpu-memory-utilization
     - '0.95'
     - --trust-remote-code
@@ -29,7 +29,7 @@ command:
     - qwen3
     - --enable-prefix-caching
     - --max-seq-len-to-capture
-    - '8192'
+    - '32768'
     - --dtype
     - half
 env:
