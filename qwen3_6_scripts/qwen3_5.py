@@ -722,15 +722,16 @@ def _torch_chunk_gated_delta_rule(
         diagonal=0)
 
     g = g.cumsum(dim=-1)
-    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+    g_diff = (g.unsqueeze(-1) - g.unsqueeze(-2)).tril().clamp(-20.0, 20.0)
+    decay_mask = g_diff.exp().float().tril()
     attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask_upper, 0)
     for i in range(1, chunk_size):
         row = attn[..., i, :i].clone()
         sub = attn[..., :i, :i].clone()
-        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+        attn[..., i, :i] = (row + (row.unsqueeze(-1) * sub).sum(-2)).clamp(-65504.0, 65504.0)
     attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
     value = attn @ v_beta
-    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+    k_cumdecay = attn @ (k_beta * g.clamp(-20.0, 20.0).exp().unsqueeze(-1))
 
     last_state = (
         torch.zeros(batch, num_heads, k_dim, v_dim, dtype=value.dtype, device=value.device)
@@ -747,13 +748,16 @@ def _torch_chunk_gated_delta_rule(
         attn_i = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask_upper2, 0)
         v_prime = k_cumdecay[:, :, i] @ last_state
         v_new = v_i - v_prime
-        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_state
+        attn_inter = (q_i * g[:, :, i, :, None].clamp(-20.0, 20.0).exp()) @ last_state
         core_out[:, :, i] = attn_inter + attn_i @ v_new
+        g_last = g[:, :, i, -1, None, None].clamp(-20.0, 20.0)
+        g_diff_state = (g[:, :, i, -1, None] - g[:, :, i]).clamp(-20.0, 20.0)
         last_state = (
-            last_state * g[:, :, i, -1, None, None].exp()
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None])
+            last_state * g_last.exp()
+            + (k_i * g_diff_state.exp()[..., None])
             .transpose(-1, -2) @ v_new
         )
+        last_state = last_state.clamp(-65504.0, 65504.0)
 
     if not output_final_state:
         last_state = None

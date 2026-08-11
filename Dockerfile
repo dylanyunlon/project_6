@@ -24,26 +24,27 @@ RUN python3 /workspace/ex_engine/precompile_moe_kernels.py 2>&1 | tee -a /worksp
     echo "[Dockerfile] moe_v055 precompile exit code: $?"
 
 # Step 4: Stage vendor_overrides into qwen3_6_scripts/ so patch_ops.sh finds them
-RUN mkdir -p /workspace/qwen3_6_scripts/vendor_overrides/vllm/core/block && \
-    mkdir -p /workspace/qwen3_6_scripts/vendor_overrides/vllm/model_executor/layers && \
+RUN mkdir -p /workspace/qwen3_6_scripts/vendor_overrides/vllm/core/block \
+             /workspace/qwen3_6_scripts/vendor_overrides/vllm/model_executor/layers && \
     cp /workspace/vllm_overrides/core/evictor_v2.py \
-       /workspace/qwen3_6_scripts/vendor_overrides/vllm/core/evictor_v2.py && \
+       /workspace/qwen3_6_scripts/vendor_overrides/vllm/core/evictor_v2.py 2>/dev/null || true && \
     cp /workspace/vllm_overrides/core/block/cpu_kv_content_cache.py \
-       /workspace/qwen3_6_scripts/vendor_overrides/vllm/core/block/cpu_kv_content_cache.py && \
+       /workspace/qwen3_6_scripts/vendor_overrides/vllm/core/block/cpu_kv_content_cache.py 2>/dev/null || true && \
     cp /workspace/vllm_overrides/core/block/cpu_gpu_block_allocator.py \
-       /workspace/qwen3_6_scripts/vendor_overrides/vllm/core/block/cpu_gpu_block_allocator.py && \
+       /workspace/qwen3_6_scripts/vendor_overrides/vllm/core/block/cpu_gpu_block_allocator.py 2>/dev/null || true && \
     cp /workspace/vllm_overrides/core/block/prefix_caching_block.py \
-       /workspace/qwen3_6_scripts/vendor_overrides/vllm/core/block/prefix_caching_block.py && \
+       /workspace/qwen3_6_scripts/vendor_overrides/vllm/core/block/prefix_caching_block.py 2>/dev/null || true && \
     cp /workspace/vllm_overrides/core/block/block_table.py \
-       /workspace/qwen3_6_scripts/vendor_overrides/vllm/core/block/block_table.py && \
+       /workspace/qwen3_6_scripts/vendor_overrides/vllm/core/block/block_table.py 2>/dev/null || true && \
     cp /workspace/vllm_overrides/core/block_manager_v2.py \
-       /workspace/qwen3_6_scripts/vendor_overrides/vllm/core/block_manager_v2.py && \
+       /workspace/qwen3_6_scripts/vendor_overrides/vllm/core/block_manager_v2.py 2>/dev/null || true && \
     cp /workspace/vllm_overrides/sampling_params.py \
-       /workspace/qwen3_6_scripts/vendor_overrides/vllm/sampling_params.py && \
+       /workspace/qwen3_6_scripts/vendor_overrides/vllm/sampling_params.py 2>/dev/null || true && \
     cp /workspace/vllm_overrides/model_executor/sampling_metadata.py \
-       /workspace/qwen3_6_scripts/vendor_overrides/vllm/model_executor/sampling_metadata.py && \
+       /workspace/qwen3_6_scripts/vendor_overrides/vllm/model_executor/sampling_metadata.py 2>/dev/null || true && \
     cp /workspace/vllm_overrides/model_executor/layers/sampler.py \
-       /workspace/qwen3_6_scripts/vendor_overrides/vllm/model_executor/layers/sampler.py
+       /workspace/qwen3_6_scripts/vendor_overrides/vllm/model_executor/layers/sampler.py 2>/dev/null || true ; \
+    echo "[Dockerfile] vendor_overrides staged"
 
 # Step 5: Deploy patches (serving + engine fixes + prebuilt .so)
 RUN chmod +x /workspace/qwen3_6_scripts/patch_ops.sh && \
