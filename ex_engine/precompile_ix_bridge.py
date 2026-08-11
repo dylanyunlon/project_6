@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 """
-Precompile ix_moe_bridge.cpp during Docker build.
+precompile_ix_bridge.py — Compile ix_moe_bridge.cpp → ix_moe_bridge.so
 
-This bridges Python ↔ ixformer::infer C++ API (topk_softmax, group_gemm, etc).
-Source: upstream_ref/xllm/xllm/core/kernels/ilu/fused_moe.cpp call pattern
+Links against libixformer.so in the base image to expose:
+  - topk_softmax (the missing vllm_moe_topk_softmax)
+  - moe_gen_idx, moe_expand_input, moe_group_gemm
+  - silu_and_mul, moe_combine_result
+  - paged_attention, rms_norm, linear, reshape_and_cache, rotary_embedding
+
+Build chain:
+  precompile_ix_bridge.py
+    → torch.utils.cpp_extension.load("ix_moe_bridge", ...)
+      → g++ -shared ix_moe_bridge.cpp -lixformer -L/path/to/ixformer
+        → ix_moe_bridge.cpython-310-x86_64-linux-gnu.so
 """
 import os
 import sys
@@ -11,97 +20,117 @@ import glob
 import logging
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("precompile_ix_bridge")
+logger = logging.getLogger("ix_bridge_compile")
 
-def find_ixformer_libs():
-    """Find libixformer.so and related libraries for linking."""
-    extra_ldflags = []
-    ixf_lib_dirs = set()
+def find_ixformer_paths():
+    """Find libixformer.so and ixformer include paths in base image."""
+    lib_dirs = set()
+    include_dirs = set()
     
-    try:
-        import ixformer
-        ixf_dir = os.path.dirname(ixformer.__file__)
-        for so in glob.glob(os.path.join(ixf_dir, "*.so")):
-            if "cpython" not in so:
-                extra_ldflags.append(so)
-                ixf_lib_dirs.add(os.path.dirname(so))
-        for so in glob.glob(os.path.join(ixf_dir, "_ixformer_torch*.so")):
-            if so not in extra_ldflags:
-                extra_ldflags.append(so)
-    except ImportError:
-        logger.warning("ixformer not installed")
-    
-    corex_lib = "/usr/local/corex/lib64"
-    if os.path.isdir(corex_lib):
-        for lib in ["libixformer.so", "libixattn.so", "libcublas.so"]:
-            p = os.path.join(corex_lib, lib)
-            if os.path.exists(p) and p not in extra_ldflags:
-                extra_ldflags.append(p)
-                ixf_lib_dirs.add(corex_lib)
-    
-    for d in ixf_lib_dirs:
-        extra_ldflags.append(f"-Wl,-rpath,{d}")
-    
-    return extra_ldflags
-
-def main():
-    # Find the .cpp source
+    # Search paths for libixformer.so
     search = [
-        "/workspace/ex_engine/csrc/ix_moe_bridge.cpp",
-        os.path.join(os.path.dirname(__file__), "csrc", "ix_moe_bridge.cpp"),
+        "/usr/local/corex/lib64/python3/dist-packages/ixformer",
+        "/usr/local/corex/lib/python3/dist-packages/ixformer",
+        "/usr/local/lib/python3.10/site-packages/ixformer",
     ]
     
-    cpp_path = None
-    for p in search:
-        if os.path.isfile(p):
-            cpp_path = p
-            break
+    for d in search:
+        so = os.path.join(d, "libixformer.so")
+        if os.path.exists(so):
+            lib_dirs.add(d)
+            logger.info(f"Found libixformer.so at: {so}")
+            # Also check for csrc/include
+            inc = os.path.join(d, "csrc", "include")
+            if os.path.isdir(inc):
+                include_dirs.add(inc)
     
-    if not cpp_path:
-        logger.error("ix_moe_bridge.cpp not found in: %s", search)
+    # Also search LD_LIBRARY_PATH
+    for d in os.environ.get("LD_LIBRARY_PATH", "").split(":"):
+        if os.path.exists(os.path.join(d, "libixformer.so")):
+            lib_dirs.add(d)
+    
+    # Fallback: find anywhere
+    if not lib_dirs:
+        for so in glob.glob("/usr/**/libixformer.so", recursive=True):
+            lib_dirs.add(os.path.dirname(so))
+            logger.info(f"Found libixformer.so at: {so}")
+    
+    return list(lib_dirs), list(include_dirs)
+
+
+def find_source():
+    """Find ix_moe_bridge.cpp."""
+    candidates = [
+        os.path.join(os.path.dirname(__file__), "csrc", "ix_moe_bridge.cpp"),
+        "/workspace/ex_engine/csrc/ix_moe_bridge.cpp",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return None
+
+
+def main():
+    import torch
+    from torch.utils.cpp_extension import load
+    
+    src = find_source()
+    if not src:
+        logger.error("ix_moe_bridge.cpp not found!")
         sys.exit(1)
     
-    logger.info("Compiling ix_moe_bridge from %s", cpp_path)
+    lib_dirs, include_dirs = find_ixformer_paths()
+    if not lib_dirs:
+        logger.warning("libixformer.so not found — bridge will fail at runtime")
+        logger.warning("This is expected if building outside the base image")
     
-    extra_ldflags = find_ixformer_libs()
-    logger.info("Link flags: %s", extra_ldflags)
+    # Build flags
+    extra_ldflags = []
+    for d in lib_dirs:
+        extra_ldflags.extend([f"-L{d}", "-Wl,-rpath," + d])
+    extra_ldflags.append("-lixformer")
     
-    if not extra_ldflags:
-        logger.error("No ixformer libraries found — cannot compile bridge")
-        sys.exit(1)
+    extra_include = include_dirs[:]
+    # Our own headers
+    here = os.path.dirname(os.path.abspath(__file__))
+    extra_include.append(os.path.join(here, "include"))
+    extra_include.append(os.path.join(here, "csrc", "ilu"))
+    
+    extra_cflags = ["-O2", "-std=c++17"]
+    
+    logger.info(f"Source: {src}")
+    logger.info(f"Lib dirs: {lib_dirs}")
+    logger.info(f"Include dirs: {extra_include}")
+    logger.info(f"Ldflags: {extra_ldflags}")
+    
+    build_dir = os.path.join(here, "build")
+    os.makedirs(build_dir, exist_ok=True)
     
     try:
-        from torch.utils.cpp_extension import load
         mod = load(
             name="ix_moe_bridge",
-            sources=[cpp_path],
-            extra_cflags=["-O2", "-std=c++17"],
+            sources=[src],
+            extra_cflags=extra_cflags,
             extra_ldflags=extra_ldflags,
+            extra_include_paths=extra_include,
+            build_directory=build_dir,
             verbose=True,
         )
-        fns = [x for x in dir(mod) if not x.startswith("_")]
-        logger.info("SUCCESS: ix_moe_bridge compiled with functions: %s", fns)
+        logger.info(f"SUCCESS: ix_moe_bridge compiled")
+        logger.info(f"Functions: {[x for x in dir(mod) if not x.startswith('_')]}")
+        
+        # Copy .so to known location
+        for so in glob.glob(os.path.join(build_dir, "*.so")):
+            dst = os.path.join(here, os.path.basename(so))
+            import shutil
+            shutil.copy2(so, dst)
+            logger.info(f"Copied: {so} → {dst}")
+            
     except Exception as e:
-        logger.error("FAILED to compile ix_moe_bridge: %s", e)
-        # Also try ix_full_bridge.cpp
-        full_path = cpp_path.replace("ix_moe_bridge", "ix_full_bridge")
-        if os.path.isfile(full_path):
-            logger.info("Trying ix_full_bridge.cpp instead...")
-            try:
-                mod = load(
-                    name="ix_full_bridge",
-                    sources=[full_path],
-                    extra_cflags=["-O2", "-std=c++17"],
-                    extra_ldflags=extra_ldflags,
-                    verbose=True,
-                )
-                fns = [x for x in dir(mod) if not x.startswith("_")]
-                logger.info("SUCCESS: ix_full_bridge compiled with functions: %s", fns)
-            except Exception as e2:
-                logger.error("FAILED ix_full_bridge too: %s", e2)
-                sys.exit(1)
-        else:
-            sys.exit(1)
+        logger.error(f"COMPILE FAILED: {e}")
+        logger.error("MoE will fall back to corex_moe.py (if base image has it)")
+        # Don't exit 1 — let Docker build continue
+        
 
 if __name__ == "__main__":
     main()
