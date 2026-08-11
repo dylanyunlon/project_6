@@ -92,15 +92,18 @@ class CoreXGDN:
             # Prefill: apply conv1d directly on sequence
             k_conv = k.transpose(0, 1).unsqueeze(0)  # (1, nk, N, kd)
             # Reshape for grouped conv: (1, nk, N, kd) -> (nk, 1, N) per head, apply conv
+            # Depthwise conv1d per head, matching qwen3_5.py _causal_conv1d_fwd pattern
+            # conv1d_weight: (nk, 1, conv_kernel_size)
             k_out = []
             for h in range(nk):
                 kh = k_conv[0, h]  # (N, kd)
-                # Pad and conv each dim independently? No — conv is on seq dim
                 kh_t = kh.t()  # (kd, N)
-                kh_pad = F.pad(kh_t, (self.conv_kernel_size - 1, 0))  # causal pad
+                kh_pad = F.pad(kh_t, (self.conv_kernel_size - 1, 0))  # causal pad: (kd, N+pad)
+                # Depthwise: each of kd channels gets its own conv with same weight
                 w = conv1d_weight[h]  # (1, conv_kernel_size)
-                kh_conv = F.conv1d(kh_pad.unsqueeze(0), w.unsqueeze(0).float(),
-                                    groups=1).squeeze(0)[:, :num_tokens]
+                w_expand = w.expand(kd, -1).unsqueeze(1).float()  # (kd, 1, conv_kernel_size)
+                kh_conv = F.conv1d(kh_pad.unsqueeze(0), w_expand,
+                                    groups=kd).squeeze(0)[:, :num_tokens]  # (kd, N)
                 k_out.append(kh_conv.t())  # (N, kd)
             k = torch.stack(k_out, dim=1).to(hidden_states.dtype)  # (N, nk, kd)
             # Update conv_state for decode
