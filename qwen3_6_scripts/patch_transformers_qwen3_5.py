@@ -2,54 +2,23 @@
 Patches transformers 4.55.3 to register qwen3_5 and qwen3_5_moe model types.
 
 Deploy steps on the remote machine:
-  1. cp -r modified_scripts/qwen3_5     /usr/local/lib/python3.10/site-packages/transformers/models/qwen3_5
-  2. cp -r modified_scripts/qwen3_5_moe /usr/local/lib/python3.10/site-packages/transformers/models/qwen3_5_moe
+  1. patch_ops.sh locates transformers with importlib.util.find_spec.
+  2. cp -r modified_scripts/qwen3_5* into the detected transformers/models.
   3. python3 modified_scripts/patch_transformers_qwen3_5.py
-
-Target: pip-installed transformers at /usr/local/lib/python3.10/site-packages/transformers/
-(Not the corex pre-installed path at /usr/local/corex/lib64/python3/dist-packages/)
 """
 
 import sys
 
-TRANSFORMERS_ROOT = None
-for _p in ["/usr/local/lib/python3.10/site-packages/transformers",
-           "/usr/local/corex/lib/python3/dist-packages/transformers",
-           "/usr/local/corex/lib64/python3/dist-packages/transformers"]:
-    import os
-    if os.path.isdir(_p):
-        TRANSFORMERS_ROOT = _p
-        break
-if TRANSFORMERS_ROOT is None:
-    TRANSFORMERS_ROOT = "/usr/local/lib/python3.10/site-packages/transformers"
-AUTO_CONFIG = f"{TRANSFORMERS_ROOT}/models/auto/configuration_auto.py"
-MODELS_INIT = f"{TRANSFORMERS_ROOT}/models/__init__.py"
+from patch_utils import package_root, replace_once, replace_one_of
 
-
-def patch_file(path, replacements):
-    with open(path, "r") as f:
-        content = f.read()
-
-    patched = False
-    for old, new in replacements:
-        if new in content:
-            print(f"  [skip] already patched: {repr(new[:60])}")
-            continue
-        if old not in content:
-            print(f"  [warn] anchor not found: {repr(old[:60])}")
-            continue
-        content = content.replace(old, new, 1)
-        patched = True
-        print(f"  [ok]   inserted after: {repr(old[:60])}")
-
-    if patched:
-        with open(path, "w") as f:
-            f.write(content)
+TRANSFORMERS_ROOT = package_root("transformers")
+AUTO_CONFIG = TRANSFORMERS_ROOT / "models" / "auto" / "configuration_auto.py"
+MODELS_INIT = TRANSFORMERS_ROOT / "models" / "__init__.py"
 
 
 def main():
     print(f"=== Patching {AUTO_CONFIG} ===")
-    patch_file(AUTO_CONFIG, [
+    replace_one_of(AUTO_CONFIG, [
         # CONFIG_MAPPING_NAMES: insert qwen3_5 + qwen3_5_moe right after qwen3
         (
             '("qwen3", "Qwen3Config"),',
@@ -59,6 +28,8 @@ def main():
             '("qwen3", "Qwen3Config")\n',
             '("qwen3", "Qwen3Config"),\n        ("qwen3_5", "Qwen3_5Config"),\n        ("qwen3_5_moe", "Qwen3_5MoeConfig"),\n',
         ),
+    ], required=True, already_contains='("qwen3_5_moe", "Qwen3_5MoeConfig")')
+    replace_one_of(AUTO_CONFIG, [
         # MODEL_NAMES_MAPPING (model_type -> human readable name)
         (
             '("qwen3", "Qwen3"),',
@@ -68,15 +39,15 @@ def main():
             '("qwen3", "Qwen3")\n',
             '("qwen3", "Qwen3"),\n        ("qwen3_5", "Qwen3_5"),\n        ("qwen3_5_moe", "Qwen3_5_MoE"),\n',
         ),
-    ])
+    ], required=True, already_contains='("qwen3_5_moe", "Qwen3_5_MoE")')
 
     print(f"\n=== Patching {MODELS_INIT} ===")
-    patch_file(MODELS_INIT, [
-        (
-            "from .qwen3 import *\n",
-            "from .qwen3 import *\n    from .qwen3_5 import *\n    from .qwen3_5_moe import *\n",
-        ),
-    ])
+    replace_once(
+        MODELS_INIT,
+        "from .qwen3 import *\n",
+        "from .qwen3 import *\n    from .qwen3_5 import *\n    from .qwen3_5_moe import *\n",
+        required=True,
+        already_contains="from .qwen3_5_moe import *")
 
     # Verification
     print("\n=== Verification ===")
@@ -88,28 +59,31 @@ def main():
             mod = importlib.util.module_from_spec(spec)
             mod.__package__ = ".".join(module_name.split(".")[:-1])
             pkg = sys.modules.setdefault("transformers", types.ModuleType("transformers"))
-            pkg.__path__ = [TRANSFORMERS_ROOT]
+            pkg.__path__ = [str(TRANSFORMERS_ROOT)]
             cu = sys.modules.setdefault(
                 "transformers.configuration_utils", types.ModuleType("transformers.configuration_utils"))
             class _PC:
-                def __init__(self, **kwargs): pass
+                def __init__(self, **kwargs):
+                    return None
             cu.PretrainedConfig = _PC
             for sub in ("transformers.models", f"transformers.models.{module_name.split('.')[-2]}"):
                 m = sys.modules.setdefault(sub, types.ModuleType(sub))
-                m.__path__ = [TRANSFORMERS_ROOT]
+                m.__path__ = [str(TRANSFORMERS_ROOT)]
             spec.loader.exec_module(mod)
             return mod
 
         mod27 = _load_config_mod(
             "transformers.models.qwen3_5.configuration_qwen3_5",
-            f"{TRANSFORMERS_ROOT}/models/qwen3_5/configuration_qwen3_5.py",
+            str(TRANSFORMERS_ROOT / "models" / "qwen3_5" /
+                "configuration_qwen3_5.py"),
         )
         cfg = mod27.Qwen3_5Config()
         print(f"  Qwen3_5Config() smoke-test OK     (model_type={cfg.model_type})")
 
         mod35 = _load_config_mod(
             "transformers.models.qwen3_5_moe.configuration_qwen3_5_moe",
-            f"{TRANSFORMERS_ROOT}/models/qwen3_5_moe/configuration_qwen3_5_moe.py",
+            str(TRANSFORMERS_ROOT / "models" / "qwen3_5_moe" /
+                "configuration_qwen3_5_moe.py"),
         )
         moe_cfg = mod35.Qwen3_5MoeConfig()
         print(f"  Qwen3_5MoeConfig() smoke-test OK  (model_type={moe_cfg.model_type})")
@@ -117,7 +91,7 @@ def main():
         print(f"    num_experts={t.num_experts}, top_k={t.num_experts_per_tok}, "
               f"shared={t.shared_expert_intermediate_size}, layers={t.num_hidden_layers}")
     except Exception as e:
-        print(f"  [warn] smoke-test failed (may be fine at runtime): {e}")
+        print(f"  [optional] smoke-test failed (may be fine at runtime): {e}")
 
     print("\nDone.")
 

@@ -6,12 +6,364 @@ import os
 import regex as re
 import signal
 import socket
+import sys
 import tempfile
+import time
 from argparse import Namespace
 from contextlib import asynccontextmanager
 from functools import partial
 from http import HTTPStatus
 from typing import AsyncIterator, Set
+
+
+def _bi100_field(value, name):
+    if isinstance(value, dict):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def _bi100_scalar(value):
+    return getattr(value, "value", value)
+
+
+def _bi100_tool_choice_kind(value):
+    value = _bi100_scalar(value)
+    if value is None:
+        return "unset"
+    if isinstance(value, str):
+        return value if value in ("none", "auto", "required") else "other"
+    function = _bi100_field(value, "function")
+    if function is not None and isinstance(
+            _bi100_field(function, "name"), str):
+        return "named"
+    return "other"
+
+
+def _bi100_image_source_kind(value):
+    if not isinstance(value, str):
+        return "other"
+    prefix = value[:8].lower()
+    if prefix.startswith("data:"):
+        return "data"
+    if prefix.startswith(("http://", "https://")):
+        return "remote"
+    return "other"
+
+
+def _bi100_chat_4xx_reason(message):
+    if message == "messages must contain at least one message":
+        return "empty_messages"
+    if (isinstance(message, str)
+            and message.startswith("top_p must be in (0, 1], got ")):
+        return "invalid_top_p"
+    if (isinstance(message, str)
+            and message.startswith("max_tokens must be at least 1, got ")):
+        return "invalid_max_tokens"
+    if (isinstance(message, str)
+            and message.startswith("This model's maximum context length is ")
+            and "tokens. However, you requested " in message):
+        return "context_length_exceeded"
+    if (isinstance(message, str) and message.startswith("n=")
+            and " exceeds max_num_seqs=" in message):
+        return "n_exceeds_max_num_seqs"
+    if message == 'tool_choice = "required" is not supported!':
+        return "unsupported_tool_choice_required"
+    if (isinstance(message, str)
+            and message.startswith('"auto" tool choice requires ')):
+        return "tool_parser_unavailable"
+    if message == "Tool call arguments are not valid JSON.":
+        return "invalid_tool_arguments_json"
+    if (isinstance(message, str)
+            and message.startswith("Tool call arguments must ")):
+        return "invalid_tool_arguments_type"
+    if (isinstance(message, str)
+            and (
+                (message.startswith("At most ")
+                 and " image(s) may be provided in one request." in message)
+                or (message.startswith("You set image=")
+                    and "items in the same prompt." in message))):
+        return "image_count_limit"
+    if message == "Unknown model type: qwen3_5_moe":
+        return "image_model_type_unsupported"
+    return "unclassified_chat_error"
+
+
+def _bi100_chat_request_shape(request):
+    messages = _bi100_field(request, "messages")
+    if not isinstance(messages, (list, tuple)):
+        messages = ()
+    tools = _bi100_field(request, "tools")
+    if not isinstance(tools, (list, tuple)):
+        tools = ()
+
+    system_count = 0
+    system_part_message_count = 0
+    system_text_part_count = 0
+    system_other_part_count = 0
+    tool_message_count = 0
+    assistant_tool_message_count = 0
+    image_count = 0
+    image_data_count = 0
+    image_remote_count = 0
+    image_other_count = 0
+    for message in messages:
+        role = _bi100_scalar(_bi100_field(message, "role"))
+        if role == "system":
+            system_count += 1
+        elif role == "tool":
+            tool_message_count += 1
+        elif (role == "assistant"
+              and _bi100_field(message, "tool_calls")):
+            assistant_tool_message_count += 1
+        content = _bi100_field(message, "content")
+        if not isinstance(content, (list, tuple)):
+            continue
+        if role == "system":
+            system_part_message_count += 1
+        for part in content:
+            part_type = _bi100_scalar(_bi100_field(part, "type"))
+            if role == "system":
+                if part_type == "text":
+                    system_text_part_count += 1
+                else:
+                    system_other_part_count += 1
+            if part_type in ("image", "image_url"):
+                image_count += 1
+                image_url = _bi100_field(part, "image_url")
+                source_kind = _bi100_image_source_kind(
+                    _bi100_field(image_url, "url"))
+                if source_kind == "data":
+                    image_data_count += 1
+                elif source_kind == "remote":
+                    image_remote_count += 1
+                else:
+                    image_other_count += 1
+
+    strict_false_count = 0
+    strict_true_count = 0
+    for tool in tools:
+        function = _bi100_field(tool, "function")
+        strict = _bi100_field(function, "strict")
+        if strict is False:
+            strict_false_count += 1
+        elif strict is True:
+            strict_true_count += 1
+
+    n = _bi100_field(request, "n")
+    return {
+        "message_count": len(messages),
+        "system_count": system_count,
+        "system_part_message_count": system_part_message_count,
+        "system_text_part_count": system_text_part_count,
+        "system_other_part_count": system_other_part_count,
+        "tool_count": len(tools),
+        "tool_message_count": tool_message_count,
+        "assistant_tool_message_count": assistant_tool_message_count,
+        "strict_false_count": strict_false_count,
+        "strict_true_count": strict_true_count,
+        "tool_choice_kind": _bi100_tool_choice_kind(
+            _bi100_field(request, "tool_choice")),
+        "image_count": image_count,
+        "image_data_count": image_data_count,
+        "image_remote_count": image_remote_count,
+        "image_other_count": image_other_count,
+        "has_image": image_count > 0,
+        "stream": bool(_bi100_field(request, "stream")),
+        "n": n if isinstance(n, int) else None,
+    }
+
+
+def _bi100_validation_message_reason(error, tool_choice_kind):
+    if not isinstance(error, dict):
+        return None
+
+    messages = []
+    context = error.get("ctx")
+    if isinstance(context, dict):
+        context_error = context.get("error")
+        if isinstance(context_error, ValueError):
+            messages.append(str(context_error))
+
+    message = error.get("msg")
+    if isinstance(message, str):
+        if message.startswith("Value error, "):
+            message = message.removeprefix("Value error, ")
+        messages.append(message)
+
+    for message in messages:
+        if message == "Tool call arguments are not valid JSON.":
+            return "invalid_tool_arguments_json"
+        if message in (
+                "Tool call arguments must decode to a JSON object.",
+                "Tool call arguments must be a JSON object or a "
+                "JSON-encoded object string."):
+            return "invalid_tool_arguments_type"
+        if message == (
+                "`tool_choice` must be a named tool, \"auto\", or \"none\"."):
+            if tool_choice_kind == "required":
+                return "unsupported_tool_choice_required"
+            return "request_validation_tool_choice"
+    return None
+
+
+def _bi100_validation_reason(errors, request_shape=None):
+    categories = set()
+    message_categories = set()
+    tool_choice_kind = (
+        request_shape.get("tool_choice_kind")
+        if isinstance(request_shape, dict) else None
+    )
+    validation_errors = errors if isinstance(errors, (list, tuple)) else ()
+    for error in validation_errors:
+        if not isinstance(error, dict):
+            continue
+        message_category = _bi100_validation_message_reason(
+            error, tool_choice_kind)
+        if message_category is not None:
+            message_categories.add(message_category)
+        location = error.get("loc")
+        if not isinstance(location, (list, tuple)):
+            continue
+        fields = [
+            value for value in location
+            if isinstance(value, str)
+            and value not in ("body", "query", "path")
+        ]
+        if not fields:
+            continue
+        field = fields[0]
+        descendants = set(fields[1:])
+        if field == "messages":
+            if "tool_call_id" in descendants:
+                categories.add("request_validation_message_tool_call_id")
+            elif "tool_calls" in descendants:
+                categories.add("request_validation_message_tool_calls")
+            elif "content" in descendants:
+                categories.add("request_validation_message_content")
+            elif "role" in descendants:
+                categories.add("request_validation_message_role")
+            else:
+                categories.add("request_validation_messages")
+        elif field == "tools":
+            if "strict" in descendants:
+                categories.add("request_validation_tool_strict")
+            elif "parameters" in descendants:
+                categories.add("request_validation_tool_parameters")
+            else:
+                categories.add("request_validation_tools")
+        elif field in ("tool_choice", "parallel_tool_calls"):
+            categories.add("request_validation_tool_choice")
+        elif field == "response_format":
+            categories.add("request_validation_response_format")
+        elif field in ("stream", "stream_options"):
+            categories.add("request_validation_streaming")
+        elif field in ("n", "max_tokens", "min_tokens", "stop"):
+            categories.add("request_validation_generation")
+        elif field in (
+                "temperature", "top_p", "top_k", "frequency_penalty",
+                "presence_penalty", "repetition_penalty", "seed"):
+            categories.add("request_validation_sampling")
+        elif field == "model":
+            categories.add("request_validation_model")
+        else:
+            categories.add("request_validation_other")
+
+    priority = (
+        "request_validation_tool_strict",
+        "request_validation_tool_parameters",
+        "request_validation_tool_choice",
+        "request_validation_message_tool_call_id",
+        "request_validation_message_tool_calls",
+        "request_validation_message_content",
+        "request_validation_message_role",
+        "request_validation_messages",
+        "request_validation_tools",
+        "request_validation_response_format",
+        "request_validation_streaming",
+        "request_validation_generation",
+        "request_validation_sampling",
+        "request_validation_model",
+        "request_validation_other",
+    )
+    for category in priority:
+        if category in categories:
+            return category
+    message_priority = (
+        "invalid_tool_arguments_json",
+        "invalid_tool_arguments_type",
+        "unsupported_tool_choice_required",
+        "request_validation_tool_choice",
+    )
+    for category in message_priority:
+        if category in message_categories:
+            return category
+    return "request_validation_unknown"
+
+
+def _bi100_validation_identifier(value):
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return "unknown"
+    if not value.isascii():
+        return "unknown"
+    if not all(character.isalnum() or character in "._-"
+               for character in value):
+        return "unknown"
+    return value
+
+
+def _bi100_validation_diagnostics(errors):
+    if not isinstance(errors, (list, tuple)):
+        return "unknown", "unknown"
+    try:
+        error_count = len(errors)
+    except Exception:
+        return "unknown", "unknown"
+    if error_count > 1:
+        return "multiple", "multiple"
+    if error_count == 0:
+        return "unknown", "unknown"
+
+    try:
+        error = errors[0]
+        if not isinstance(error, dict):
+            return "unknown", "unknown"
+        location = error.get("loc")
+        validation_type = _bi100_validation_identifier(error.get("type"))
+        if not isinstance(location, (list, tuple)):
+            return "unknown", validation_type
+        if not location:
+            return "root", validation_type
+        index = 0
+        if location[0] in ("body", "query", "path", "header", "cookie"):
+            index = 1
+        if index >= len(location):
+            return "root", validation_type
+        field = location[index]
+        if field in ("__root__", "root"):
+            return "root", validation_type
+        return _bi100_validation_identifier(field), validation_type
+    except Exception:
+        return "unknown", "unknown"
+
+
+def _bi100_safe_validation_errors(exc):
+    try:
+        errors = exc.errors()
+        if not isinstance(errors, (list, tuple)):
+            return ()
+        return tuple(errors)
+    except Exception:
+        return ()
+
+
+def _bi100_startup_trace(message: str) -> None:
+    if os.getenv("BI100_EXECUTOR_STARTUP_DEBUG") == "1":
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        print(f"[BI100 STARTUP] {stamp} pid={os.getpid()} {message}",
+              file=sys.stderr, flush=True)
+
+
+_bi100_startup_trace("api_server stdlib imports complete; loading runtime dependencies")
 
 import uvloop
 from fastapi import APIRouter, FastAPI, Request
@@ -70,6 +422,124 @@ logger = init_logger('vllm.entrypoints.openai.api_server')
 
 _running_tasks: Set[asyncio.Task] = set()
 
+_bi100_startup_trace("api_server runtime imports complete")
+
+
+def _bi100_log_chat_4xx(request, error) -> None:
+    code = getattr(error, "code", None)
+    if not isinstance(code, int) or not 400 <= code < 500:
+        return
+    shape = _bi100_chat_request_shape(request)
+    reason = _bi100_chat_4xx_reason(getattr(error, "message", None))
+    logger.warning(
+        "[BI100 4XX] endpoint=chat code=%d reason=%s messages=%d "
+        "systems=%d system_part_msgs=%d system_text_parts=%d "
+        "system_other_parts=%d tools=%d tool_msgs=%d "
+        "assistant_tool_msgs=%d strict_false=%d strict_true=%d choice=%s "
+        "images=%d image_data=%d image_remote=%d image_other=%d "
+        "stream=%d n=%s",
+        code,
+        reason,
+        shape["message_count"],
+        shape["system_count"],
+        shape["system_part_message_count"],
+        shape["system_text_part_count"],
+        shape["system_other_part_count"],
+        shape["tool_count"],
+        shape["tool_message_count"],
+        shape["assistant_tool_message_count"],
+        shape["strict_false_count"],
+        shape["strict_true_count"],
+        shape["tool_choice_kind"],
+        shape["image_count"],
+        shape["image_data_count"],
+        shape["image_remote_count"],
+        shape["image_other_count"],
+        int(shape["stream"]),
+        shape["n"] if shape["n"] is not None else "unset",
+    )
+
+
+def _bi100_log_request_validation_4xx(raw_request, exc) -> None:
+    validation_errors = ()
+    validation_field = "unknown"
+    validation_type = "unknown"
+    try:
+        validation_errors = _bi100_safe_validation_errors(exc)
+        validation_field, validation_type = (
+            _bi100_validation_diagnostics(validation_errors)
+        )
+        body = getattr(exc, "body", None)
+        url = getattr(raw_request, "url", None)
+        path = getattr(url, "path", "")
+        is_chat_request = (
+            isinstance(path, str)
+            and path.endswith("/v1/chat/completions")
+            and isinstance(body, dict)
+        )
+        shape = (
+            _bi100_chat_request_shape(body) if is_chat_request else None
+        )
+        reason = _bi100_validation_reason(validation_errors, shape)
+        if shape is not None:
+            if (reason == "request_validation_tools"
+                    and shape["strict_true_count"]):
+                reason = "request_validation_tool_strict"
+            logger.warning(
+                "[BI100 4XX] endpoint=request_validation code=400 reason=%s "
+                "messages=%d systems=%d system_part_msgs=%d "
+                "system_text_parts=%d system_other_parts=%d tools=%d "
+                "tool_msgs=%d assistant_tool_msgs=%d strict_false=%d "
+                "strict_true=%d choice=%s images=%d image_data=%d "
+                "image_remote=%d image_other=%d stream=%d n=%s errors=%d "
+                "validation_field=%s validation_type=%s",
+                reason,
+                shape["message_count"],
+                shape["system_count"],
+                shape["system_part_message_count"],
+                shape["system_text_part_count"],
+                shape["system_other_part_count"],
+                shape["tool_count"],
+                shape["tool_message_count"],
+                shape["assistant_tool_message_count"],
+                shape["strict_false_count"],
+                shape["strict_true_count"],
+                shape["tool_choice_kind"],
+                shape["image_count"],
+                shape["image_data_count"],
+                shape["image_remote_count"],
+                shape["image_other_count"],
+                int(shape["stream"]),
+                shape["n"] if shape["n"] is not None else "unset",
+                len(validation_errors),
+                validation_field,
+                validation_type,
+            )
+        else:
+            logger.warning(
+                "[BI100 4XX] endpoint=request_validation code=400 reason=%s "
+                "errors=%d validation_field=%s validation_type=%s",
+                reason,
+                len(validation_errors),
+                validation_field,
+                validation_type,
+            )
+        return
+    except Exception:
+        pass
+
+    try:
+        logger.warning(
+            "[BI100 4XX] endpoint=request_validation code=400 "
+            "reason=request_validation_unknown errors=%d "
+            "validation_field=%s validation_type=%s",
+            len(validation_errors),
+            validation_field,
+            validation_type,
+        )
+    except Exception:
+        pass
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -101,12 +571,15 @@ async def lifespan(app: FastAPI):
 async def build_async_engine_client(
         args: Namespace) -> AsyncIterator[EngineClient]:
 
+    _bi100_startup_trace("building AsyncEngineArgs")
     # Context manager to handle engine_client lifecycle
     # Ensures everything is shutdown and cleaned up on error/exit
     engine_args = AsyncEngineArgs.from_cli_args(args)
 
+    _bi100_startup_trace("entering engine client construction")
     async with build_async_engine_client_from_engine_args(
             engine_args, args.disable_frontend_multiprocessing) as engine:
+        _bi100_startup_trace("engine client construction completed")
         yield engine
 
 
@@ -309,52 +782,15 @@ async def show_version():
     return JSONResponse(content=ver)
 
 
-def _select_error_policy(e: Exception):
-    """CCCL tuning_adjacent_difference policy_selector pattern:
-    Select error handling strategy based on exception characteristics,
-    like policy_selector chooses kernel config based on value_type_size
-    and may_alias.  Returns (status_code, error_code, message)."""
-    err_msg = str(e)
-    err_type = type(e).__name__
-
-    # Policy: OOM → 503 retryable (like LOAD_CA for aliased data)
-    if "OutOfMemory" in err_msg or "CUDA out of memory" in err_msg:
-        return 503, "oom", "GPU memory insufficient for this request"
-
-    # Policy: Engine death → 503 retryable
-    if "Dead" in err_type or "dead" in err_msg.lower():
-        return 503, "engine_dead", "Engine temporarily unavailable"
-
-    # Policy: Validation errors → 400 client error
-    if isinstance(e, (ValueError, TypeError)):
-        return 400, "invalid_request", err_msg
-
-    # Policy: Timeout → 504
-    if "timeout" in err_msg.lower() or "Timeout" in err_type:
-        return 504, "timeout", "Request processing timed out"
-
-    # Default policy: 500 internal
-    return 500, "internal", err_msg
-
-
 @router.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest,
                                  raw_request: Request):
-    try:
-        generator = await chat(raw_request).create_chat_completion(
-            request, raw_request)
-    except Exception as e:
-        status, code, msg = _select_error_policy(e)
-        if status >= 500:
-            logger.exception("Error in chat completion (policy=%s)", code)
-        else:
-            logger.warning("Client error in chat completion: %s", code)
-        return JSONResponse(
-            content={"error": {"message": msg, "type": "server_error",
-                               "code": code}},
-            status_code=status)
+
+    generator = await chat(raw_request).create_chat_completion(
+        request, raw_request)
 
     if isinstance(generator, ErrorResponse):
+        _bi100_log_chat_4xx(request, generator)
         return JSONResponse(content=generator.model_dump(),
                             status_code=generator.code)
 
@@ -468,7 +904,8 @@ def build_app(args: Namespace) -> FastAPI:
     )
 
     @app.exception_handler(RequestValidationError)
-    async def validation_exception_handler(_, exc):
+    async def validation_exception_handler(raw_request, exc):
+        _bi100_log_request_validation_4xx(raw_request, exc)
         chat = app.state.openai_serving_chat
         err = chat.create_error_response(message=str(exc))
         return JSONResponse(err.model_dump(),
@@ -565,6 +1002,7 @@ def init_app_state(
 
 
 async def run_server(args, **uvicorn_kwargs) -> None:
+    _bi100_startup_trace("run_server entered")
     logger.info("vLLM API server version %s", VLLM_VERSION)
     logger.info("args: %s", args)
 
@@ -597,12 +1035,17 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 
     signal.signal(signal.SIGTERM, signal_handler)
 
+    _bi100_startup_trace("starting engine client context")
     async with build_async_engine_client(args) as engine_client:
+        _bi100_startup_trace("building FastAPI application")
         app = build_app(args)
 
+        _bi100_startup_trace("requesting model config from engine")
         model_config = await engine_client.get_model_config()
+        _bi100_startup_trace("model config received; initializing app state")
         init_app_state(engine_client, model_config, app.state, args)
 
+        _bi100_startup_trace("starting HTTP server")
         shutdown_task = await serve_http(
             app,
             host=args.host,
@@ -622,6 +1065,7 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 
 
 if __name__ == "__main__":
+    _bi100_startup_trace("api_server __main__ entered")
     # NOTE(simon):
     # This section should be in sync with vllm/scripts.py for CLI entrypoints.
     parser = FlexibleArgumentParser(
@@ -629,5 +1073,8 @@ if __name__ == "__main__":
     parser = make_arg_parser(parser)
     args = parser.parse_args()
     validate_parsed_serve_args(args)
+    _bi100_startup_trace(
+        f"arguments parsed model={args.model} tp={args.tensor_parallel_size} "
+        f"max_model_len={args.max_model_len}")
 
     uvloop.run(run_server(args))
