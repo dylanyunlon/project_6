@@ -26,7 +26,13 @@ RUN chmod +x /workspace/qwen3_6_scripts/patch_ops.sh && \
     bash /workspace/qwen3_6_scripts/patch_ops.sh 2>&1 | tee /workspace/patch_ops.log ; \
     echo "[Dockerfile] patch_ops exit code: $?"
 
-# Step 5: Precompile GDN kernel (needs vllm in path, so after patch_ops)
+# Step 5: Precompile ix_moe_bridge.cpp → links to ixformer::infer::topk_softmax()
+# This is the C++ pybind bridge that makes ixformer SDK callable from Python.
+# Source: upstream_ref/xllm/xllm/core/kernels/ilu/fused_moe.cpp call pattern
+RUN python3 /workspace/ex_engine/precompile_ix_bridge.py 2>&1 | tee -a /workspace/ex_build.log ; \
+    echo "[Dockerfile] ix_bridge precompile exit code: $?"
+
+# Step 6: Precompile GDN kernel (needs vllm in path, so after patch_ops)
 RUN python3 /workspace/qwen3_6_scripts/precompile_gdn.py \
     /workspace/qwen3_6_scripts/flash_qla_sm70 2>&1 | tee -a /workspace/ex_build.log ; \
     echo "[Dockerfile] gdn precompile exit code: $?"

@@ -974,9 +974,44 @@ def invoke_fused_moe_kernel(
 _moe_topk_ext = None
 _moe_topk_init_done = False
 
+_ix_bridge_mod = None
+_ix_bridge_init_done = False
+
+def _init_ix_bridge():
+    """Try to load ix_bridge which calls ixformer::infer::topk_softmax() via C++ pybind."""
+    global _ix_bridge_mod, _ix_bridge_init_done
+    _ix_bridge_init_done = True
+    try:
+        from ex_engine.python.ix_bridge import is_available, topk_softmax as _ix_ts
+        if is_available():
+            _ix_bridge_mod = True
+            logger.info("topk_softmax: ix_bridge → ixformer::infer::topk_softmax() LOADED")
+            return
+    except Exception as e:
+        logger.info("topk_softmax: ix_bridge unavailable (%s)", e)
+    # Also try direct import from workspace
+    try:
+        import sys
+        for p in ['/workspace/ex_engine/python', '/workspace/ex_engine',
+                  '/usr/local/corex/lib/python3/dist-packages/ex_engine/python']:
+            if p not in sys.path:
+                sys.path.insert(0, p)
+        from ix_bridge import is_available, topk_softmax as _ix_ts
+        if is_available():
+            _ix_bridge_mod = True
+            logger.info("topk_softmax: ix_bridge (direct) → ixformer::infer LOADED")
+            return
+    except Exception as e:
+        logger.info("topk_softmax: ix_bridge direct import failed (%s)", e)
+
+
 def _init_moe_topk():
     global _moe_topk_ext, _moe_topk_init_done
     _moe_topk_init_done = True
+    # 0. Try ix_bridge first (calls ixformer C++ SDK directly)
+    _init_ix_bridge()
+    if _ix_bridge_mod:
+        return  # ix_bridge loaded, no need for CUDA kernel
     # 1. Try import precompiled module (torch cache from Docker build)
     try:
         import moe_topk_softmax_v3 as ext
@@ -1037,6 +1072,21 @@ def topk_softmax(topk_weights: torch.Tensor, topk_ids: torch.Tensor,
     global _moe_topk_ext, _moe_topk_init_done
     if not _moe_topk_init_done:
         _init_moe_topk()
+
+    # Priority 0: ix_bridge → ixformer::infer::topk_softmax() (fastest, uses SDK)
+    if _ix_bridge_mod:
+        try:
+            from ex_engine.python.ix_bridge import topk_softmax as _ix_topk
+            gating = gating_output if isinstance(gating_output, torch.Tensor) else gating_output
+            topk_k = topk_weights.shape[1]
+            weights, ids = _ix_topk(gating, topk_k, renormalize=False)
+            topk_weights.copy_(weights.to(topk_weights.dtype))
+            topk_ids.copy_(ids.to(topk_ids.dtype))
+            # token_expert_indicies not produced by ix_bridge, fill with topk_ids
+            token_expert_indicies.copy_(ids.to(token_expert_indicies.dtype))
+            return
+        except Exception as e:
+            logger.warning("topk_softmax ix_bridge failed (%s), trying CUDA kernel", e)
 
     # Priority 1: Our CUDA kernel (fused warp-shuffle, ~5x faster than PyTorch)
     if _moe_topk_ext is not None:
