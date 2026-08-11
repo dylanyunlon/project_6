@@ -1,8 +1,7 @@
 concurrency: 1
 command:
     - python3
-    - -m
-    - vllm.entrypoints.openai.api_server
+    - /workspace/qwen3_6_scripts/launch_server.py
     - --model
     - /model
     - --served-model-name
