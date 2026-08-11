@@ -942,18 +942,10 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
             query = query.unsqueeze(0)
             key = key.unsqueeze(0)
             value = value.unsqueeze(0)
-            if self.head_size > 128:
-                out = self._run_sdpa_fallback(query, key, value, attn_metadata)
-            else:
-                out = xops.memory_efficient_attention_forward(
-                    query,
-                    key,
-                    value,
-                    attn_bias=attn_bias[0],
-                    p=0.0,
-                    scale=self.scale,
-                    op=self.attn_op,
-                )
+            # BI-V100: ixformer varlen_fwd has incompatible signature with
+            # xops.fmha.flash.FwOp() (20-arg mismatch). Use pure-math fallback
+            # for ALL head sizes during prefill, not just head_size > 128.
+            out = self._run_sdpa_fallback(query, key, value, attn_metadata)
             return out.view_as(original_query)
 
         # Attention with alibi slopes.
