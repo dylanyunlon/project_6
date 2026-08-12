@@ -1,21 +1,7 @@
-# Exclude everything not needed for the Docker image
-cccl_upstream/
-upstream_ref/
-vllm/
-muh/
-docs/
-optimizations/
-vllm_adapter/
-*.zip
-*.txt
-*.md
-*.json
-*.muh
-.git/
-.gitignore
-__pycache__/
-*.pyc
-debug_*.py
-verify_*.py
-# Keep: qwen3_6_scripts/, computility-run.yaml, Dockerfile, ex_engine/
-ex_engine/
+# Exclude everything
+*
+
+# Only include what Dockerfile needs
+!Dockerfile
+!computility-run.yaml
+!qwen3_6_scripts/
