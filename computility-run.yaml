@@ -8,18 +8,18 @@ command:
     - --served-model-name
     - llm
     - --max-model-len
-    - '262144'
+    - '256000'
     - --gpu-memory-utilization
-    - '0.9'
+    - '0.95'
     - --trust-remote-code
     - -tp
     - '4'
     - --max-num-seqs
-    - '1'
+    - '2'
     - --disable-log-requests
     - --disable-frontend-multiprocessing
     - --max-num-batched-tokens
-    - '8192'
+    - '4096'
     - --enable-chunked-prefill
     - --max-seq-len-to-capture
     - '32768'
@@ -29,6 +29,9 @@ command:
     - --reasoning-parser
     - qwen3
     - --enable-prefix-caching
+    - --enforce-eager
+    - --dtype
+    - half
 env:
     - name: VLLM_ENGINE_ITERATION_TIMEOUT_S
       value: 3600

@@ -138,6 +138,11 @@ try:
 except ImportError:
     _corex_moe_direct_routed = None
 
+try:
+    from vllm import corex_moe_topk_softmax as _corex_moe_topk_softmax
+except ImportError:
+    _corex_moe_topk_softmax = None
+
 from vllm.model_executor.models.interfaces import (HasInnerState, SupportsLoRA,
                                                    SupportsMultiModal)
 
@@ -179,6 +184,9 @@ _USE_COREX_MOE_WEIGHT_GATHER = (
 _USE_COREX_MOE_DIRECT_ROUTED = (
     _corex_moe_direct_routed is not None
     and env_bool("BI100_MOE_COREX_DIRECT_ROUTED", False))
+_USE_COREX_MOE_TOPK_SOFTMAX = (
+    _corex_moe_topk_softmax is not None
+    and env_bool("BI100_MOE_COREX_TOPK_SOFTMAX", True))
 _USE_FUSED_MOE_ACTIVATION = env_bool("BI100_MOE_FUSED_ACTIVATION", True)
 
 
@@ -1599,13 +1607,18 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         Output is partial (pre-all-reduce), same contract as FusedMoE
         with reduce_results=False.
         """
-        # Softmax is monotonic, so selecting logits first is equivalent to
-        # full-expert softmax -> top-k -> renormalise while normalising only K
-        # values. This saves one 256-wide softmax in the decode hot path.
-        topk_logits, topk_ids = torch.topk(
-            router_logits.float(), self.top_k, dim=-1)     # (T, top_k)
-        topk_weights = torch.softmax(topk_logits, dim=-1)
-        topk_weights = topk_weights.to(hidden_states.dtype)
+        # Fused topk+softmax: single CUB kernel vs 2 PyTorch ops.
+        # Source: xllm/core/kernels/cuda/moe/moe_topk_softmax_kernels.cuh
+        if _USE_COREX_MOE_TOPK_SOFTMAX:
+            topk_weights, topk_ids = _corex_moe_topk_softmax.moe_topk_softmax(
+                router_logits.float(), self.top_k, True)
+            topk_ids = topk_ids.to(torch.int64)
+            topk_weights = topk_weights.to(hidden_states.dtype)
+        else:
+            topk_logits, topk_ids = torch.topk(
+                router_logits.float(), self.top_k, dim=-1)     # (T, top_k)
+            topk_weights = torch.softmax(topk_logits, dim=-1)
+            topk_weights = topk_weights.to(hidden_states.dtype)
 
         w13 = self.experts.w13_weight  # (E, 2*I, H)
         w2  = self.experts.w2_weight   # (E, H, I)

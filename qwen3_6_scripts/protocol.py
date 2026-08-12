@@ -180,6 +180,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
     logprobs: Optional[bool] = False
     top_logprobs: Optional[int] = 0
     max_tokens: Optional[int] = None
+    # OpenAI newer API field — treat as alias for max_tokens
+    max_completion_tokens: Optional[int] = None
     n: Optional[int] = 1
     presence_penalty: Optional[float] = 0.0
     response_format: Optional[ResponseFormat] = None
@@ -193,6 +195,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     tool_choice: Optional[Union[Literal["none"], Literal["auto"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
     thinking: Optional[Union[bool, str, Dict[str, Any]]] = None
+    reasoning_effort: Optional[str] = None
 
     # NOTE this will be ignored by VLLM -- the model determines the behavior
     parallel_tool_calls: Optional[bool] = False

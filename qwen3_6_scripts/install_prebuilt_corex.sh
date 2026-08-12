@@ -16,8 +16,8 @@ MANIFEST=${BUNDLE_DIR}/SHA256SUMS
 }
 
 mapfile -t artifacts < <(awk '{print $2}' "$MANIFEST")
-[[ "${#artifacts[@]}" -eq 12 ]] || {
-    printf 'expected 12 prebuilt CoreX artifacts, found %s\n' \
+[[ "${#artifacts[@]}" -eq 13 ]] || {
+    printf 'expected 13 prebuilt CoreX artifacts, found %s\n' \
         "${#artifacts[@]}" >&2
     exit 2
 }

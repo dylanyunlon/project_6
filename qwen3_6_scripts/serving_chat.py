@@ -394,6 +394,9 @@ class OpenAIServingChat(OpenAIServing):
             assert prompt_inputs is not None
 
             sampling_params: Union[SamplingParams, BeamSearchParams]
+            # OpenAI API: max_completion_tokens takes precedence over max_tokens
+            if request.max_completion_tokens is not None and request.max_tokens is None:
+                request.max_tokens = request.max_completion_tokens
             default_max_tokens = self.max_model_len - len(
                 prompt_inputs["prompt_token_ids"])
             if request.use_beam_search:
