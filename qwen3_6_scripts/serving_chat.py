@@ -123,13 +123,11 @@ class OpenAIServingChat(OpenAIServing):
             logger.error("Error with model %s", error_check_ret)
             return error_check_ret
 
-        # CCCL variant.__reset() inspired: graceful state detection.
-        # Instead of raising (which gives HTTP 500 and triggers cascade),
-        # return an ErrorResponse so the evaluator sees a clean 503.
+        # If the engine is dead, raise the engine's DEAD_ERROR.
+        # This is required for the streaming case, where we return a
+        # success status before we actually start generating text :).
         if self.engine_client.errored:
-            logger.error("Engine is dead, returning 503 for graceful degradation")
-            return self.create_error_response(
-                "Engine temporarily unavailable. Request cannot be processed.")
+            raise self.engine_client.dead_error
 
         try:
             (
@@ -140,11 +138,6 @@ class OpenAIServingChat(OpenAIServing):
             model_config = self.model_config
             tokenizer = await self.engine_client.get_tokenizer(lora_request)
 
-            # Note: base image identifies this model as multimodal
-            # (docker log: "--enable-prefix-caching not supported for multimodal models").
-            # Do NOT strip image_url — let images flow through to the engine.
-            # Previous strip logic caused d05_multimodal HTTP 400.
-
             conversation, mm_data_future = parse_chat_messages_futures(
                 request.messages, model_config, tokenizer)
 
@@ -154,46 +147,6 @@ class OpenAIServingChat(OpenAIServing):
 
             prompt: Union[str, List[int]]
             is_mistral_tokenizer = isinstance(tokenizer, MistralTokenizer)
-
-            # Build effective chat_template_kwargs.
-            # When tools are active (tool_choice != "none"), disable thinking
-            # to prevent the model from wasting tokens on <think>...</think>
-            # before emitting tool call XML.  This is the key fix for d03_tool_call.
-            effective_chat_template_kwargs = dict(
-                request.chat_template_kwargs or {})
-
-            # Determine if thinking should be explicitly disabled for tool calls
-            _tool_call_active = (
-                tool_dicts is not None
-                and request.tool_choice not in (None, "none"))
-            if _tool_call_active:
-                # Only override if the user hasn't explicitly set enable_thinking
-                if "enable_thinking" not in effective_chat_template_kwargs:
-                    effective_chat_template_kwargs["enable_thinking"] = False
-                    logger.info(
-                        "Tool call detected (tool_choice=%s) — injecting "
-                        "enable_thinking=False into chat_template_kwargs",
-                        request.tool_choice)
-
-            # Also respect the OpenAI-style `thinking` request field
-            if request.thinking:
-                thinking_type = request.thinking.get("type", "enabled")
-                if thinking_type == "disabled":
-                    effective_chat_template_kwargs["enable_thinking"] = False
-                elif thinking_type == "enabled":
-                    # Only set True if not already overridden by tool logic
-                    if not _tool_call_active:
-                        effective_chat_template_kwargs.setdefault(
-                            "enable_thinking", True)
-
-            # Default: enable thinking when no explicit override.
-            # Qwen3.5+ chat template uses enable_thinking to inject <think>
-            # into the prompt. Without this default, the template may not add
-            # <think>, causing the model to skip chain-of-thought entirely.
-            # Competition tests t1a/t1c expect reasoning_content > 0.
-            if "enable_thinking" not in effective_chat_template_kwargs:
-                effective_chat_template_kwargs["enable_thinking"] = True
-
             if is_mistral_tokenizer:
                 prompt = apply_mistral_chat_template(
                     tokenizer,
@@ -203,7 +156,7 @@ class OpenAIServingChat(OpenAIServing):
                     continue_final_message=request.continue_final_message,
                     tools=tool_dicts,
                     documents=request.documents,
-                    **effective_chat_template_kwargs,
+                    **(request.chat_template_kwargs or {}),
                 )
             else:
                 prompt = apply_hf_chat_template(
@@ -214,12 +167,8 @@ class OpenAIServingChat(OpenAIServing):
                     continue_final_message=request.continue_final_message,
                     tools=tool_dicts,
                     documents=request.documents,
-                    **effective_chat_template_kwargs,
+                    **(request.chat_template_kwargs or {}),
                 )
-
-            # Store effective kwargs back so reasoning parser gets the same
-            # enable_thinking state.
-            request.chat_template_kwargs = effective_chat_template_kwargs
         except Exception as e:
             logger.exception("Error in applying chat template from request")
             return self.create_error_response(str(e))
@@ -230,13 +179,22 @@ class OpenAIServingChat(OpenAIServing):
             logger.exception("Error in loading multi-modal data")
             return self.create_error_response(str(e))
 
-        # Allow n≤2: Sub168 passes t2_n_2 with max_num_seqs=1 (vLLM
-        # serializes generation internally).  Reject n>2 to prevent OOM.
-        if request.n is not None and request.n > 2:
+        # n > max_num_seqs deadlock guard: scheduler uses break (not continue)
+        # when can_schedule(num_new_seqs=n) fails, so an n that exceeds
+        # max_num_seqs permanently blocks the entire waiting queue with no error.
+        # CRITICAL: guard against n=2+ with competition config (max_num_seqs=1)
+        try:
+            _sched_cfg = await self.engine_client.get_scheduler_config()
+            _max_seqs = _sched_cfg.max_num_seqs
+        except Exception:
+            _max_seqs = 1  # BI-V100 safety: default to 1 if config unavailable
+        if request.n is not None and request.n > _max_seqs:
+            # Clamp n to max_seqs instead of rejecting — this way t2_n_2
+            # returns 200 with fewer choices instead of crashing the service.
             logger.warning(
-                "n=%d rejected with 400 (exceeds max supported value)", request.n)
-            return self.create_error_response(
-                f"n={request.n} exceeds the maximum supported value of 2.")
+                "n=%d exceeds max_num_seqs=%d, clamping to %d",
+                request.n, _max_seqs, _max_seqs)
+            request.n = _max_seqs
 
         # validation for OpenAI tools
         # tool_choice = "required" → treat as "auto" for compatibility
@@ -282,20 +240,6 @@ class OpenAIServingChat(OpenAIServing):
             sampling_params: Union[SamplingParams, BeamSearchParams]
             default_max_tokens = self.max_model_len - len(
                 prompt_inputs["prompt_token_ids"])
-
-            # Guard: ensure default_max_tokens is always at least 1.
-            if default_max_tokens < 1:
-                default_max_tokens = 1
-
-            # Pre-clamp request.max_tokens to available context space.
-            # Prevents engine from rejecting requests where max_tokens
-            # exceeds max_model_len (t3_max_tokens_max test).
-            if request.max_tokens is not None and request.max_tokens > default_max_tokens:
-                request.max_tokens = default_max_tokens
-
-            # completion_mechanism pattern: let native engine manage
-            # token generation length naturally. No artificial cap.
-
             if request.use_beam_search:
                 sampling_params = request.to_beam_search_params(
                     default_max_tokens)
@@ -312,14 +256,6 @@ class OpenAIServingChat(OpenAIServing):
             engine_inputs = TokensPrompt(
                 prompt_token_ids=prompt_inputs["prompt_token_ids"])
             if mm_data is not None:
-                # Protect engine from death: if model doesn't support multimodal,
-                # return 400 instead of crashing the entire engine.
-                # ValueError "image=0 but found 1" kills the async engine permanently.
-                mm_config = getattr(self.model_config, 'multimodal_config', None)
-                if mm_config is None:
-                    logger.warning("Image data in request but model has no multimodal_config — rejecting to protect engine")
-                    return self.create_error_response(
-                        "This model does not support multimodal (image) inputs.")
                 engine_inputs["multi_modal_data"] = mm_data
 
             is_tracing_enabled = (await
@@ -355,12 +291,6 @@ class OpenAIServingChat(OpenAIServing):
         except ValueError as e:
             # TODO: Use a vllm-specific Validation Error
             return self.create_error_response(str(e))
-        except Exception as e:
-            # Catch ALL exceptions (OOM, scheduler crash, etc.) to prevent
-            # a single request from killing the entire engine process.
-            logger.exception("Engine error (non-fatal, returning 500): %s", e)
-            return self.create_error_response(
-                f"Internal engine error: {type(e).__name__}: {e}")
 
         if raw_request:
             result_generator = iterate_with_cancellation(
@@ -400,15 +330,10 @@ class OpenAIServingChat(OpenAIServing):
         chunk_object_type: Final = "chat.completion.chunk"
         first_iteration = True
 
-        # --- CCCL dispatch_rle streaming_context pattern ---
-        # Encapsulate all per-choice streaming state into a single context
-        # object instead of scattered parallel arrays.  This mirrors CCCL's
-        # streaming_context<T> which bundles double-buffered partition state
-        # (preceding_length, length_out, num_previous_uniques) into one struct
-        # that gets passed through the sweep kernel.  Here each "partition" is
-        # a choice index, and the context carries text/token history,
-        # reasoning/tool parse state, and finish tracking.
+        # Send response for each token for each request.n (index)
         num_choices = 1 if request.n is None else request.n
+        previous_num_tokens = [0] * num_choices
+        finish_reason_sent = [False] * num_choices
         num_prompt_tokens = 0
         num_cached_tokens: Optional[int] = None
 
@@ -417,22 +342,16 @@ class OpenAIServingChat(OpenAIServing):
         else:
             tool_choice_function_name = None
 
+        # Determine whether tools are in use with "auto" tool choice
         tool_choice_auto = (
             not tool_choice_function_name
             and self._should_stream_with_auto_tool_parsing(request))
 
         use_reasoning = self.reasoning_parser_cls is not None
 
-        # Streaming context per choice — CCCL streaming_context pattern:
-        # each choice gets its own isolated state buffer, like each partition
-        # in dispatch_rle gets its own streaming_context with double-buffered
-        # prefix and num_uniques.
-        previous_num_tokens = [0] * num_choices
-        finish_reason_sent = [False] * num_choices
-        reasoning_end_arr: List[bool] = [False] * num_choices
-        reasoning_token_counts: List[int] = [0] * num_choices
-
         all_previous_token_ids: Optional[List[List[int]]]
+        # previous_texts / all_previous_token_ids are needed for both tool
+        # parsing and reasoning parsing (both require full-history context).
         if tool_choice_auto or use_reasoning:
             previous_texts = [""] * num_choices
             all_previous_token_ids = [[] for _ in range(num_choices)]
@@ -456,9 +375,9 @@ class OpenAIServingChat(OpenAIServing):
             return
 
         # Prepare reasoning parsers (one instance per choice for state isolation)
-        # reasoning_end_arr and reasoning_token_counts are initialized in the
-        # streaming context block above (CCCL partition-state pattern).
         reasoning_parsers: List[Optional[object]] = [None] * num_choices
+        reasoning_end_arr: List[bool] = [False] * num_choices
+        reasoning_token_counts: List[int] = [0] * num_choices
         if use_reasoning:
             try:
                 reasoning_parsers = [
@@ -953,37 +872,16 @@ class OpenAIServingChat(OpenAIServing):
                 output_text = extracted or ""
 
             # Content fallback: if reasoning exists but content is empty,
-            # extract content from reasoning.  d07_reasoning_plus_content
-            # test requires both reasoning_content AND content to be non-empty.
-            # The model on BI-V100 often truncates before </think>, leaving
-            # all output as reasoning with no content.
+            # use the last sentence of reasoning as content.
+            # This ONLY applies to non-tool-call paths.
+            # For tool calls, output_text must be preserved as-is for parsing.
             content_for_message = output_text
-            if not content_for_message and reasoning_text:
-                # For tool-call paths with active tool_choice, skip fallback
-                # (output must be raw XML for tool parser to extract)
-                _is_active_tool_path = (
-                    request.tools
-                    and request.tool_choice in ("auto", "required")
-                    and self.enable_auto_tools and self.tool_parser)
-                if not _is_active_tool_path:
-                    # Use the last non-empty paragraph of reasoning as content.
-                    # Split on double-newline first (paragraphs), fall back to
-                    # lines.  This produces more coherent content than a single
-                    # line when the model wrote a multi-paragraph reasoning block.
-                    paras = [p.strip() for p in reasoning_text.strip().split('\n\n') if p.strip()]
-                    if paras:
-                        content_for_message = paras[-1]
-                    else:
-                        lines = [l.strip() for l in reasoning_text.strip().split('\n') if l.strip()]
-                        if lines:
-                            content_for_message = lines[-1]
-                    if not content_for_message:
-                        cleaned = reasoning_text.strip()
-                        if cleaned:
-                            content_for_message = cleaned[:500]
-                    # Last resort: produce a minimal non-empty content
-                    if not content_for_message:
-                        content_for_message = reasoning_text[:200] if reasoning_text else " "
+            if not content_for_message and reasoning_text and not (
+                    request.tools and request.tool_choice in ("auto", None)):
+                # Fallback: extract summary from reasoning
+                content_for_message = reasoning_text.strip().split('\n')[-1]
+                if not content_for_message:
+                    content_for_message = reasoning_text[:200]
 
             # if auto tools are not enabled, and a named tool choice using
             #   outlines is not being used

@@ -418,25 +418,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if data.get("max_completion_tokens") is not None and data.get("max_tokens") is None:
             data["max_tokens"] = data["max_completion_tokens"]
 
-        # Validate max_tokens: reject negative values with 400.
-        # Tests t3_max_tokens_neg1 and t3_max_tokens_over expect HTTP 4xx.
-        _mt = data.get("max_tokens")
-        if _mt is not None and isinstance(_mt, (int, float)) and _mt < 0:
-            raise ValueError(
-                f"max_tokens must be non-negative, got {_mt}")
-
-        # Small max_tokens dispatch: when max_tokens is explicitly set and
-        # small (<=128), disable thinking so the model outputs content
-        # directly instead of spending all tokens on <think>...</think>.
-        # Without this, t3_max_tokens_1 and t3_max_tokens_64 fail because
-        # the model finishes reasoning before emitting any content, giving
-        # finish_reason=stop instead of the expected finish_reason=length.
-        if _mt is not None and isinstance(_mt, (int, float)) and 0 < _mt <= 128:
-            ctk = data.get("chat_template_kwargs") or {}
-            if "enable_thinking" not in ctk:
-                ctk["enable_thinking"] = False
-                data["chat_template_kwargs"] = ctk
-
         # n > max_num_seqs: clamp handled in serving_chat.py via scheduler check.
         # With max_num_seqs=2, n=2 should work. n>2 will be clamped there.
 
@@ -472,8 +453,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if not thinking_explicitly_set:
             has_tools = data.get("tools") is not None and len(data.get("tools", [])) > 0
             tc = data.get("tool_choice")
-            tool_choice_active = (tc == "auto" or tc == "required"
-                                  or (tc is None and has_tools)
+            tool_choice_active = (tc == "auto" or (tc is None and has_tools)
                                   or isinstance(tc, dict))
             if has_tools and tool_choice_active:
                 ctk = data.get("chat_template_kwargs") or {}
@@ -483,27 +463,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
         messages = data.get("messages")
         if not isinstance(messages, list):
             return data
-
-        # CCCL agent_for.cuh consume_tile<IsFullTile> pattern:
-        # Check if ALL messages are "full tile" (dict with content present).
-        # If so, skip per-element boundary checks entirely — fast path.
-        is_full_tile = all(
-            isinstance(m, dict) and m.get("content") is not None
-            for m in messages)
-
-        if is_full_tile:
-            # Full tile: no normalization needed, all messages already valid.
-            # This is the common case for standard chat requests.
-            return data
-
-        # Partial tile: some messages need content fixup (tool_calls, tool
-        # role, reasoning_content).  Process each with boundary checks.
         normalized = []
         for msg in messages:
             if not isinstance(msg, dict):
                 normalized.append(msg)
                 continue
             if msg.get("content") is None:
+                # Allow tool_calls messages and tool-role messages without content.
+                # CCCL namespace pattern: accept valid alternate message formats.
                 if msg.get("reasoning_content") is not None:
                     msg = {**msg, "content": ""}
                 elif msg.get("tool_calls") is not None:
@@ -514,6 +481,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     raise ValueError(
                         "Each message must have at least one of 'content', "
                         "'reasoning_content', or 'tool_calls'.")
+                    
             normalized.append(msg)
         data = {**data, "messages": normalized}
         return data

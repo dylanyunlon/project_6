@@ -18,83 +18,6 @@ logger = init_logger(__name__)
 
 supports_moe_ops = True
 
-# ============================================================================
-# MoE CUDA kernels — JIT-compiled from vllm v0.5.5 (torch::Tensor API)
-# topk_softmax + moe_align_block_size compiled as moe_kernels.so
-# ============================================================================
-_moe_kernels = None
-_moe_kernels_loaded = False
-
-def _load_moe_kernels():
-    """Load pre-compiled moe_kernels.so or JIT compile on demand."""
-    global _moe_kernels, _moe_kernels_loaded
-    if _moe_kernels_loaded:
-        return _moe_kernels
-    _moe_kernels_loaded = True
-    
-    import os, glob, importlib.util
-    
-    # Try pre-compiled .so from torch extensions cache
-    try:
-        import moe_kernels
-        _moe_kernels = moe_kernels
-        logger.info("[EX] moe_kernels loaded from cache")
-        return _moe_kernels
-    except ImportError:
-        pass
-    
-    # Try to find .so in known locations
-    search_paths = [
-        os.path.expanduser('~/.cache/torch_extensions'),
-        '/root/.cache/torch_extensions',
-        '/workspace/ex_engine/build',
-    ]
-    for sp in search_paths:
-        for so in glob.glob(os.path.join(sp, '**/moe_kernels*.so'), recursive=True):
-            try:
-                spec = importlib.util.spec_from_file_location('moe_kernels', so)
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                _moe_kernels = mod
-                logger.info(f"[EX] moe_kernels loaded from {so}")
-                return _moe_kernels
-            except Exception:
-                continue
-    
-    # JIT compile as last resort
-    moe_dir = None
-    for candidate in [
-        '/workspace/ex_engine/csrc/moe_v055',
-        os.path.join(os.path.dirname(__file__), '..', 'model_executor', 'models', 
-                     'ex_engine', 'csrc', 'moe_v055'),
-    ]:
-        if os.path.isdir(candidate):
-            moe_dir = candidate
-            break
-    
-    if moe_dir and os.path.isfile(os.path.join(moe_dir, 'moe_pybind.cpp')):
-        try:
-            from torch.utils.cpp_extension import load
-            _moe_kernels = load(
-                name='moe_kernels',
-                sources=[
-                    os.path.join(moe_dir, 'moe_pybind.cpp'),
-                    os.path.join(moe_dir, 'topk_softmax_kernels.cu'),
-                    os.path.join(moe_dir, 'moe_align_block_size_kernels.cu'),
-                ],
-                extra_include_paths=[moe_dir],
-                extra_cflags=['-O2', '-std=c++17'],
-                extra_cuda_cflags=['-O2', '--expt-relaxed-constexpr'],
-                verbose=False,
-            )
-            logger.info(f"[EX] moe_kernels JIT compiled from {moe_dir}")
-            return _moe_kernels
-        except Exception as e:
-            logger.warning(f"[EX] moe_kernels JIT compile failed: {e}")
-    
-    logger.warning("[EX] moe_kernels NOT available — MoE will use PyTorch path")
-    return None
-
 if TYPE_CHECKING:
 
     def register_fake(fn):
@@ -866,43 +789,9 @@ def moe_align_block_size(topk_ids: torch.Tensor, num_experts: int,
                          block_size: int, sorted_token_ids: torch.Tensor,
                          experts_ids: torch.Tensor,
                          num_tokens_post_pad: torch.Tensor) -> None:
-    # PyTorch implementation of moe_align_block_size.
-    # Sort tokens by expert assignment with block-aligned padding.
-    # This is the same logic as vllm's CUDA kernel but in Python.
-    max_num_tokens_padded = sorted_token_ids.numel()
-    num_tokens = topk_ids.numel()
-    
-    # Count tokens per expert
-    tokens_per_expert = torch.zeros(num_experts, dtype=torch.int32, device=topk_ids.device)
-    for i in range(num_tokens):
-        tokens_per_expert[topk_ids.view(-1)[i]] += 1
-    
-    # Compute padded counts (align to block_size)
-    cumsum = 0
-    sorted_idx = 0
-    for expert_id in range(num_experts):
-        # Collect all tokens for this expert
-        cnt = tokens_per_expert[expert_id].item()
-        for i in range(num_tokens):
-            if topk_ids.view(-1)[i].item() == expert_id:
-                if sorted_idx < max_num_tokens_padded:
-                    sorted_token_ids[sorted_idx] = i
-                    sorted_idx += 1
-        # Pad to block_size boundary
-        padded_cnt = ((cnt + block_size - 1) // block_size) * block_size
-        for _ in range(padded_cnt - cnt):
-            if sorted_idx < max_num_tokens_padded:
-                sorted_token_ids[sorted_idx] = num_tokens  # padding sentinel
-                sorted_idx += 1
-        # Expert id for each block
-        num_blocks = padded_cnt // block_size
-        for b in range(num_blocks):
-            block_idx = cumsum // block_size + b
-            if block_idx < experts_ids.numel():
-                experts_ids[block_idx] = expert_id
-        cumsum += padded_cnt
-    
-    num_tokens_post_pad.fill_(sorted_idx)
+    ixf_F.vllm_moe_align_block_size(topk_ids, num_experts, block_size,
+                                      sorted_token_ids, experts_ids,
+                                      num_tokens_post_pad)
 
 
 def invoke_fused_moe_kernel(
@@ -923,147 +812,26 @@ def invoke_fused_moe_kernel(
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
 ) -> None:
-    # PyTorch implementation of fused MoE GEMM kernel.
-    # For each block of sorted tokens belonging to the same expert,
-    # compute C[token] = A[token] @ B[expert].T (optionally weighted).
-    #
-    # This replaces the Triton/CUDA fused_moe_kernel that base image expects
-    # via ixf_F.vllm_invoke_fused_moe_kernel (which doesn't exist).
-    num_tokens = A.shape[0]
-    block_size = config.get('BLOCK_SIZE_M', 64)
-    num_valid = num_tokens_post_padded.item() if isinstance(num_tokens_post_padded, torch.Tensor) else num_tokens_post_padded
-    num_blocks = (num_valid + block_size - 1) // block_size
-    
-    for block_idx in range(min(num_blocks, expert_ids.numel())):
-        expert_id = expert_ids[block_idx].item()
-        start = block_idx * block_size
-        end = min(start + block_size, num_valid)
-        
-        # Get token indices for this block
-        token_indices = sorted_token_ids[start:end]
-        # Filter out padding sentinels (index >= num_tokens)
-        valid_mask = token_indices < num_tokens
-        if not valid_mask.any():
-            continue
-        valid_indices = token_indices[valid_mask].long()
-        
-        # Gather input tokens
-        a_block = A[valid_indices]  # (valid_count, K)
-        # Expert weight: B is (num_experts, N, K) → B[expert_id] is (N, K)
-        w = B[expert_id]  # (N, K)
-        # GEMM: output = input @ weight.T
-        out = torch.matmul(a_block.to(w.dtype), w.t())  # (valid_count, N)
-        
-        if mul_routed_weight:
-            # Apply routing weights
-            # valid_indices are flattened (token_idx * top_k + k)
-            # We need to map back to (token_idx, k) to get the weight
-            token_idx = valid_indices // top_k
-            k_idx = valid_indices % top_k
-            weights = topk_weights[token_idx, k_idx].unsqueeze(1).to(out.dtype)
-            out = out * weights
-        
-        # Scatter back
-        C[valid_indices] = out.to(C.dtype)
-
-
-# ---------- topk_softmax: CUDA kernel → PyTorch fallback ----------
-# moe_topk_softmax_v3.cu: fused warp-shuffle kernel, 64 experts, zero SMEM.
-# Precompiled during Docker build → .so cached by torch.
-# If not found, JIT from .cu source. PyTorch last resort.
-_moe_topk_ext = None
-_moe_topk_init_done = False
-
-def _init_moe_topk():
-    global _moe_topk_ext, _moe_topk_init_done
-    _moe_topk_init_done = True
-    # 1. Try import precompiled module (torch cache from Docker build)
-    try:
-        import moe_topk_softmax_v3 as ext
-        _moe_topk_ext = ext
-        logger.info("topk_softmax: loaded precompiled CUDA kernel")
-        return
-    except ImportError:
-        pass
-    # 2. Try loading from known .so paths
-    import glob
-    so_patterns = [
-        "/workspace/ex_engine/build/moe_topk_softmax_v3*.so",
-        "/root/.cache/torch_extensions/*/moe_topk_softmax_v3/*.so",
-        "/tmp/torch_extensions/*/moe_topk_softmax_v3/*.so",
-    ]
-    for pattern in so_patterns:
-        for so_path in glob.glob(pattern):
-            try:
-                torch.ops.load_library(so_path)
-                # After load_library, the pybind module should be importable
-                import moe_topk_softmax_v3 as ext
-                _moe_topk_ext = ext
-                logger.info("topk_softmax: loaded CUDA kernel from %s", so_path)
-                return
-            except Exception:
-                pass
-    # 3. JIT compile from .cu source
-    import os
-    search_paths = [
-        "/workspace/ex_engine/csrc/moe_topk_softmax_v3.cu",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "moe_topk_softmax_v3.cu"),
-    ]
-    for base in ["/usr/local/corex/lib/python3/dist-packages/vllm/model_executor/models",
-                 "/usr/local/corex/lib64/python3/dist-packages/vllm/model_executor/models"]:
-        search_paths.append(os.path.join(base, "moe_topk_softmax_v3.cu"))
-    for cu_path in search_paths:
-        if os.path.isfile(cu_path):
-            try:
-                from torch.utils.cpp_extension import load
-                ext = load(
-                    name="moe_topk_softmax_v3",
-                    sources=[cu_path],
-                    extra_cuda_cflags=["-O3"],
-                    verbose=False,
-                )
-                _moe_topk_ext = ext
-                logger.info("topk_softmax: JIT compiled CUDA kernel from %s", cu_path)
-                return
-            except Exception as e:
-                logger.warning("topk_softmax: JIT compile failed (%s)", e)
-                break  # Don't retry same source with different paths
-    logger.warning("topk_softmax: CUDA kernel unavailable — PyTorch fallback (SLOW)")
+    ixf_F.vllm_invoke_fused_moe_kernel(
+        A,
+        B,
+        C,
+        topk_weights,
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        mul_routed_weight,
+        top_k,
+        config['BLOCK_SIZE_M']
+    )
 
 
 def topk_softmax(topk_weights: torch.Tensor, topk_ids: torch.Tensor,
                  token_expert_indicies: torch.Tensor,
                  gating_output: float) -> None:
-    global _moe_topk_ext, _moe_topk_init_done
-    if not _moe_topk_init_done:
-        _init_moe_topk()
-
-    # Priority 1: Our CUDA kernel (fused warp-shuffle, ~5x faster than PyTorch)
-    if _moe_topk_ext is not None:
-        try:
-            gating = gating_output if isinstance(gating_output, torch.Tensor) else gating_output
-            topk_k = topk_weights.shape[1]
-            results = _moe_topk_ext.moe_topk_softmax(gating, topk_k, False)
-            topk_weights.copy_(results[0].to(topk_weights.dtype))
-            topk_ids.copy_(results[1].to(topk_ids.dtype))
-            token_expert_indicies.copy_(results[2].to(token_expert_indicies.dtype))
-            return
-        except Exception as e:
-            logger.warning("topk_softmax CUDA kernel failed (%s), falling back to PyTorch", e)
-            _moe_topk_ext = None  # disable permanently on failure
-
-    # Priority 2: PyTorch fallback (always works)
-    if isinstance(gating_output, torch.Tensor):
-        probs = torch.softmax(gating_output.float(), dim=-1)
-    else:
-        probs = torch.softmax(gating_output, dim=-1)
-    topk = topk_weights.shape[1]
-    tw, ti = torch.topk(probs, topk, dim=-1)
-    topk_weights.copy_(tw.to(topk_weights.dtype))
-    topk_ids.copy_(ti.to(topk_ids.dtype))
-    token_expert_indicies.copy_(
-        torch.arange(topk, device=topk_ids.device, dtype=topk_ids.dtype)
-        .unsqueeze(0).expand_as(topk_ids))
+    ixf_F.vllm_moe_topk_softmax(topk_weights, topk_ids,
+                                  token_expert_indicies, gating_output)
 
 
 if supports_moe_ops and hasattr(torch.ops._moe_C, "marlin_gemm_moe"):
@@ -1142,35 +910,12 @@ def reshape_and_cache_flashinfer(
 def copy_blocks(key_caches: List[torch.Tensor],
                 value_caches: List[torch.Tensor],
                 block_mapping: torch.Tensor) -> None:
-    # ixformer vllm_copy_cache expects dict {src_block: [dst_blocks...]}
-    # vllm 0.6.3 passes a Tensor of shape [N, 2] with (src, dst) pairs
-    if isinstance(block_mapping, torch.Tensor):
-        mapping_dict = {}
-        bm = block_mapping.cpu()
-        for i in range(bm.shape[0]):
-            src = int(bm[i, 0])
-            dst = int(bm[i, 1])
-            if src not in mapping_dict:
-                mapping_dict[src] = []
-            mapping_dict[src].append(dst)
-        ixf_F.vllm_copy_cache(key_caches, value_caches, mapping_dict)
-    else:
-        ixf_F.vllm_copy_cache(key_caches, value_caches, block_mapping)
+    ixf_F.copy_blocks(key_caches, value_caches, block_mapping)
 
 
 def swap_blocks(src: torch.Tensor, dst: torch.Tensor,
                 block_mapping: torch.Tensor) -> None:
-    # Same issue: ixformer expects dict, vllm passes Tensor
-    if isinstance(block_mapping, torch.Tensor):
-        mapping_dict = {}
-        bm = block_mapping.cpu()
-        for i in range(bm.shape[0]):
-            s = int(bm[i, 0])
-            d = int(bm[i, 1])
-            mapping_dict[s] = d
-        ixf_F.vllm_swap_blocks(src, dst, mapping_dict)
-    else:
-        ixf_F.vllm_swap_blocks(src, dst, block_mapping)
+    ixf_F.swap_blocks(src, dst, block_mapping)
 
 
 def convert_fp8(output: torch.Tensor,

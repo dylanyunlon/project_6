@@ -1,12 +1,10 @@
 # Inference-only Qwen3.6-27B (Qwen3_5 architecture) for Iluvatar BI-V100.
-# CoreX dispatch: try native fused kernels first, fallback to PyTorch.
-# CCCL env_dispatch pattern: query capability → try native → fallback.
+# Pure-PyTorch DeltaNet (no fla / causal_conv1d dependency).
 # Text-only (no VL, no MTP).
 
 from collections import OrderedDict
 from typing import Dict, Iterable, List, Optional, Tuple
 
-import os
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -43,155 +41,9 @@ from vllm.model_executor.models.interfaces import HasInnerState, SupportsLoRA
 
 logger = init_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# ixformer hardware acceleration (BI-V100 native ops)
-#
-# Confirmed available on BI-V100 via SSH probe (Aug 8 2026):
-#   ixformer.matmul(input, other, out=None, transa=False, transb=False, alpha=1.0, beta=0.0)
-#   ixformer.softmax(input, dim=None)
-#   ixformer.rms_norm(input, weight, output=None, eps=1e-6)
-#   ixformer.fused_add_rms_norm(input, residual, weight, eps=1e-5, scale=1.0)
-#   ixformer.silu_and_mul(input, output=None)
-#   ixformer.conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1)
-#   ixformer.flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False)
-#   ixformer.gemv(x, A)
-#
-# No topk/moe/expert/gate ops available — MoE stays pure PyTorch.
-# No fused GDN scan kernel — GDN loop stays, but individual ops inside are accelerated.
-# ---------------------------------------------------------------------------
-_ix = None
-_ix_available = False
-
-try:
-    import ixformer as _ix
-    _ix_available = True
-    logger.info("ixformer loaded — BI-V100 hardware acceleration available")
-except ImportError:
-    logger.warning("ixformer not found — using pure PyTorch (no hardware acceleration)")
-
-# corex_gdn/corex_moe: these are custom modules that teams package into their
-# Docker image. If present, they provide fused GDN/MoE kernels.
-# ix_bridge: C++ bridge to ixformer::infer (full MoE pipeline)
-_ix_bridge_available = False
-_ix_topk_softmax = None
-_ix_fused_moe_forward = None
-try:
-    from ex_engine.python.ix_bridge import (
-        topk_softmax as _ix_topk_softmax,
-        fused_moe_forward as _ix_fused_moe_forward,
-        is_available as _ix_bridge_check,
-    )
-    _ix_bridge_available = True
-    logger.info("ix_bridge: full ixformer MoE pipeline available (topk + fused_moe)")
-except ImportError:
-    try:
-        import sys
-        _ex_dir = os.path.join(os.path.dirname(__file__), "ex_engine")
-        if os.path.isdir(_ex_dir) and _ex_dir not in sys.path:
-            sys.path.insert(0, os.path.dirname(_ex_dir))
-        from ex_engine.python.ix_bridge import (
-            topk_softmax as _ix_topk_softmax,
-            fused_moe_forward as _ix_fused_moe_forward,
-            is_available as _ix_bridge_check,
-        )
-        _ix_bridge_available = True
-        logger.info("ix_bridge: full ixformer MoE pipeline available (deployed path)")
-    except ImportError as e:
-        logger.warning(
-            "ix_bridge: IMPORT FAILED (%s). MoE will use PyTorch fallback. "
-            "This is 3-10x slower.", e)
-_corex_gdn_available = False
-_corex_moe_available = False
-
-# SM70 FlashQLA GDN kernel (from 1Cat-vLLM, MIT license)
-# Fused CUDA kernel for GatedDeltaNet on SM70/SM75 (V100/BI-V100)
-# JIT compiled via torch.utils.cpp_extension.load() on first call
-_flash_qla_sm70 = None
-_flash_qla_available = False
-
-try:
-    from vllm.model_executor.models.flash_qla_sm70 import (
-        chunk_gated_delta_rule_fwd_sm70,
-        chunk_gated_delta_rule_fwd_sm70_vlk_varlen,
-    )
-    _flash_qla_available = True
-    logger.info("FlashQLA SM70 GDN module found — fused CUDA kernel available (JIT on first call)")
-except ImportError as e:
-    logger.warning("FlashQLA SM70 GDN not found (%s) — using PyTorch GDN", e)
-
-try:
-    from vllm.model_executor.models import corex_gdn as _corex_gdn_module
-    _corex_gdn_available = True
-    logger.info("CoreX GDN module found — fused GDN kernels available")
-except ImportError as e:
-    logger.warning("corex_gdn import failed: %s", e)
-
-try:
-    from vllm.model_executor.models import corex_moe as _corex_moe_module
-    _corex_moe_available = True
-    logger.info("CoreX MoE module found — fused MoE kernels available")
-except ImportError as e:
-    logger.warning("corex_moe import failed: %s — MoE uses PyTorch loop (SLOW)", e)
-
-_corex_fa2_available = False
-_corex_fa2_module = None
-try:
-    from vllm.model_executor.models import corex_fa2 as _corex_fa2_module
-    _corex_fa2_available = True
-    logger.info("CoreX FA2 module found — fused attention kernels available")
-except ImportError as e:
-    logger.warning("corex_fa2 import failed: %s", e)
-
-# EX Engine: fused MoE topk_softmax CUDA kernel (xllm CUB-based)
-_ex_moe_topk_softmax = None
-_ex_moe_topk_available = False
-try:
-    from ex_engine.python.moe_topk import moe_topk_softmax as _ex_moe_topk_softmax
-    _ex_moe_topk_available = True
-    logger.info("EX Engine MoE topk_softmax kernel available")
-except ImportError:
-    try:
-        from vllm.model_executor.models.ex_engine.moe_topk import moe_topk_softmax as _ex_moe_topk_softmax
-        _ex_moe_topk_available = True
-        logger.info("EX Engine MoE topk_softmax kernel available (vllm path)")
-    except ImportError:
-        pass
-
 
 # ---------------------------------------------------------------------------
-# ixformer-accelerated ops (drop-in replacements for torch ops)
-# ---------------------------------------------------------------------------
-
-def _ix_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """BI-V100 accelerated matmul via ixformer. Only for half — ixformer rejects float32."""
-    if _ix_available and a.dtype == torch.float16:
-        try:
-            return _ix.matmul(a, b)
-        except Exception:
-            pass
-    return torch.matmul(a, b)
-
-def _ix_bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Batched matmul — ixformer.matmul handles batched half inputs."""
-    if _ix_available and a.dtype == torch.float16:
-        try:
-            return _ix.matmul(a, b)
-        except Exception:
-            pass
-    return torch.matmul(a, b)
-
-def _ix_softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """BI-V100 accelerated softmax via ixformer. Only for half."""
-    if _ix_available and x.dtype == torch.float16:
-        try:
-            return _ix.softmax(x, dim=dim)
-        except Exception:
-            pass
-    return torch.softmax(x, dim=dim)
-
-
-# ---------------------------------------------------------------------------
-# Pure-PyTorch DeltaNet kernels (with ixformer acceleration where possible)
+# Pure-PyTorch DeltaNet kernels (fallbacks from transformers 5.2.0)
 # ---------------------------------------------------------------------------
 
 def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
@@ -222,12 +74,7 @@ def _torch_chunk_gated_delta_rule(
     value: torch.Tensor,   # (batch, seq, num_heads, head_v_dim)
     g: torch.Tensor,       # (batch, seq, num_heads)
     beta: torch.Tensor,    # (batch, seq, num_heads)
-    # CCCL agent_radix_sort_upsweep overflow pattern: UNROLL_COUNT = min(64, 255/KEYS_PER_THREAD)
-    # prevents counter overflow by limiting accumulation steps.
-    # Same principle: chunk_size limits cumsum steps. With pre-clamp [-5,2]:
-    #   chunk=64: worst cumsum = 64*2 = 128 → exp(128) = inf
-    #   chunk=16: worst cumsum = 16*2 = 32  → clamp(-20,20) catches it
-    chunk_size: int = 16,
+    chunk_size: int = 64,
     initial_state: Optional[torch.Tensor] = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
@@ -264,20 +111,49 @@ def _torch_chunk_gated_delta_rule(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
         diagonal=0)
 
-    # Match xllm qwen3_gated_delta_net_base.cpp line 170-175:
-    # cumsum first, then difference form (g_i - g_j) which is numerically
-    # stable — the subtraction cancels cumsum growth so exp() stays bounded.
-    # Do NOT clamp g before cumsum — that corrupts gate values and causes NaN.
     g = g.cumsum(dim=-1)
-    decay_mask = (g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().to(torch.float32).tril()
-    attn = -((_ix_matmul(k_beta, key.transpose(-1, -2))) * decay_mask).masked_fill(mask_upper, 0)
-    for i in range(1, chunk_size):
-        row = attn[..., i, :i].clone()
-        sub = attn[..., :i, :i].clone()
-        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
-    value = _ix_matmul(attn, v_beta)
-    k_cumdecay = _ix_matmul(attn, k_beta * g.exp().unsqueeze(-1))
+    # Clamp gate logits to prevent exp overflow → NaN cascade.
+    # CCCL dispatch_reduce_deterministic.cuh: numerical stability requires
+    # bounded intermediate values. Gate logit range [-20, 20] keeps exp
+    # in [~2e-9, ~5e8] — safe for float32 accumulation.
+    g = g.clamp(-20.0, 20.0)
+    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+
+    # Lower-triangular solve WITHOUT libcusolver (not available on BI-V100).
+    #
+    # Computes (I - A)^{-1} @ RHS where A is strictly lower-triangular.
+    # A = (k_beta @ key^T) * decay_mask, masked to lower triangle.
+    #
+    # Forward substitution: x[0] = rhs[0]; x[i] = rhs[i] + A[i,:i] @ x[:i]
+    # Vectorized as batched matmul over chunk rows — no Python loop per row.
+    # Uses torch.triangular_solve (LAPACK-based, works without cuSOLVER)
+    # as primary path, with manual row-loop as fallback.
+    A = ((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask_upper, 0)
+
+    # For solve: (I-A) @ X = RHS  →  X = (I-A)^{-1} @ RHS
+    # Since (I-A) is lower-triangular with 1s on diagonal, and A is strictly
+    # lower-triangular, we can use a row-by-row forward substitution.
+    # This avoids cuSOLVER entirely — only needs basic matmul and indexing.
+
+    def _forward_sub_lower(A_lower, rhs):
+        """Solve (I - A_lower) @ X = RHS via forward substitution.
+        A_lower: (..., C, C) strictly lower-triangular
+        rhs: (..., C, D)
+        Returns X: (..., C, D)
+        """
+        C = rhs.shape[-2]
+        x = torch.zeros_like(rhs)
+        x[..., 0, :] = rhs[..., 0, :]
+        for i in range(1, C):
+            # x[i] = rhs[i] + A[i, :i] @ x[:i]
+            x[..., i, :] = rhs[..., i, :] + (A_lower[..., i, :i].unsqueeze(-2) @ x[..., :i, :]).squeeze(-2)
+        return x
+
+    value = _forward_sub_lower(A, v_beta)
+
+    k_cumdecay = _forward_sub_lower(A, k_beta * g.exp().unsqueeze(-1))
+
+    del A  # free memory
 
     last_state = (
         torch.zeros(batch, num_heads, k_dim, v_dim, dtype=value.dtype, device=value.device)
@@ -289,36 +165,18 @@ def _torch_chunk_gated_delta_rule(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
         diagonal=1)
 
-    # dispatch_scan.cuh Phase 1: pre-compute ALL chunk-local attention matrices
-    # outside the state loop. attn_i[c] only depends on q, k, decay_mask — NOT state.
-    # This is the CCCL "init kernel" pattern: compute everything possible
-    # before the sequential scan kernel that needs tile_state propagation.
-    num_chunks = total_len // chunk_size
-    attn_i_all = torch.empty(
-        batch, num_heads, num_chunks, chunk_size, chunk_size,
-        dtype=value.dtype, device=value.device)
-    for i in range(num_chunks):
-        attn_i_all[:, :, i] = (
-            _ix_matmul(query[:, :, i], key[:, :, i].transpose(-1, -2))
-            * decay_mask[:, :, i]
-        ).masked_fill_(mask_upper2, 0)
-
-    # State propagation — match xllm qwen3_gated_delta_net_base.cpp line 218-238
-    for i in range(num_chunks):
-        q_i = query[:, :, i]
-        k_i = key[:, :, i]
-        v_i = value[:, :, i]
-        v_prime = _ix_matmul(k_cumdecay[:, :, i], last_state)
+    for i in range(total_len // chunk_size):
+        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
+        attn_i = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask_upper2, 0)
+        v_prime = k_cumdecay[:, :, i] @ last_state
         v_new = v_i - v_prime
-        # attn_inter: q * exp(g) @ state — xllm line 228
-        attn_inter = _ix_matmul(q_i * g[:, :, i].unsqueeze(-1).exp(), last_state)
-        core_out[:, :, i] = attn_inter + _ix_matmul(attn_i_all[:, :, i], v_new)
-        # State update — xllm line 230-237: difference form for numerical stability
-        g_i_last = g[:, :, i, -1].unsqueeze(-1)          # (B, H, 1)
-        g_exp_term = (g_i_last - g[:, :, i]).exp().unsqueeze(-1)  # (B, H, C, 1)
-        k_g_exp = (k_i * g_exp_term).transpose(-1, -2).contiguous()
-        last_state = (last_state * g_i_last.unsqueeze(-1).exp()
-                      + _ix_matmul(k_g_exp, v_new))
+        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_state
+        core_out[:, :, i] = attn_inter + attn_i @ v_new
+        last_state = (
+            last_state * g[:, :, i, -1, None, None].exp()
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None])
+            .transpose(-1, -2) @ v_new
+        )
 
     if not output_final_state:
         last_state = None
@@ -459,25 +317,6 @@ class GatedDeltaNet(nn.Module):
         self.norm = Qwen3_5RMSNormGated(self.head_v_dim,
                                         eps=text_cfg.rms_norm_eps)
 
-        # CoreX dispatch: try to create fused GDN operator from base image
-        self._use_corex_gdn = False
-        if _corex_gdn_available and _corex_gdn_module is not None:
-            try:
-                self._corex_gdn_obj = _corex_gdn_module.CoreXGDN(
-                    num_v_heads=self.num_v_heads // tp_size,
-                    num_k_heads=self.num_k_heads // tp_size,
-                    head_k_dim=self.head_k_dim,
-                    head_v_dim=self.head_v_dim,
-                    conv_kernel_size=self.conv_kernel_size,
-                    layer_idx=layer_idx,
-                )
-                self._use_corex_gdn = True
-                logger.info("GatedDeltaNet layer %d: CoreX fused GDN enabled", layer_idx)
-            except Exception as e:
-                logger.warning(
-                    "GatedDeltaNet layer %d: CoreX GDN init failed (%s), using PyTorch",
-                    layer_idx, e)
-
     def _conv1d_weight_loader(self, param: torch.Tensor,
                               loaded_weight: torch.Tensor) -> None:
         # loaded_weight: (conv_dim=10240, 1, kernel) ordered as [q, k, v] channels
@@ -502,140 +341,6 @@ class GatedDeltaNet(nn.Module):
         conv_state: torch.Tensor,          # (batch, local_conv_dim, kernel-1)  in-place
         temporal_state: torch.Tensor,      # (batch, local_v_heads, k_dim, v_dim)  in-place
     ) -> torch.Tensor:
-        # CoreX dispatch: try fused GDN kernel first (CCCL env_dispatch pattern)
-        if self._use_corex_gdn:
-            try:
-                return self._corex_gdn_obj.forward(
-                    hidden_states, attn_metadata,
-                    conv_state, temporal_state,
-                    self.in_proj_qkv, self.in_proj_z,
-                    self.in_proj_b, self.in_proj_a,
-                    self.conv1d_weight, self.A_log, self.dt_bias,
-                    self.norm, self.out_proj,
-                )
-            except Exception as e:
-                if self.layer_idx == 0:
-                    logger.warning(
-                        "CoreX GDN forward failed (%s), falling back", e)
-                self._use_corex_gdn = False  # permanent fallback
-
-        # flash_qla SM70 DISABLED: produces inf on BI-V100 (abs mean=inf from real test)
-        # xllm uses equivalent PyTorch chunked path (qwen3_gated_delta_net_base.cpp)
-        # which works correctly in fp32. Keeping PyTorch path only.
-        #
-        # if _flash_qla_available and attn_metadata.num_prefill_tokens > 0:
-        #     try:
-        #         return self._flash_qla_prefill(...)
-
-        return self._pytorch_forward(
-            hidden_states, attn_metadata, conv_state, temporal_state)
-
-    def _flash_qla_prefill(
-        self,
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        conv_state: torch.Tensor,
-        temporal_state: torch.Tensor,
-    ) -> torch.Tensor:
-        """Prefill using FlashQLA SM70 fused CUDA kernel."""
-        tp_size = get_tensor_model_parallel_world_size()
-        local_key_dim = self.key_dim // tp_size
-        local_val_dim = self.value_dim // tp_size
-        local_num_v = self.num_v_heads // tp_size
-        local_num_k = self.num_k_heads // tp_size
-        local_conv_dim = self.conv_dim // tp_size
-
-        # Project all tokens
-        mixed_qkv_all, _ = self.in_proj_qkv(hidden_states)
-        z_all, _ = self.in_proj_z(hidden_states)
-        b_all, _ = self.in_proj_b(hidden_states)
-        a_all, _ = self.in_proj_a(hidden_states)
-
-        seq_starts = attn_metadata.query_start_loc.tolist()
-        outputs = []
-
-        for i in range(len(seq_starts) - 1):
-            s, e = seq_starts[i], seq_starts[i + 1]
-            L = e - s
-            if L == 0:
-                continue
-
-            mixed = mixed_qkv_all[s:e]  # (L, local_conv_dim)
-            z_seq = z_all[s:e]
-            b_seq = torch.sigmoid(b_all[s:e])  # (L, local_num_v)
-            dt = F.softplus(a_all[s:e] + self.dt_bias)  # (L, local_num_v)
-            gate = -dt * self.A_log.exp()  # (L, local_num_v) — decay
-
-            # Conv1d
-            conv_out = F.conv1d(
-                F.pad(mixed.unsqueeze(0).transpose(1, 2),
-                      (self.conv_kernel_size - 1, 0)),
-                self.conv1d_weight, groups=local_conv_dim
-            ).transpose(1, 2).squeeze(0)
-
-            # Split into q, k, v
-            qkv = conv_out.view(L, local_num_k + local_num_k + local_num_v,
-                                self.head_k_dim)
-            q_raw = qkv[:, :local_num_k, :]
-            k_raw = qkv[:, local_num_k:2*local_num_k, :]
-            v_raw = qkv[:, 2*local_num_k:, :local_val_dim // local_num_v]
-
-            # L2 normalize q, k
-            q = _l2norm(q_raw)
-            k = _l2norm(k_raw)
-
-            # Reshape to [1, L, H, D] for SM70 kernel
-            q_4d = q.unsqueeze(0)            # (1, L, Hk, K)
-            k_4d = k.unsqueeze(0)            # (1, L, Hk, K)
-            v_4d = v_raw.unsqueeze(0)        # (1, L, Hv, V)
-            g_3d = gate.unsqueeze(0)         # (1, L, Hv)
-            # Clamp gate to prevent exp() overflow in CUDA kernel.
-            # gate = -dt * A_log.exp(), typically negative (decay).
-            # But pathological weights can produce positive values → exp > 1
-            # → state grows exponentially over L tokens → inf.
-            # PyTorch ref clamps g ∈ [-5, 2] before cumsum.
-            # For recurrent kernel: clamp raw gate so exp(gate) ∈ [exp(-5), exp(2)]
-            g_3d = g_3d.clamp(-5.0, 2.0)
-            beta_3d = b_seq.unsqueeze(0)     # (1, L, Hv)
-
-            # Initial state from temporal_state
-            init_state = temporal_state[i:i+1]  # (1, Hv, K, V)
-
-            # Call SM70 fused kernel
-            output_4d, final_state = chunk_gated_delta_rule_fwd_sm70(
-                q_4d, k_4d, v_4d, g_3d, beta_3d,
-                scale=1.0,  # q already normalized
-                initial_state=init_state,
-                output_final_state=True,
-                gate_is_exp=False,
-            )
-
-            # Update temporal state
-            if final_state is not None:
-                temporal_state[i] = final_state[0]
-
-            # output_4d: (1, L, Hv, V) → (L, local_val_dim)
-            out_seq = output_4d.squeeze(0).reshape(L, local_val_dim)
-
-            # Apply gated RMSNorm + z gate
-            z_seq_heads = z_seq.view(L, local_num_v, self.head_v_dim)
-            out_heads = out_seq.view(L, local_num_v, self.head_v_dim)
-            normed = self.norm(out_heads, z_seq_heads)
-            normed_flat = normed.reshape(L, local_val_dim)
-
-            proj_out, _ = self.out_proj(normed_flat)
-            outputs.append(proj_out)
-
-        return torch.cat(outputs, dim=0)
-
-    def _pytorch_forward(
-        self,
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        conv_state: torch.Tensor,
-        temporal_state: torch.Tensor,
-    ) -> torch.Tensor:
-        """Pure-PyTorch GatedDeltaNet forward (fallback path)."""
         tp_size = get_tensor_model_parallel_world_size()
         local_key_dim = self.key_dim // tp_size
         local_val_dim = self.value_dim // tp_size
@@ -696,11 +401,8 @@ class GatedDeltaNet(nn.Module):
                 v = v.reshape(1, seq_len, local_num_v, self.head_v_dim)
 
                 beta = b_all[s:e].sigmoid().unsqueeze(0)  # (1, seq_len, local_num_v)
-                # CCCL overflow guard: clamp A_log before exp to prevent
-                # extreme decay rates that cause cumsum → exp → NaN chain
-                _A_safe = self.A_log.float().clamp(-8.0, 4.0)
-                g = (-_A_safe.exp()
-                     * F.softplus(a_all[s:e].float() + self.dt_bias).clamp(max=10.0)
+                g = (-self.A_log.float().exp()
+                     * F.softplus(a_all[s:e].float() + self.dt_bias)
                      ).unsqueeze(0)  # (1, seq_len, local_num_v)
 
                 # Expand k/q to match num_v_heads
@@ -712,7 +414,7 @@ class GatedDeltaNet(nn.Module):
                 # Full 18K: tensors [1,6,282,64,64]=220 MB each → ~990 MB/call.
                 # With _DNN_CHUNK=4096: [1,6,64,64,64]=6 MB each → ~137 MB/call.
                 # State is chained via initial_state / output_final_state.
-                _DNN_CHUNK = 2048
+                _DNN_CHUNK = 4096
                 cur_state = temporal_state[si:si + 1].clone()
                 core_out_parts = []
                 for sc_start in range(0, seq_len, _DNN_CHUNK):
@@ -736,9 +438,6 @@ class GatedDeltaNet(nn.Module):
                 # Gate + norm + output proj
                 z = z_all[s:e].reshape(seq_len, local_num_v, self.head_v_dim)
                 core_out = core_out.reshape(seq_len, local_num_v, self.head_v_dim)
-                # Force fp16 — ixformer matmul requires kHalf
-                core_out = core_out.to(torch.float16)
-                z = z.to(torch.float16)
                 normed = self.norm(
                     core_out.reshape(-1, self.head_v_dim),
                     z.reshape(-1, self.head_v_dim))
@@ -777,9 +476,8 @@ class GatedDeltaNet(nn.Module):
             v = v.reshape(num_seqs, 1, local_num_v, self.head_v_dim)
 
             beta = b_all.sigmoid().unsqueeze(1)  # (num_seqs, 1, local_num_v)
-            _A_safe = self.A_log.float().clamp(-8.0, 4.0)
-            g = (-_A_safe.exp()
-                 * F.softplus(a_all.float() + self.dt_bias).clamp(max=10.0)
+            g = (-self.A_log.float().exp()
+                 * F.softplus(a_all.float() + self.dt_bias)
                  ).unsqueeze(1)  # (num_seqs, 1, local_num_v)
 
             q = q.repeat_interleave(self.head_expand_ratio, dim=2)
@@ -796,7 +494,7 @@ class GatedDeltaNet(nn.Module):
             q_t = _l2norm(q.squeeze(1)).float() * _scale   # (B, H_v, k_dim)
             k_t = _l2norm(k.squeeze(1)).float()             # (B, H_v, k_dim)
             v_t = v.squeeze(1).float()                      # (B, H_v, v_dim)
-            g_t = g.squeeze(1).float().clamp_(-20.0, 2.0).exp_()  # (B, H_v) — clamp before exp
+            g_t = g.squeeze(1).float().exp_()               # (B, H_v)
             bt  = beta.squeeze(1).float()                   # (B, H_v)
 
             # Decay state in-place: (B, H_v, k_dim, v_dim) *= scalar per head
@@ -807,7 +505,7 @@ class GatedDeltaNet(nn.Module):
             BH = ts_flat.shape[0]
 
             # kv_mem = k_t @ temporal_state  shape: (B*H_v, 1, k_dim) @ (B*H_v, k_dim, v_dim)
-            kv_mem = _ix_bmm(
+            kv_mem = torch.bmm(
                 k_t.view(BH, 1, self.head_k_dim), ts_flat
             ).view(num_seqs, local_num_v, self.head_v_dim)  # (B, H_v, v_dim)
 
@@ -818,11 +516,9 @@ class GatedDeltaNet(nn.Module):
                 k_t.view(BH, self.head_k_dim, 1),
                 delta.view(BH, 1, self.head_v_dim),
             )
-            # Clamp state to prevent gradual drift → NaN over long sequences
-            temporal_state.clamp_(-65504.0, 65504.0)
 
             # Output: core_out = q_t @ updated temporal_state
-            core_out = _ix_bmm(
+            core_out = torch.bmm(
                 q_t.view(BH, 1, self.head_k_dim), ts_flat
             ).view(num_seqs, local_num_v, self.head_v_dim).to(orig_dtype)
             # core_out: (B, H_v, v_dim) = (num_seqs, local_num_v, head_v_dim) already
@@ -1028,10 +724,16 @@ class Qwen3_5MLP(nn.Module):
 class Qwen3_5MoeSparseBlock(nn.Module):
     """Replaces Qwen3_5MLP for qwen3_5_moe_text layers.
 
-    FusedMoE is used ONLY for weight storage and loading (create_weights /
-    weight_loader are pure PyTorch).  Its forward kernel is bypassed because
-    ixformer on BI-V100 lacks vllm_moe_topk_softmax / vllm_invoke_fused_moe_kernel.
-    Routing and expert computation use a pure-PyTorch loop instead.
+    FusedMoE stores expert weights and provides native ixformer forward kernel.
+    Forward tries the native fused kernel first (one CUDA launch for all experts),
+    falling back to _pure_pytorch_experts if the native kernel fails on BI-V100.
+
+    CCCL architecture insight (dispatch_reduce_by_key.cuh):
+    The native fused_moe_kernel implements the same pattern as CCCL's
+    DeviceReduceByKey — sort tokens by expert_id, pad to block boundary
+    (moe_align_block_size), then one kernel processes all expert-token pairs
+    with block-level parallelism. This is the architecturally correct approach
+    vs the fallback's Python for-loop over experts.
 
     Shared expert uses RowParallelLinear(reduce_results=False) so both paths
     produce partial (pre-all-reduce) outputs that are combined before a single
@@ -1079,80 +781,27 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         self.shared_expert_gate = ReplicatedLinear(
             hidden_size, 1, bias=False, quant_config=quant_config)
 
-        # CoreX dispatch: try to use fused MoE kernels from base image
-        self._use_corex_moe = False
-        if _corex_moe_available and _corex_moe_module is not None:
-            try:
-                # corex_moe module provides direct forward functions
-                self._corex_moe_forward = getattr(
-                    _corex_moe_module, 'moe_forward', None)
-                if self._corex_moe_forward is not None:
-                    self._use_corex_moe = True
-                    logger.info("MoE: CoreX fused MoE forward available")
-                else:
-                    logger.warning("MoE: corex_moe has no moe_forward, using PyTorch")
-            except Exception as e:
-                logger.warning("MoE: CoreX MoE init failed (%s), using PyTorch", e)
-
     def _pure_pytorch_experts(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
-        """MoE expert computation with tiered dispatch.
-
-        Dispatch order:
-          Tier 0: ix_fused_moe_forward — full C++ pipeline (7 kernel launches)
-          Tier 1: EX Engine CUB topk kernel + PyTorch GEMM
-          Tier 2: ix_bridge topk_softmax + PyTorch GEMM
-          Tier 3: Pure PyTorch (torch.softmax + torch.topk + for-loop)
+        """Pure-PyTorch MoE (ixformer has no MoE kernels on BI-V100).
 
         w13_weight: (num_experts, 2*inter_per_partition, hidden)  [TP-sharded]
         w2_weight:  (num_experts, hidden,  inter_per_partition)   [TP-sharded]
-        Output is partial (pre-all-reduce), same contract as FusedMoE.
+        Output is partial (pre-all-reduce), same contract as FusedMoE
+        with reduce_results=False.
         """
+        # Routing: softmax → topk → renormalise
+        routing_weights = torch.softmax(router_logits.float(), dim=-1)
+        topk_weights, topk_ids = torch.topk(
+            routing_weights, self.top_k, dim=-1)           # (T, top_k)
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights.to(hidden_states.dtype)
+
         w13 = self.experts.w13_weight  # (E, 2*I, H)
         w2  = self.experts.w2_weight   # (E, H, I)
-
-        # Tier 0: Full fused MoE pipeline via ixformer C++
-        # 7 kernel launches vs 3*E in Python loop
-        if _ix_fused_moe_forward is not None and _ix_bridge_available:
-            try:
-                return _ix_fused_moe_forward(
-                    hidden_states, router_logits,
-                    w13, w2,
-                    self.top_k, self.num_experts,
-                    renormalize=True,
-                )
-            except Exception as e:
-                if not getattr(self, '_ix_fused_warned', False):
-                    logger.warning("ix_fused_moe_forward failed (%s), falling back to tiered dispatch", e)
-                    self._ix_fused_warned = True
-
-        # Routing: fused topk+softmax dispatch chain
-        # Tier 1: EX Engine CUB kernel → Tier 2: ix_bridge → Tier 3: PyTorch
-        if _ex_moe_topk_available:
-            T_tok = router_logits.shape[0]
-            topk_weights = torch.empty(T_tok, self.top_k, dtype=torch.float32,
-                                       device=router_logits.device)
-            topk_ids = torch.empty(T_tok, self.top_k, dtype=torch.int32,
-                                   device=router_logits.device)
-            token_expert_indices = torch.empty(T_tok, self.top_k, dtype=torch.int32,
-                                               device=router_logits.device)
-            _ex_moe_topk_softmax(topk_weights, topk_ids, token_expert_indices,
-                                 router_logits.float(), True)
-            topk_ids = topk_ids.to(torch.long)
-            topk_weights = topk_weights.to(hidden_states.dtype)
-        elif _ix_bridge_available:
-            topk_weights, topk_ids = _ix_topk_softmax(
-                router_logits, self.top_k, renormalize=True)
-            topk_weights = topk_weights.to(hidden_states.dtype)
-        else:
-            routing_weights = _ix_softmax(router_logits.float(), dim=-1)
-            topk_weights, topk_ids = torch.topk(
-                routing_weights, self.top_k, dim=-1)           # (T, top_k)
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-            topk_weights = topk_weights.to(hidden_states.dtype)
 
         T = hidden_states.shape[0]
         if T == 1:
@@ -1177,48 +826,101 @@ class Qwen3_5MoeSparseBlock(nn.Module):
             act = F.silu(gate) * up                            # (K, I)
 
             # bmm: (K,H,I) @ (K,I,1) → (K,H,1) → (K,H)
-            expert_out = _ix_bmm(w2_sel, act.unsqueeze(-1)).squeeze(-1)  # (K, H)
+            expert_out = torch.bmm(w2_sel, act.unsqueeze(-1)).squeeze(-1)  # (K, H)
 
             out = (expert_out * ws.unsqueeze(-1)).sum(0, keepdim=True).to(
                 hidden_states.dtype)                           # (1, H)
         else:
-            # General path (prefill / multi-seq): loop over unique active experts.
-            # At most T*top_k unique experts, always <= num_experts.
+            # General path (prefill / multi-seq): CCCL histogram sort+reduce pattern.
+            #
+            # CCCL insight (thrust/examples/histogram.cu sparse_histogram):
+            #   sort data → reduce_by_key over contiguous segments.
+            # Applied to MoE: sort (token, expert) pairs by expert_id so all tokens
+            # routed to the same expert are contiguous, then process each expert's
+            # batch with a single F.linear call.
+            #
+            # Previous code: for-loop over unique experts, each with F.linear.
+            #   With 256 experts × top_k=8 ≈ up to 256 active experts → 512 F.linear calls.
+            # New code: sort + segment → same number of F.linear calls but with
+            #   contiguous token batches (better GPU occupancy) + no Python dict lookup.
+            #
+            # Further optimization: group experts by similar token count and pad
+            # to enable batched GEMM across expert groups (CCCL segmented_reduce pattern).
+            # TODO: implement when we have benchmark data showing this path is hot.
+
             out = torch.zeros_like(hidden_states)
-            unique_eids = topk_ids.view(-1).unique().tolist()
-            for eid in unique_eids:
-                eid = int(eid)
-                mask = (topk_ids == eid)                       # (T, top_k)
-                tok_ids, topk_pos = mask.nonzero(as_tuple=True)
-                tokens = hidden_states[tok_ids]                # (n, H)
+
+            # Flatten all (token, expert) assignments: (T*top_k,) pairs
+            flat_eids = topk_ids.view(-1)                      # (T*K,)
+            flat_tok_ids = torch.arange(T, device=hidden_states.device).unsqueeze(1) \
+                                .expand(-1, self.top_k).reshape(-1)  # (T*K,)
+            flat_topk_pos = torch.arange(self.top_k, device=hidden_states.device) \
+                                  .unsqueeze(0).expand(T, -1).reshape(-1)  # (T*K,)
+
+            # Sort by expert_id — CCCL histogram pattern: sort brings equal keys together
+            sort_idx = flat_eids.argsort(stable=True)
+            sorted_eids = flat_eids[sort_idx]
+            sorted_tok_ids = flat_tok_ids[sort_idx]
+            sorted_topk_pos = flat_topk_pos[sort_idx]
+
+            # Find segment boundaries — CCCL reduce_by_key: identify contiguous runs
+            # This replaces the unique().tolist() + per-expert mask.nonzero() pattern
+            changes = torch.cat([
+                torch.tensor([True], device=sorted_eids.device),
+                sorted_eids[1:] != sorted_eids[:-1],
+            ])
+            seg_starts = changes.nonzero(as_tuple=True)[0]
+            seg_ends = torch.cat([seg_starts[1:],
+                                  torch.tensor([len(sorted_eids)], device=seg_starts.device)])
+            seg_eids = sorted_eids[seg_starts]
+
+            # Process each expert segment (contiguous tokens → single F.linear)
+            for seg_i in range(len(seg_starts)):
+                s, e = int(seg_starts[seg_i]), int(seg_ends[seg_i])
+                eid = int(seg_eids[seg_i])
+                tok_ids_seg = sorted_tok_ids[s:e]
+                topk_pos_seg = sorted_topk_pos[s:e]
+
+                tokens = hidden_states[tok_ids_seg]            # (n, H) — contiguous gather
                 gate_up = F.linear(tokens, w13[eid])           # (n, 2*I)
                 gate, up = gate_up.chunk(2, dim=-1)
                 act = F.silu(gate) * up                        # (n, I)
                 expert_out = F.linear(act, w2[eid])            # (n, H)
-                weights = topk_weights[tok_ids, topk_pos].unsqueeze(-1)
-                out.index_add_(0, tok_ids, (expert_out * weights).to(out.dtype))
+                weights = topk_weights[tok_ids_seg, topk_pos_seg].unsqueeze(-1)
+                out.index_add_(0, tok_ids_seg, (expert_out * weights).to(out.dtype))
 
         return out  # partial, all-reduce done in forward()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         router_logits, _ = self.gate(hidden_states)
 
-        # CoreX dispatch: try fused MoE kernel first
-        if self._use_corex_moe:
+        # Try native FusedMoE path first (ixformer kernel).
+        # CCCL dispatch_reduce_by_key.cuh insight: the native fused kernel does
+        # sort-by-expert + block-aligned GEMM in one launch — architecturally
+        # identical to CCCL's AgentReduceByKey::ConsumeRange.
+        # One fused kernel vs our _pure_pytorch_experts' 256× F.linear calls.
+        #
+        # _custom_ops.py confirms ixformer HAS these ops:
+        #   ixf_F.vllm_moe_topk_softmax
+        #   ixf_F.vllm_moe_align_block_size
+        #   ixf_F.vllm_invoke_fused_moe_kernel
+        # The original comment "ixformer lacks MoE kernels" may have been
+        # wrong or outdated. Try native first, catch and fallback if it fails.
+        if not hasattr(self, '_use_native_moe'):
+            self._use_native_moe = True  # optimistic: try native first
+
+        if self._use_native_moe:
             try:
-                routed_out = self._corex_moe_forward(
-                    hidden_states, router_logits,
-                    self.experts.w13_weight, self.experts.w2_weight,
-                    w3=None, topk=self.top_k,
-                )
+                routed_out = self.experts(hidden_states, router_logits)
             except Exception as e:
-                # NO FALLBACK — crash with error log so we can diagnose
-                logger.error("CoreX MoE forward FAILED: %s", e)
-                raise RuntimeError(
-                    f"corex_moe.moe_forward failed: {e}. "
-                    f"Shapes: hidden={hidden_states.shape}, router={router_logits.shape}, "
-                    f"w13={self.experts.w13_weight.shape}, w2={self.experts.w2_weight.shape}"
-                ) from e
+                # Native kernel failed — disable permanently for this instance
+                # and fallback to pure PyTorch for all subsequent calls.
+                logger.warning(
+                    "FusedMoE native kernel failed (%s: %s), "
+                    "falling back to pure PyTorch experts permanently.",
+                    type(e).__name__, e)
+                self._use_native_moe = False
+                routed_out = self._pure_pytorch_experts(hidden_states, router_logits)
         else:
             routed_out = self._pure_pytorch_experts(hidden_states, router_logits)
 

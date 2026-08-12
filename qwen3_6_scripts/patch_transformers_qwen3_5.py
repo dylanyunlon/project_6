@@ -12,16 +12,7 @@ Target: pip-installed transformers at /usr/local/lib/python3.10/site-packages/tr
 
 import sys
 
-TRANSFORMERS_ROOT = None
-for _p in ["/usr/local/lib/python3.10/site-packages/transformers",
-           "/usr/local/corex/lib/python3/dist-packages/transformers",
-           "/usr/local/corex/lib64/python3/dist-packages/transformers"]:
-    import os
-    if os.path.isdir(_p):
-        TRANSFORMERS_ROOT = _p
-        break
-if TRANSFORMERS_ROOT is None:
-    TRANSFORMERS_ROOT = "/usr/local/lib/python3.10/site-packages/transformers"
+TRANSFORMERS_ROOT = "/usr/local/lib/python3.10/site-packages/transformers"
 AUTO_CONFIG = f"{TRANSFORMERS_ROOT}/models/auto/configuration_auto.py"
 MODELS_INIT = f"{TRANSFORMERS_ROOT}/models/__init__.py"
 
