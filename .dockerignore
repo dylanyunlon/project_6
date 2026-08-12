@@ -18,3 +18,4 @@ __pycache__/
 debug_*.py
 verify_*.py
 # Keep: qwen3_6_scripts/, computility-run.yaml, Dockerfile, ex_engine/
+ex_engine/
