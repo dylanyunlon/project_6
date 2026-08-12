@@ -974,73 +974,14 @@ def invoke_fused_moe_kernel(
 _moe_topk_ext = None
 _moe_topk_init_done = False
 
-_ix_bridge_mod = None
-_ix_bridge_init_done = False
-
-def _init_ix_bridge():
-    """Try to load ix_bridge which calls ixformer::infer::topk_softmax() via C++ pybind."""
-    global _ix_bridge_mod, _ix_bridge_init_done
-    _ix_bridge_init_done = True
-    try:
-        from ex_engine.python.ix_bridge import is_available, topk_softmax as _ix_ts
-        if is_available():
-            _ix_bridge_mod = True
-            logger.info("topk_softmax: ix_bridge → ixformer::infer::topk_softmax() LOADED")
-            return
-    except Exception as e:
-        logger.info("topk_softmax: ix_bridge unavailable (%s)", e)
-    # Also try direct import from workspace
-    try:
-        import sys
-        for p in ['/workspace/ex_engine/python', '/workspace/ex_engine',
-                  '/usr/local/corex/lib/python3/dist-packages/ex_engine/python']:
-            if p not in sys.path:
-                sys.path.insert(0, p)
-        from ix_bridge import is_available, topk_softmax as _ix_ts
-        if is_available():
-            _ix_bridge_mod = True
-            logger.info("topk_softmax: ix_bridge (direct) → ixformer::infer LOADED")
-            return
-    except Exception as e:
-        logger.info("topk_softmax: ix_bridge direct import failed (%s)", e)
-
-
 def _init_moe_topk():
     global _moe_topk_ext, _moe_topk_init_done
     _moe_topk_init_done = True
-    # 0. Try _moe_C (CUB-based, proven on BI-V100 real hardware 2026-08-11)
-    try:
-        import _moe_C as ext
-        if hasattr(ext, 'topk_softmax'):
-            _moe_topk_ext = ext
-            logger.info("topk_softmax: loaded _moe_C (CUB BlockReduce, WARP_SIZE=64)")
-            return
-    except ImportError:
-        pass
-    # 0b. Try loading from torch cache
-    import glob as _glob
-    for pattern in [
-        "/root/.cache/torch_extensions/py310_cu102/_moe_C/_moe_C.so",
-        "/root/.cache/torch_extensions/*/_moe_C/*.so",
-    ]:
-        for so_path in _glob.glob(pattern):
-            try:
-                torch.ops.load_library(so_path)
-                import _moe_C as ext
-                _moe_topk_ext = ext
-                logger.info("topk_softmax: loaded _moe_C from %s", so_path)
-                return
-            except Exception:
-                pass
-    # 0c. Try ix_bridge (calls ixformer C++ SDK if available)
-    _init_ix_bridge()
-    if _ix_bridge_mod:
-        return
-    # 1. Try import old precompiled module (torch cache from Docker build)
+    # 1. Try import precompiled module (torch cache from Docker build)
     try:
         import moe_topk_softmax_v3 as ext
         _moe_topk_ext = ext
-        logger.info("topk_softmax: loaded precompiled moe_topk_softmax_v3")
+        logger.info("topk_softmax: loaded precompiled CUDA kernel")
         return
     except ImportError:
         pass
@@ -1054,11 +995,9 @@ def _init_moe_topk():
     for pattern in so_patterns:
         for so_path in glob.glob(pattern):
             try:
-                import importlib.util
-                spec = importlib.util.spec_from_file_location(
-                    "moe_topk_softmax_v3", so_path)
-                ext = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(ext)
+                torch.ops.load_library(so_path)
+                # After load_library, the pybind module should be importable
+                import moe_topk_softmax_v3 as ext
                 _moe_topk_ext = ext
                 logger.info("topk_softmax: loaded CUDA kernel from %s", so_path)
                 return
@@ -1099,47 +1038,15 @@ def topk_softmax(topk_weights: torch.Tensor, topk_ids: torch.Tensor,
     if not _moe_topk_init_done:
         _init_moe_topk()
 
-    # Priority 0: ix_bridge → ixformer::infer::topk_softmax() (fastest, uses SDK)
-    if _ix_bridge_mod:
-        try:
-            from ex_engine.python.ix_bridge import topk_softmax as _ix_topk
-            gating = gating_output if isinstance(gating_output, torch.Tensor) else gating_output
-            topk_k = topk_weights.shape[1]
-            weights, ids = _ix_topk(gating, topk_k, renormalize=False)
-            topk_weights.copy_(weights.to(topk_weights.dtype))
-            topk_ids.copy_(ids.to(topk_ids.dtype))
-            # token_expert_indicies not produced by ix_bridge, fill with topk_ids
-            token_expert_indicies.copy_(ids.to(token_expert_indicies.dtype))
-            return
-        except Exception as e:
-            logger.warning("topk_softmax ix_bridge failed (%s), trying CUDA kernel", e)
-
-    # Priority 1: ex_factor_0.so → CCCL warp-shuffle topk kernel (compiled for BI-V100)
-    try:
-        from ex_engine.python.ex_topk_bridge import ex_topk_softmax as _ex_topk
-        gating = gating_output if isinstance(gating_output, torch.Tensor) else gating_output
-        _ex_topk(topk_weights, topk_ids, token_expert_indicies, gating.float())
-        return
-    except Exception as e:
-        if not getattr(topk_softmax, '_ex_warned', False):
-            logger.warning("ex_factor_0 topk failed (%s), trying _moe_C", e)
-            topk_softmax._ex_warned = True
-
-    # Priority 2: CUDA kernel (_moe_C or moe_topk_softmax_v3)
+    # Priority 1: Our CUDA kernel (fused warp-shuffle, ~5x faster than PyTorch)
     if _moe_topk_ext is not None:
         try:
             gating = gating_output if isinstance(gating_output, torch.Tensor) else gating_output
-            if hasattr(_moe_topk_ext, 'topk_softmax'):
-                # _moe_C style: in-place (vllm standard API)
-                _moe_topk_ext.topk_softmax(topk_weights, topk_ids,
-                                           token_expert_indicies, gating.float())
-            elif hasattr(_moe_topk_ext, 'moe_topk_softmax'):
-                # old v3 style: returns tuple
-                topk_k = topk_weights.shape[1]
-                results = _moe_topk_ext.moe_topk_softmax(gating, topk_k, False)
-                topk_weights.copy_(results[0].to(topk_weights.dtype))
-                topk_ids.copy_(results[1].to(topk_ids.dtype))
-                token_expert_indicies.copy_(results[2].to(token_expert_indicies.dtype))
+            topk_k = topk_weights.shape[1]
+            results = _moe_topk_ext.moe_topk_softmax(gating, topk_k, False)
+            topk_weights.copy_(results[0].to(topk_weights.dtype))
+            topk_ids.copy_(results[1].to(topk_ids.dtype))
+            token_expert_indicies.copy_(results[2].to(token_expert_indicies.dtype))
             return
         except Exception as e:
             logger.warning("topk_softmax CUDA kernel failed (%s), falling back to PyTorch", e)

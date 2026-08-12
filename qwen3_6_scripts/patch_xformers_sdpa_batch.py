@@ -28,9 +28,10 @@ Deploy:
   python3 modified_scripts/patch_xformers_sdpa_batch.py
 """
 
-from patch_utils import package_root, replace_once
-
-XFORMERS_PATH = package_root("vllm") / "attention" / "backends" / "xformers.py"
+XFORMERS_PATH = (
+    "/usr/local/corex/lib64/python3/dist-packages/"
+    "vllm/attention/backends/xformers.py"
+)
 
 FALLBACK_METHOD = '''
     def _run_sdpa_fallback(
@@ -152,18 +153,32 @@ INJECT_ANCHOR = "    def _run_memory_efficient_xformers_forward("
 
 
 def patch_file(path):
-    replace_once(
-        path,
-        INJECT_ANCHOR,
-        FALLBACK_METHOD + INJECT_ANCHOR,
-        required=True,
-        already_contains="def _run_sdpa_fallback(")
-    replace_once(
-        path,
-        OLD_XFORMER_BLOCK,
-        NEW_XFORMER_BLOCK,
-        required=True,
-        already_contains="out = self._run_sdpa_fallback(query, key, value, attn_metadata)")
+    with open(path, "r") as f:
+        content = f.read()
+    changed = False
+
+    if "_run_sdpa_fallback" in content:
+        print("  [skip] _run_sdpa_fallback already present")
+    elif INJECT_ANCHOR not in content:
+        print("  [warn] inject anchor not found")
+    else:
+        content = content.replace(INJECT_ANCHOR, FALLBACK_METHOD + INJECT_ANCHOR, 1)
+        print("  [ok]   injected _run_sdpa_fallback (batch, pure-math)")
+        changed = True
+
+    if NEW_XFORMER_BLOCK in content:
+        print("  [skip] dispatch block already patched")
+    elif OLD_XFORMER_BLOCK in content:
+        content = content.replace(OLD_XFORMER_BLOCK, NEW_XFORMER_BLOCK, 1)
+        print("  [ok]   patched dispatch block")
+        changed = True
+    else:
+        print("  [warn] dispatch block anchor not found")
+
+    if changed:
+        with open(path, "w") as f:
+            f.write(content)
+        print(f"  Written: {path}")
 
 
 def main():
