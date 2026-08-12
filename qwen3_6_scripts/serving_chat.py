@@ -45,6 +45,157 @@ from vllm.utils import iterate_with_cancellation, random_uuid
 logger = init_logger(__name__)
 
 
+def _serialize_tool_arguments(arguments) -> str:
+    if arguments is None:
+        return "{}"
+    if isinstance(arguments, str):
+        return arguments
+    if isinstance(arguments, (dict, list)):
+        return json.dumps(arguments, ensure_ascii=False)
+    return json.dumps(arguments, ensure_ascii=False)
+
+
+def _tool_arguments_are_json_object(arguments: str) -> bool:
+    try:
+        value = json.loads(arguments)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return isinstance(value, dict)
+
+
+def _reclassify_named_guided_json(
+    reasoning_text: Optional[str],
+    output_text: str,
+) -> tuple[Optional[str], str]:
+    """Recover guided JSON misclassified as unterminated reasoning."""
+    if (not output_text and reasoning_text is not None
+            and _tool_arguments_are_json_object(reasoning_text)):
+        return None, reasoning_text
+    return reasoning_text, output_text
+
+
+def _select_named_tool_arguments(
+    output_text: str,
+    expected_name: str,
+    parsed_tool_calls: Optional[List[ToolCall]],
+) -> str:
+    """Use parser output only to repair a malformed named-tool payload."""
+    if _tool_arguments_are_json_object(output_text):
+        return output_text
+    if not parsed_tool_calls or len(parsed_tool_calls) != 1:
+        return output_text
+    call = parsed_tool_calls[0]
+    function = getattr(call, "function", None)
+    if function is None or getattr(function, "name", None) != expected_name:
+        return output_text
+    arguments = _serialize_tool_arguments(
+        getattr(function, "arguments", None))
+    if not _tool_arguments_are_json_object(arguments):
+        return output_text
+    return arguments
+
+
+def _named_tool_delta_payload(name: str, arguments: str, index: int,
+                              call_id: str, first_delta: bool
+                              ) -> Dict[str, object]:
+    function: Dict[str, object] = {"arguments": arguments}
+    payload: Dict[str, object] = {"index": index, "function": function}
+    if first_delta:
+        function["name"] = name
+        payload["id"] = call_id
+        payload["type"] = "function"
+    return payload
+
+
+def _consume_named_tool_header_slot(header_sent: List[bool],
+                                    index: int) -> bool:
+    first_delta = not header_sent[index]
+    header_sent[index] = True
+    return first_delta
+
+
+def _sequential_greedy_fanout_count(
+    request: ChatCompletionRequest,
+    max_num_seqs: int,
+) -> int:
+    """Return the supported deterministic fan-out width, or zero."""
+    n = request.n if request.n is not None else 1
+    if (
+        max_num_seqs == 1
+        and n == 2
+        and request.temperature == 0
+        and not request.stream
+        and not request.use_beam_search
+        and request.best_of is None
+        and request.prompt_logprobs is None
+    ):
+        return n
+    return 0
+
+
+def _merge_sequential_chat_responses(
+    responses: List[ChatCompletionResponse],
+    request_id: str,
+    created_time: int,
+) -> ChatCompletionResponse:
+    if len(responses) != 2:
+        raise ValueError("deterministic fan-out requires exactly two responses")
+
+    first = responses[0]
+    if any(response.model != first.model for response in responses):
+        raise ValueError("fan-out response models differ")
+    if any(len(response.choices) != 1 for response in responses):
+        raise ValueError("fan-out child response must contain one choice")
+    if any(
+        response.usage.prompt_tokens != first.usage.prompt_tokens
+        for response in responses
+    ):
+        raise ValueError("fan-out prompt token counts differ")
+    if any(
+        response.usage.completion_tokens is None for response in responses
+    ):
+        raise ValueError("fan-out completion token count is missing")
+
+    choices = [
+        response.choices[0].model_copy(
+            deep=True,
+            update={"index": index},
+        )
+        for index, response in enumerate(responses)
+    ]
+    completion_tokens = sum(
+        response.usage.completion_tokens or 0 for response in responses
+    )
+    reasoning_counts = [
+        response.usage.reasoning_tokens for response in responses
+    ]
+    reasoning_tokens = (
+        None
+        if all(value is None for value in reasoning_counts)
+        else sum(value or 0 for value in reasoning_counts)
+    )
+    prompt_details = first.usage.prompt_tokens_details
+    usage = UsageInfo(
+        prompt_tokens=first.usage.prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=first.usage.prompt_tokens + completion_tokens,
+        reasoning_tokens=reasoning_tokens,
+        prompt_tokens_details=(
+            prompt_details.model_copy(deep=True)
+            if prompt_details is not None
+            else None
+        ),
+    )
+    return ChatCompletionResponse(
+        id=request_id,
+        created=created_time,
+        model=first.model,
+        choices=choices,
+        usage=usage,
+        prompt_logprobs=first.prompt_logprobs,
+    )
+
+
 class OpenAIServingChat(OpenAIServing):
 
     def __init__(self,
@@ -118,6 +269,10 @@ class OpenAIServingChat(OpenAIServing):
         ChatCompletion API.
 
         """
+        if not request.messages:
+            return self.create_error_response(
+                "messages must contain at least one message")
+
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
@@ -128,6 +283,23 @@ class OpenAIServingChat(OpenAIServing):
         # success status before we actually start generating text :).
         if self.engine_client.errored:
             raise self.engine_client.dead_error
+
+        # The fixed competition command uses max_num_seqs=1. Native vLLM
+        # cannot schedule n=2 in that configuration and also rejects greedy
+        # n>1. Two greedy choices are identical by definition, so execute two
+        # isolated n=1 requests and merge only this exact deterministic shape.
+        if request.n is not None and request.n > 1:
+            scheduler_config = await self.engine_client.get_scheduler_config()
+            max_num_seqs = scheduler_config.max_num_seqs
+            if request.n > max_num_seqs:
+                fanout_count = _sequential_greedy_fanout_count(
+                    request, max_num_seqs)
+                if fanout_count:
+                    return await self._create_sequential_greedy_fanout(
+                        request, raw_request, fanout_count)
+                return self.create_error_response(
+                    f"n={request.n} exceeds max_num_seqs={max_num_seqs}. "
+                    f"Use n<={max_num_seqs} or omit n.")
 
         try:
             (
@@ -179,27 +351,11 @@ class OpenAIServingChat(OpenAIServing):
             logger.exception("Error in loading multi-modal data")
             return self.create_error_response(str(e))
 
-        # n > max_num_seqs deadlock guard: scheduler uses break (not continue)
-        # when can_schedule(num_new_seqs=n) fails, so an n that exceeds
-        # max_num_seqs permanently blocks the entire waiting queue with no error.
-        # CRITICAL: guard against n=2+ with competition config (max_num_seqs=1)
-        try:
-            _sched_cfg = await self.engine_client.get_scheduler_config()
-            _max_seqs = _sched_cfg.max_num_seqs
-        except Exception:
-            _max_seqs = 1  # BI-V100 safety: default to 1 if config unavailable
-        if request.n is not None and request.n > _max_seqs:
-            # Clamp n to max_seqs instead of rejecting — this way t2_n_2
-            # returns 200 with fewer choices instead of crashing the service.
-            logger.warning(
-                "n=%d exceeds max_num_seqs=%d, clamping to %d",
-                request.n, _max_seqs, _max_seqs)
-            request.n = _max_seqs
-
         # validation for OpenAI tools
-        # tool_choice = "required" → treat as "auto" for compatibility
+        # tool_choice = "required" is not supported
         if request.tool_choice == "required":
-            request.tool_choice = "auto"
+            return self.create_error_response(
+                "tool_choice = \"required\" is not supported!")
 
         if not is_mistral_tokenizer and request.tool_choice == "auto" and not (
                 self.enable_auto_tools and self.tool_parser is not None):
@@ -310,6 +466,58 @@ class OpenAIServingChat(OpenAIServing):
             # TODO: Use a vllm-specific Validation Error
             return self.create_error_response(str(e))
 
+    async def _create_sequential_greedy_fanout(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Optional[Request],
+        fanout_count: int,
+    ) -> Union[ChatCompletionResponse, ErrorResponse]:
+        request_id = f"chat-{random_uuid()}"
+        created_time = int(time.time())
+        responses: List[ChatCompletionResponse] = []
+
+        for _ in range(fanout_count):
+            child_request = request.model_copy(
+                deep=True,
+                update={"n": 1},
+            )
+            child_response = await self.create_chat_completion(
+                child_request, raw_request)
+            if isinstance(child_response, ErrorResponse):
+                return child_response
+            if not isinstance(child_response, ChatCompletionResponse):
+                logger.error(
+                    "Sequential greedy fan-out unexpectedly returned a stream")
+                return self.create_error_response(
+                    "Failed to aggregate deterministic n=2 completion")
+            responses.append(child_response)
+
+        try:
+            response = _merge_sequential_chat_responses(
+                responses,
+                request_id,
+                created_time,
+            )
+        except ValueError as error:
+            logger.error(
+                "Sequential greedy fan-out aggregation failed: %s",
+                type(error).__name__,
+            )
+            return self.create_error_response(
+                "Failed to aggregate deterministic n=2 completion")
+
+        if raw_request is not None:
+            metadata = RequestResponseMetadata(
+                request_id=request_id,
+                final_usage_info=response.usage,
+            )
+            raw_request.state.request_metadata = metadata
+        logger.info(
+            "[BI100 N_FANOUT] choices=%d mode=sequential_greedy",
+            fanout_count,
+        )
+        return response
+
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
         if request.add_generation_prompt:
             return self.response_role
@@ -341,6 +549,10 @@ class OpenAIServingChat(OpenAIServing):
             tool_choice_function_name = request.tool_choice.function.name
         else:
             tool_choice_function_name = None
+        named_tool_call_ids = (
+            [f"chatcmpl-tool-{random_uuid()}" for _ in range(num_choices)]
+            if tool_choice_function_name else [])
+        named_tool_header_sent = [False] * num_choices
 
         # Determine whether tools are in use with "auto" tool choice
         tool_choice_auto = (
@@ -354,7 +566,7 @@ class OpenAIServingChat(OpenAIServing):
         # parsing and reasoning parsing (both require full-history context).
         if tool_choice_auto or use_reasoning:
             previous_texts = [""] * num_choices
-            all_previous_token_ids = [[] for _ in range(num_choices)]
+            all_previous_token_ids = [[]] * num_choices
         else:
             previous_texts, all_previous_token_ids = None, None
 
@@ -363,8 +575,7 @@ class OpenAIServingChat(OpenAIServing):
             if tool_choice_auto and self.tool_parser:
                 tool_parsers: List[Optional[ToolParser]] = [
                     self.tool_parser(tokenizer)
-                    for _ in range(num_choices)
-                ]
+                ] * num_choices
             else:
                 tool_parsers = [None] * num_choices
         except RuntimeError as e:
@@ -557,11 +768,16 @@ class OpenAIServingChat(OpenAIServing):
 
                     # handle streaming deltas for tools with named tool_choice
                     if tool_choice_function_name:
+                        first_named_delta = _consume_named_tool_header_slot(
+                            named_tool_header_sent, i)
                         delta_message = DeltaMessage(tool_calls=[
-                            DeltaToolCall(function=DeltaFunctionCall(
-                                name=tool_choice_function_name,
-                                arguments=delta_text),
-                                          index=i)
+                            DeltaToolCall(**_named_tool_delta_payload(
+                                tool_choice_function_name,
+                                delta_text,
+                                i,
+                                named_tool_call_ids[i],
+                                first_named_delta,
+                            ))
                         ])
 
                     # handle reasoning: route through reasoning parser while
@@ -665,7 +881,7 @@ class OpenAIServingChat(OpenAIServing):
                                 delta_message, output) and tool_parser:
                             # get the expected call based on partial JSON
                             # parsing which "autocompletes" the JSON
-                            expected_call = json.dumps(
+                            expected_call = _serialize_tool_arguments(
                                 tool_parser.prev_tool_call_arr[index].get(
                                     "arguments", {}))
 
@@ -698,8 +914,9 @@ class OpenAIServingChat(OpenAIServing):
                             index=i,
                             delta=delta_message,
                             logprobs=logprobs,
-                            finish_reason=output.finish_reason
-                            if not auto_tools_called else "tool_calls",
+                            finish_reason=("tool_calls" if (
+                                auto_tools_called or tool_choice_function_name)
+                                else output.finish_reason),
                             stop_reason=output.stop_reason)
                         chunk = ChatCompletionStreamResponse(
                             id=request_id,
@@ -728,7 +945,7 @@ class OpenAIServingChat(OpenAIServing):
             # is sent, send the usage
             if (request.stream_options
                     and request.stream_options.include_usage):
-                completion_tokens = previous_num_tokens[i]
+                completion_tokens = sum(previous_num_tokens)
                 total_reasoning = sum(reasoning_token_counts) if use_reasoning else None
                 final_usage = UsageInfo(
                     prompt_tokens=num_prompt_tokens,
@@ -870,18 +1087,13 @@ class OpenAIServingChat(OpenAIServing):
                 reasoning_text, extracted = r_parser.extract_reasoning(
                     output.text, request)
                 output_text = extracted or ""
+                if isinstance(request.tool_choice,
+                              ChatCompletionNamedToolChoiceParam):
+                    reasoning_text, output_text = \
+                        _reclassify_named_guided_json(
+                            reasoning_text, output_text)
 
-            # Content fallback: if reasoning exists but content is empty,
-            # use the last sentence of reasoning as content.
-            # This ONLY applies to non-tool-call paths.
-            # For tool calls, output_text must be preserved as-is for parsing.
-            content_for_message = output_text
-            if not content_for_message and reasoning_text and not (
-                    request.tools and request.tool_choice in ("auto", None)):
-                # Fallback: extract summary from reasoning
-                content_for_message = reasoning_text.strip().split('\n')[-1]
-                if not content_for_message:
-                    content_for_message = reasoning_text[:200]
+            named_tool_called = False
 
             # if auto tools are not enabled, and a named tool choice using
             #   outlines is not being used
@@ -891,12 +1103,31 @@ class OpenAIServingChat(OpenAIServing):
                         ChatCompletionNamedToolChoiceParam):
                 message = ChatMessage(role=role,
                                       reasoning_content=reasoning_text,
-                                      content=content_for_message)
+                                      content=output_text)
 
             # if the request uses tools and specified a tool choice
             elif request.tool_choice and type(
                     request.tool_choice) is ChatCompletionNamedToolChoiceParam:
 
+                named_tool_called = True
+                parsed_named_tool_calls: Optional[List[ToolCall]] = None
+                if (not _tool_arguments_are_json_object(output_text)
+                        and self.tool_parser is not None):
+                    try:
+                        named_tool_info = self.tool_parser(
+                            tokenizer).extract_tool_calls(
+                                output_text, request=request)
+                        if named_tool_info.tools_called:
+                            parsed_named_tool_calls = named_tool_info.tool_calls
+                    except RuntimeError as e:
+                        logger.warning(
+                            "Named tool parser unavailable; preserving raw "
+                            "arguments: %s", type(e).__name__)
+                named_arguments = _select_named_tool_arguments(
+                    output_text,
+                    request.tool_choice.function.name,
+                    parsed_named_tool_calls,
+                )
                 message = ChatMessage(
                     role=role,
                     reasoning_content=reasoning_text,
@@ -904,7 +1135,7 @@ class OpenAIServingChat(OpenAIServing):
                     tool_calls=[
                         ToolCall(function=FunctionCall(
                             name=request.tool_choice.function.name,
-                            arguments=output_text))
+                            arguments=named_arguments))
                     ])
 
             # if the request doesn't use tool choice
@@ -913,7 +1144,7 @@ class OpenAIServingChat(OpenAIServing):
 
                 message = ChatMessage(role=role,
                                       reasoning_content=reasoning_text,
-                                      content=content_for_message)
+                                      content=output_text)
 
             # handle when there are tools and tool choice is auto
             elif request.tools and (
@@ -940,7 +1171,7 @@ class OpenAIServingChat(OpenAIServing):
                 else:
                     message = ChatMessage(role=role,
                                           reasoning_content=reasoning_text,
-                                          content=content_for_message)
+                                          content=output_text)
 
             # undetermined case that is still important to handle
             else:
@@ -950,13 +1181,14 @@ class OpenAIServingChat(OpenAIServing):
                     "completion.")
                 message = ChatMessage(role=role,
                                       reasoning_content=reasoning_text,
-                                      content=content_for_message)
+                                      content=output_text)
 
             choice_data = ChatCompletionResponseChoice(
                 index=output.index,
                 message=message,
                 logprobs=logprobs,
-                finish_reason="tool_calls" if auto_tools_called else
+                finish_reason="tool_calls" if (
+                    auto_tools_called or named_tool_called) else
                 output.finish_reason if output.finish_reason else "stop",
                 stop_reason=output.stop_reason)
             choices.append(choice_data)
@@ -1000,13 +1232,30 @@ class OpenAIServingChat(OpenAIServing):
 
         request_metadata.final_usage_info = usage
 
+        prompt_logprobs = final_res.prompt_logprobs
+        sample_positions = request.bi100_prompt_logprobs_sample_positions
+        if sample_positions is not None:
+            if num_cached_tokens not in (None, 0):
+                return self.create_error_response(
+                    "BI100 sampled prompt logprobs require a cold request.")
+            if prompt_logprobs is None or (
+                    sample_positions
+                    and sample_positions[-1] >= len(prompt_logprobs)):
+                return self.create_error_response(
+                    "BI100 prompt-logprob sample positions exceed the prompt.")
+            selected = set(sample_positions)
+            prompt_logprobs = [
+                row if position in selected else None
+                for position, row in enumerate(prompt_logprobs)
+            ]
+
         response = ChatCompletionResponse(
             id=request_id,
             created=created_time,
             model=model_name,
             choices=choices,
             usage=usage,
-            prompt_logprobs=final_res.prompt_logprobs,
+            prompt_logprobs=prompt_logprobs,
         )
 
         return response

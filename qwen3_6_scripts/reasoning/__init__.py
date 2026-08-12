@@ -1,5 +1,5 @@
 """
-Reasoning parser module for vLLM 0.6.3 (BI-V100 / Qwen3.6-27B adaptation).
+Reasoning parser module for vLLM 0.6.3 (BI-V100 / Qwen3.6-35B-A3B adaptation).
 
 Usage: --reasoning-parser qwen3
 """

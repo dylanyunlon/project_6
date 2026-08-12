@@ -70,15 +70,10 @@ class MambaCacheManager:
         return tuple(buffer[:, :batch_size] for buffer in self.mamba_cache)
 
     def _swap_mamba_cache(self, from_index: int, to_index: int):
-        # CCCL DeviceCopy::Batched uses separate src/dst buffers — never
-        # in-place scatter. PyTorch advanced indexing assignment
-        # cache[:, [a,b]] = cache[:, [b,a]] has undefined evaluation order.
-        # Use explicit temp clone for correctness.
         assert len(self.mamba_cache) > 0
         for cache_t in self.mamba_cache:
-            tmp = cache_t[:, from_index].clone()
-            cache_t[:, from_index].copy_(cache_t[:, to_index])
-            cache_t[:, to_index].copy_(tmp)
+            cache_t[:, [to_index,from_index]] = \
+             cache_t[:, [from_index,to_index]]
 
     def _copy_mamba_cache(self, from_index: int, to_index: int):
         assert len(self.mamba_cache) > 0

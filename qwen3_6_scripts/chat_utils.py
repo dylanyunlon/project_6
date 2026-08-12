@@ -172,8 +172,8 @@ class BaseMultiModalItemTracker(ABC, Generic[_T]):
                 return "<image>"
             if model_type == "mllama":
                 return "<|image|>"
-            if model_type in ("qwen2_vl", "qwen2_5_vl",
-                              "qwen3_5", "qwen3_5_moe"):
+            if model_type in ("qwen2_vl", "qwen2_5_vl", "qwen3_5",
+                              "qwen3_5_moe"):
                 return "<|vision_start|><|image_pad|><|vision_end|>"
             if model_type == "molmo":
                 return ""
@@ -184,8 +184,7 @@ class BaseMultiModalItemTracker(ABC, Generic[_T]):
                 return "<|reserved_special_token_0|>"
             raise TypeError(f"Unknown model type: {model_type}")
         elif modality == "video":
-            if model_type in ("qwen2_vl", "qwen2_5_vl",
-                              "qwen3_5", "qwen3_5_moe"):
+            if model_type in ("qwen2_vl","qwen2_5_vl"):
                 return "<|vision_start|><|video_pad|><|vision_end|>"
             raise TypeError(f"Unknown model type: {model_type}")
         else:
@@ -514,11 +513,26 @@ def _postprocess_messages(messages: List[ConversationMessage]) -> None:
     # from openAI format) to dict
     for message in messages:
         if (message["role"] == "assistant" and "tool_calls" in message
-                and isinstance(message["tool_calls"], list)):
+                and message["tool_calls"] is not None):
+            if not isinstance(message["tool_calls"], list):
+                message["tool_calls"] = list(message["tool_calls"])
 
             for item in message["tool_calls"]:
-                item["function"]["arguments"] = json.loads(
-                    item["function"]["arguments"])
+                arguments = item["function"]["arguments"]
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            "Tool call arguments are not valid JSON.") from exc
+                elif not isinstance(arguments, dict):
+                    raise TypeError(
+                        "Tool call arguments must be a JSON object or a "
+                        "JSON-encoded object string.")
+                if not isinstance(arguments, dict):
+                    raise TypeError(
+                        "Tool call arguments must decode to a JSON object.")
+                item["function"]["arguments"] = arguments
 
 
 def parse_chat_messages(

@@ -38,16 +38,18 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         parts = model_output.partition(self.start_token)
         model_output = parts[2] if parts[1] else parts[0]
 
+        if not self.thinking_enabled:
+            if self.end_token in model_output:
+                _, _, content = model_output.partition(self.end_token)
+                return None, content or ""
+            return None, model_output
+
         if self.end_token not in model_output:
-            if not self.thinking_enabled:
-                return None, model_output
             # Thinking enabled but output truncated before </think>.
-            # All output is reasoning; content is None.
             return model_output, None
 
         reasoning, _, content = model_output.partition(self.end_token)
-        content = content.strip() if content else ""
-        return reasoning or None, content if content else None
+        return reasoning, content or None
 
     def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
         token_ids = list(token_ids)
