@@ -1,29 +1,29 @@
 concurrency: 1
 command:
     - python3
-    - /workspace/qwen3_6_scripts/launch_server.py
+    - -m
+    - vllm.entrypoints.openai.api_server
     - --model
     - /model
     - --served-model-name
     - llm
     - --max-model-len
-    - '80000'
+    - '100000'
     - --gpu-memory-utilization
-    - '0.95'
+    - '0.90'
     - --trust-remote-code
     - -tp
     - '4'
     - --max-num-seqs
     - '2'
-    - --max-num-batched-tokens
-    - '4096'
-    - --enable-chunked-prefill
     - --disable-log-requests
     - --disable-frontend-multiprocessing
     - --enforce-eager
     - --enable-auto-tool-choice
     - --tool-call-parser
     - qwen3_coder
+    - --reasoning-parser
+    - qwen3
     - --enable-prefix-caching
     - --max-seq-len-to-capture
     - '8192'
@@ -43,8 +43,4 @@ env:
     - name: PYTORCH_CUDA_ALLOC_CONF
       value: max_split_size_mb:512
     - name: OMP_NUM_THREADS
-      value: '1'
-    - name: BI100_MOE_COREX_DIRECT_ROUTED
-      value: '1'
-    - name: BI100_GDN_COREX_PACKED_DECODE
       value: '1'
