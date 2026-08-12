@@ -394,7 +394,7 @@ class OpenAIServingChat(OpenAIServing):
             assert prompt_inputs is not None
 
             sampling_params: Union[SamplingParams, BeamSearchParams]
-            default_max_tokens = min(8192, self.max_model_len - len(
+            default_max_tokens = self.max_model_len - len(
                 prompt_inputs["prompt_token_ids"])
             if request.use_beam_search:
                 sampling_params = request.to_beam_search_params(

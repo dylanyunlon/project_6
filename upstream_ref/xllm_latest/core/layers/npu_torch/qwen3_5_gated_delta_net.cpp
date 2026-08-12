@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -123,19 +123,53 @@ torch::Tensor Qwen3_5GatedDeltaNetImpl::merge_ba_from_split_activations(
 }
 
 std::pair<torch::Tensor, torch::Tensor>
-Qwen3_5GatedDeltaNetImpl::project_padded_inputs(
-    const torch::Tensor& hidden_states,
-    const AttentionMetadata& attn_metadata) {
-  auto qkv = reshape_qkvz_with_pad(attn_metadata,
-                                   in_proj_qkv_->forward(hidden_states));
-  auto z_proj =
-      reshape_qkvz_with_pad(attn_metadata, in_proj_z_->forward(hidden_states));
-  auto b_proj =
-      reshape_qkvz_with_pad(attn_metadata, in_proj_b_->forward(hidden_states));
-  auto a_proj =
-      reshape_qkvz_with_pad(attn_metadata, in_proj_a_->forward(hidden_states));
+Qwen3_5GatedDeltaNetImpl::project_decode_inputs(
+    const torch::Tensor& hidden_states) {
+  const auto reshape_projection = [](const torch::Tensor& projection) {
+    return projection.view({projection.size(0), -1, projection.size(-1)});
+  };
+  auto qkv = reshape_projection(in_proj_qkv_->forward(hidden_states));
+  auto z_proj = reshape_projection(in_proj_z_->forward(hidden_states));
+  auto b_proj = reshape_projection(in_proj_b_->forward(hidden_states));
+  auto a_proj = reshape_projection(in_proj_a_->forward(hidden_states));
   return {merge_qkvz_from_split_activations(qkv, z_proj),
           merge_ba_from_split_activations(b_proj, a_proj)};
+}
+
+std::pair<torch::Tensor, torch::Tensor>
+Qwen3_5GatedDeltaNetImpl::project_flat_inputs(
+    const torch::Tensor& hidden_states) {
+  auto qkv = in_proj_qkv_->forward(hidden_states).unsqueeze(0);
+  auto z_proj = in_proj_z_->forward(hidden_states).unsqueeze(0);
+  auto b_proj = in_proj_b_->forward(hidden_states).unsqueeze(0);
+  auto a_proj = in_proj_a_->forward(hidden_states).unsqueeze(0);
+  auto qkvz = merge_qkvz_from_split_activations(qkv, z_proj);
+  auto ba = merge_ba_from_split_activations(b_proj, a_proj);
+  return {qkvz.view({hidden_states.size(0), qkvz.size(-1)}).contiguous(),
+          ba.view({hidden_states.size(0), ba.size(-1)}).contiguous()};
+}
+
+std::optional<
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>>
+Qwen3_5GatedDeltaNetImpl::project_split_inputs(
+    const torch::Tensor& hidden_states,
+    const AttentionMetadata& attn_metadata) {
+  auto qkv = reshape_projected_tokens_with_pad(
+      attn_metadata, in_proj_qkv_->forward(hidden_states));
+  auto z_proj = reshape_projected_tokens_with_pad(
+      attn_metadata, in_proj_z_->forward(hidden_states));
+  auto b_proj = reshape_projected_tokens_with_pad(
+      attn_metadata, in_proj_b_->forward(hidden_states));
+  auto a_proj = reshape_projected_tokens_with_pad(
+      attn_metadata, in_proj_a_->forward(hidden_states));
+
+  const int64_t batch_size = qkv.size(0);
+  const int64_t seq_len = qkv.size(1);
+  auto z =
+      z_proj.view({batch_size, seq_len, num_v_heads_ / tp_size_, head_v_dim_});
+  auto b = b_proj.view({batch_size, seq_len, num_v_heads_ / tp_size_});
+  auto a = a_proj.view({batch_size, seq_len, num_v_heads_ / tp_size_});
+  return std::make_tuple(qkv, z, b, a);
 }
 
 void Qwen3_5GatedDeltaNetImpl::load_projection_state_dict(

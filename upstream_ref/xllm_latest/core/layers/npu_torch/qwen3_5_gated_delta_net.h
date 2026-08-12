@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,7 +17,9 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 
 #include "qwen3_next_gated_delta_net.h"
@@ -34,9 +36,15 @@ class Qwen3_5GatedDeltaNetImpl : public Qwen3NextGatedDeltaNetImpl {
                            const torch::TensorOptions& options);
 
  protected:
-  std::pair<torch::Tensor, torch::Tensor> project_padded_inputs(
-      const torch::Tensor& hidden_states,
-      const AttentionMetadata& attn_metadata) override;
+  std::pair<torch::Tensor, torch::Tensor> project_decode_inputs(
+      const torch::Tensor& hidden_states) override;
+  std::pair<torch::Tensor, torch::Tensor> project_flat_inputs(
+      const torch::Tensor& hidden_states) override;
+  std::optional<
+      std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>>
+  project_split_inputs(const torch::Tensor& hidden_states,
+                       const AttentionMetadata& attn_metadata) override;
+  bool use_fla_ssm_state_layout() const override { return true; }
 
   void load_projection_state_dict(const StateDict& state_dict) override;
   void verify_projection_weights(const std::string& prefix) const override;

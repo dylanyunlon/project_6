@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,6 +19,8 @@ limitations under the License.
 
 #include <tuple>
 #include <vector>
+
+#include "common/flash_comm1_context.h"
 
 namespace xllm {
 namespace layer {
@@ -63,7 +65,8 @@ Qwen3NextAttentionImpl::Qwen3NextAttentionImpl(
                         /*bias=*/args.attention_bias(),
                         /*gather_output=*/false,
                         parallel_args,
-                        options));
+                        options,
+                        quant_args));
 
   // 2. O proj
   o_proj_ = register_module("o_proj",
@@ -144,7 +147,14 @@ torch::Tensor Qwen3NextAttentionImpl::forward(
     const AttentionMetadata& attn_metadata,
     KVCache& kv_cache,
     const torch::Tensor& mrope_cos_sin) {
-  auto qkv = qkv_proj_->forward(hidden_states);
+  const FlashComm1Context* fc1_ctx = get_current_flash_comm1_context();
+  torch::Tensor h = hidden_states;
+
+  if (fc1_ctx && is_sequence_sharded(*fc1_ctx)) {
+    h = gather_sequence(hidden_states, *fc1_ctx);
+  }
+
+  auto qkv = qkv_proj_->forward(h);
 
   if (use_fused_qkv_) {
     const int64_t T = qkv.size(0);
@@ -168,6 +178,10 @@ torch::Tensor Qwen3NextAttentionImpl::forward(
     auto out = std::get<0>(
         attn_->forward(attn_metadata, q_flat, k_flat, v_flat, kv_cache));
     out = out * torch::sigmoid(gate.view({T, q_size_}));
+
+    if (fc1_ctx && is_sequence_sharded(*fc1_ctx)) {
+      return o_proj_->forward(out, row_parallel_reduce_mode_for_fc1(*fc1_ctx));
+    }
     return o_proj_->forward(out);
   }
 
@@ -198,13 +212,18 @@ torch::Tensor Qwen3NextAttentionImpl::forward(
   if (attn_output_gate_) {
     out = out * torch::sigmoid(gate);
   }
+
+  if (fc1_ctx && is_sequence_sharded(*fc1_ctx)) {
+    return o_proj_->forward(out, row_parallel_reduce_mode_for_fc1(*fc1_ctx));
+  }
   return o_proj_->forward(out);
 }
 
 void Qwen3NextAttentionImpl::load_state_dict(const StateDict& state_dict) {
   qkv_proj_->load_state_dict(state_dict, {"q_proj.", "k_proj.", "v_proj."});
 
-  if (attn_output_gate_) {
+  if (attn_output_gate_ && qkv_proj_->is_weight_loaded() &&
+      !qkv_weight_reordered_) {
     // Rearrange q_proj rows from per-head interleaved [q0,g0,q1,g1,...]
     // to grouped [q0,q1,...,g0,g1,...] so forward output is [Q|G|K|V].
     auto w = qkv_proj_->weight();
@@ -217,6 +236,32 @@ void Qwen3NextAttentionImpl::load_state_dict(const StateDict& state_dict) {
         {q_part.reshape({q_size_, hidden}), g_part.reshape({q_size_, hidden})},
         0);
     qg_rows.copy_(reordered);
+
+    // Reorder weight_scale and weight_offset for W8A8 dynamic quantization.
+    // These are per-channel (per output row) tensors that must match the
+    // reordered weight layout for correct dequantization.
+    const int64_t qg_size = q_size_ * 2;
+    auto reorder_per_channel = [this, qg_size](torch::Tensor tensor) {
+      if (!tensor.defined() || tensor.numel() == 0) {
+        return;
+      }
+      auto qg_part = tensor.slice(0, 0, qg_size);
+      auto qg_2d = qg_part.view({num_heads_, 2 * head_dim_});
+      auto q_scale = qg_2d.slice(1, 0, head_dim_);
+      auto g_scale = qg_2d.slice(1, head_dim_, 2 * head_dim_);
+      auto reordered_scale = torch::cat(
+          {q_scale.reshape({q_size_}), g_scale.reshape({q_size_})}, 0);
+      qg_part.copy_(reordered_scale);
+    };
+
+    if (qkv_proj_->is_weight_scale_loaded()) {
+      reorder_per_channel(qkv_proj_->weight_scale());
+    }
+    if (qkv_proj_->is_weight_offset_loaded()) {
+      reorder_per_channel(qkv_proj_->weight_offset());
+    }
+
+    qkv_weight_reordered_ = true;
   }
 
   o_proj_->load_state_dict(state_dict.get_dict_with_prefix("o_proj."));
@@ -231,8 +276,14 @@ void Qwen3NextAttentionImpl::load_state_dict(const StateDict& state_dict) {
   // uses standard RMSNorm (w only). Pre-add 1 so the fused kernel produces
   // the same result as Qwen3NextRMSNorm (gemma_rms_norm).
   if (use_fused_qkv_) {
-    q_norm_->weight().add_(1.0);
-    k_norm_->weight().add_(1.0);
+    if (q_norm_->is_weight_loaded() && !q_norm_weight_adjusted_) {
+      q_norm_->weight().add_(1.0);
+      q_norm_weight_adjusted_ = true;
+    }
+    if (k_norm_->is_weight_loaded() && !k_norm_weight_adjusted_) {
+      k_norm_->weight().add_(1.0);
+      k_norm_weight_adjusted_ = true;
+    }
   }
 }
 
