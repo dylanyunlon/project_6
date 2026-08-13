@@ -246,6 +246,14 @@ if source != installed:
     raise SystemExit("runtime api_server overlay identity mismatch")
 PY
 
+build_stage "compiling CoreX MoE index+combine kernel"
+if [[ -x /usr/local/corex-3.2.3/bin/clang++ ]]; then
+    bash ./build_corex_moe_index_combine.sh "${VLLM_ROOT}" || \
+        echo "[WARN] moe_index_combine build failed — will use PyTorch fallback"
+else
+    echo "[WARN] corex clang++ not found — skipping moe_index_combine build"
+fi
+
 build_stage "compiling submission Python sources"
 find . -path './wheels' -prune -o -name '*.py' -print0 | xargs -0 python3 -m py_compile
 build_stage "patch script completed"
