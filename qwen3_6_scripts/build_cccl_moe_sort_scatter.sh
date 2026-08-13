@@ -20,8 +20,8 @@ done
 [[ -n "${CXX}" ]] || { echo "no corex clang++"; exit 2; }
 
 # Find torch paths
-TORCH_INC=$(python3 -c "import torch; print(torch.utils.cpp_extension.include_paths()[0])")
-TORCH_LIB=$(python3 -c "import torch.utils.cpp_extension as e; import os; print(os.path.join(os.path.dirname(e.__file__), '..', '..', 'lib'))" | xargs realpath)
+TORCH_INC=$(python3 -c "from torch.utils.cpp_extension import include_paths; print(include_paths()[0])")
+TORCH_LIB=$(python3 -c "import torch; import os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
 PYTHON_INC=$(python3 -c "from sysconfig import get_paths; print(get_paths()['include'])")
 CUDA_INC="/usr/local/corex/include"
 
