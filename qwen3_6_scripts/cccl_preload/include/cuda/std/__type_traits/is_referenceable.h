@@ -39,7 +39,7 @@ struct __cccl_is_referenceable_impl
   template <class _Tp>
   _CCCL_HOST_DEVICE static _Tp& __test(int);
   template <class _Tp>
-  _CCCL_HOST_DEVICE static false_type __test(...);
+  _CCCL_HOST_DEVICE static false_type __test(long);
 };
 
 template <class _Tp>

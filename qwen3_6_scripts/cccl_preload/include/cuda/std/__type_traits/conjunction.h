@@ -35,7 +35,7 @@ template <class... _Pred>
 _CCCL_HOST_DEVICE __expand_to_true<enable_if_t<_Pred::value>...> __and_helper(int);
 
 template <class...>
-_CCCL_HOST_DEVICE false_type __and_helper(...);
+_CCCL_HOST_DEVICE false_type __and_helper(long);
 
 // _And always performs lazy evaluation of its arguments.
 //

@@ -43,7 +43,8 @@ _CCCL_BEGIN_NAMESPACE_CUDA_STD
 
 struct __any
 {
-  _CCCL_API inline __any(...);
+  template <class _T>
+  _CCCL_API inline __any(_T);
 };
 
 template <class _DecayedFp>
