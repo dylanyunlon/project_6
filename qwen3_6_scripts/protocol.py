@@ -412,6 +412,16 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def fold_max_completion_tokens(cls, data):
+        """OpenAI newer API: max_completion_tokens → max_tokens alias."""
+        if isinstance(data, dict):
+            mct = data.pop("max_completion_tokens", None)
+            if mct is not None and data.get("max_tokens") is None:
+                data["max_tokens"] = mct
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def normalize_messages(cls, data):
         """Normalize incoming messages before pydantic union validation.
 
