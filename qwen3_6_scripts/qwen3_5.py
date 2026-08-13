@@ -1187,8 +1187,6 @@ class GatedDeltaNet(nn.Module):
                     core_out = _corex_gdn_packed_decode.packed_decode(
                         temporal_state, packed_mixed_qkv, b_all, a_all,
                         self.A_log, self.dt_bias)
-                    core_out = torch.nan_to_num(
-                        core_out, nan=0.0, posinf=0.0, neginf=0.0)
             else:
                 q, k, v = torch.split(
                     mixed_qkv_conv,
@@ -1613,13 +1611,9 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         # Source: xllm/core/kernels/cuda/moe/moe_topk_softmax_kernels.cuh
         if _USE_COREX_MOE_TOPK_SOFTMAX:
             topk_weights, topk_ids = _corex_moe_topk_softmax.moe_topk_softmax(
-                router_logits.float().contiguous(), self.top_k, True)
+                router_logits.float(), self.top_k, True)
             topk_ids = topk_ids.to(torch.int64)
-            # BI-V100 CUB softmax may produce non-finite → clamp before cast
-            topk_weights = torch.nan_to_num(
-                topk_weights, nan=0.0, posinf=1.0, neginf=0.0)
-            denom = topk_weights.sum(dim=-1, keepdim=True).clamp(min=1e-6)
-            topk_weights = (topk_weights / denom).to(hidden_states.dtype)
+            topk_weights = topk_weights.to(hidden_states.dtype)
         else:
             topk_logits, topk_ids = torch.topk(
                 router_logits.float(), self.top_k, dim=-1)     # (T, top_k)
@@ -1657,10 +1651,8 @@ class Qwen3_5MoeSparseBlock(nn.Module):
                 gate_up = _corex_moe_direct_routed.w13(
                     hidden_states, w13, eids)
                 act = self.act_fn(gate_up)
-                out = _corex_moe_direct_routed.w2_reduce(
+                return _corex_moe_direct_routed.w2_reduce(
                     act, w2, eids, ws)
-                return torch.nan_to_num(
-                    out, nan=0.0, posinf=0.0, neginf=0.0)
 
             use_corex_gather = (
                 _USE_COREX_MOE_WEIGHT_GATHER
@@ -1705,7 +1697,6 @@ class Qwen3_5MoeSparseBlock(nn.Module):
                     and ws.dtype == torch.float16
                     and expert_out.shape[0] == 8):
                 out = _corex_moe_exact_reduce.serial_float(expert_out, ws)
-                out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
             else:
                 out = (expert_out * ws.unsqueeze(-1)).sum(
                     0, keepdim=True).to(hidden_states.dtype)   # (1, H)
