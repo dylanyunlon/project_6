@@ -246,12 +246,14 @@ if source != installed:
     raise SystemExit("runtime api_server overlay identity mismatch")
 PY
 
-build_stage "compiling CoreX MoE index+combine kernel"
+build_stage "compiling CoreX CUDA extensions (moe_index_combine + gdn_chunk_recurrent)"
 if [[ -x /usr/local/corex-3.2.3/bin/clang++ ]]; then
     bash ./build_corex_moe_index_combine.sh "${VLLM_ROOT}" || \
         echo "[WARN] moe_index_combine build failed — will use PyTorch fallback"
+    bash ./build_corex_gdn_chunk_recurrent.sh "${VLLM_ROOT}" || \
+        echo "[WARN] gdn_chunk_recurrent build failed — will use Python fallback"
 else
-    echo "[WARN] corex clang++ not found — skipping moe_index_combine build"
+    echo "[WARN] corex clang++ not found — skipping extension builds"
 fi
 
 build_stage "compiling submission Python sources"

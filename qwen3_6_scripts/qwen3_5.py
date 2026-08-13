@@ -148,6 +148,13 @@ try:
 except ImportError:
     _corex_moe_index_combine = None
 
+try:
+    from vllm import corex_gdn_chunk_recurrent as _corex_gdn_chunk_recurrent
+except ImportError:
+    _corex_gdn_chunk_recurrent = None
+
+_HAS_COREX_GDN_CHUNK = _corex_gdn_chunk_recurrent is not None
+
 from vllm.model_executor.models.interfaces import (HasInnerState, SupportsLoRA,
                                                    SupportsMultiModal)
 
@@ -1105,9 +1112,14 @@ class GatedDeltaNet(nn.Module):
                     seq_len, _DNN_CHUNK_SIZE,
                     seq_capture_offsets | seq_segment_offsets)
                 sc_start = 0
+                _chunk_fn = (
+                    _corex_gdn_chunk_recurrent.torch_chunk_gated_delta_rule
+                    if _HAS_COREX_GDN_CHUNK
+                    else _torch_chunk_gated_delta_rule
+                )
                 with bi100_timer(f"L{self.layer_idx}.gdn.prefill"):
                     for sc_end in segment_ends:
-                        c_out, cur_state = _torch_chunk_gated_delta_rule(
+                        c_out, cur_state = _chunk_fn(
                             q[:, sc_start:sc_end],
                             k[:, sc_start:sc_end],
                             v[:, sc_start:sc_end],
