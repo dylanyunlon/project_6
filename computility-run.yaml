@@ -8,14 +8,14 @@ command:
     - --served-model-name
     - llm
     - --max-model-len
-    - '131072'
+    - '80000'
     - --gpu-memory-utilization
     - '0.90'
     - --trust-remote-code
     - -tp
     - '4'
     - --max-num-seqs
-    - '1'
+    - '2'
     - --disable-log-requests
     - --disable-frontend-multiprocessing
     - --max-num-batched-tokens
@@ -47,3 +47,5 @@ env:
       value: hybrid64
     - name: BI100_MOE_COREX_TOPK_SOFTMAX
       value: '0'
+    - name: PYTORCH_CUDA_ALLOC_CONF
+      value: expandable_segments:True
