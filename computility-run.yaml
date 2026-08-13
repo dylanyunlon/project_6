@@ -10,7 +10,7 @@ command:
     - --max-model-len
     - '80000'
     - --gpu-memory-utilization
-    - '0.90'
+    - '0.85'
     - --trust-remote-code
     - -tp
     - '4'
