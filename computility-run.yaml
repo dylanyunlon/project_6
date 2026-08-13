@@ -8,7 +8,7 @@ command:
     - --served-model-name
     - llm
     - --max-model-len
-    - '256000'
+    - '131072'
     - --gpu-memory-utilization
     - '0.95'
     - --trust-remote-code
