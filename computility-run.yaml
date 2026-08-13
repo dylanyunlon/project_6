@@ -32,6 +32,8 @@ command:
     - --enforce-eager
     - --dtype
     - half
+    - --num-gpu-blocks-override
+    - '4000'
 env:
     - name: VLLM_ENGINE_ITERATION_TIMEOUT_S
       value: 3600
