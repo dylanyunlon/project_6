@@ -72,11 +72,9 @@ COMMON_FLAGS=(
     # Suppress CCCL warnings that don't affect correctness
     -Wno-unused-function
     -Wno-unknown-pragmas
-    # CUB needs these for non-NVCC compilers
-    -D_CCCL_COMPILER_GCC=1
+    # CUB needs this for non-NVCC compilers
     -D__CUDA_ARCH_LIST__=700
     -DCUB_DISABLE_NAMESPACE_MAGIC
-    -DCUB_WRAPPED_NAMESPACE=cccl_preload
 )
 
 if [[ "${CXX}" == *clang++* ]]; then
