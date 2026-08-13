@@ -8,6 +8,10 @@
  * caching allocator. Strips expandable_segments from
  * PYTORCH_CUDA_ALLOC_CONF before libtorch reads it.
  *
+ * CRITICAL: CUB's allocator internally calls cudaMalloc/cudaFree for
+ * cache misses. We use a thread-local reentrant guard so internal calls
+ * go straight to the real CUDA runtime, avoiding infinite recursion.
+ *
  * Source: CCCL cub/cub/util_allocator.cuh (BSD-3, NVIDIA)
  * Build:  bash build_cccl_preload.sh
  */
@@ -24,38 +28,38 @@
 
 /* ========================================================================
  * Configuration for BI-V100 (32GB × 4 cards)
- *
- * CUB CachingDeviceAllocator parameters:
- *   bin_growth = 2   (power-of-2 bins: 256B, 512B, 1KB, ... 4GB)
- *   min_bin    = 8   (2^8 = 256B minimum allocation)
- *   max_bin    = 32  (2^32 = 4GB maximum cached bin)
- *   max_cached = 8GB per device
- *
- * More granular bins (growth=2) than CUB default (growth=8) because
- * PyTorch tensor sizes vary widely in inference.
  * ======================================================================== */
 
 static constexpr unsigned int ALLOC_BIN_GROWTH   = 2;
-static constexpr unsigned int ALLOC_MIN_BIN      = 8;   /* 256 bytes */
-static constexpr unsigned int ALLOC_MAX_BIN      = 32;  /* 4 GB */
-static constexpr size_t       ALLOC_MAX_CACHED   = (size_t)8 * 1024 * 1024 * 1024; /* 8GB */
+static constexpr unsigned int ALLOC_MIN_BIN      = 8;   /* 2^8  = 256 bytes */
+static constexpr unsigned int ALLOC_MAX_BIN      = 32;  /* 2^32 = 4 GB */
+static constexpr size_t       ALLOC_MAX_CACHED   = (size_t)8 * 1024 * 1024 * 1024;
 
 /* ---- Global allocator singleton ---- */
 using CubAllocator = CUB_NS_QUALIFIER::CachingDeviceAllocator;
 
 static CubAllocator& get_allocator() {
     static CubAllocator instance(
-        ALLOC_BIN_GROWTH,
-        ALLOC_MIN_BIN,
-        ALLOC_MAX_BIN,
+        ALLOC_BIN_GROWTH, ALLOC_MIN_BIN, ALLOC_MAX_BIN,
         ALLOC_MAX_CACHED,
-        true  /* skip_cleanup: CoreX may tear down CUDA before our dtor */
+        true  /* skip_cleanup: CoreX may tear down CUDA before dtor */
     );
     return instance;
 }
 
 static bool g_preload_active = false;
 static bool g_debug = false;
+
+/*
+ * Reentrant guard: CUB's DeviceAllocate/DeviceFree internally call
+ * cudaMalloc/cudaFree (for cache misses and evictions). Without this
+ * guard, our intercept would call DeviceAllocate again → infinite
+ * recursion → stack overflow → segfault.
+ *
+ * When inside_cub == true, cudaMalloc/cudaFree go straight to the
+ * real CUDA runtime via dlsym(RTLD_NEXT).
+ */
+static thread_local bool inside_cub = false;
 
 /* ---- Real cudaMalloc/cudaFree via dlsym(RTLD_NEXT) ---- */
 using RealMalloc_t = cudaError_t (*)(void**, size_t);
@@ -109,11 +113,8 @@ static void cccl_preload_init() {
                 alloc_conf, clean.empty() ? "(unset)" : clean.c_str());
     }
 
-    /* Initialize allocator */
     auto& alloc = get_allocator();
-    if (g_debug) {
-        alloc.debug = true;
-    }
+    if (g_debug) alloc.debug = true;
 
     g_preload_active = true;
     fprintf(stderr,
@@ -125,20 +126,29 @@ static void cccl_preload_init() {
 
 /* ========================================================================
  * cudaMalloc / cudaFree intercepts
+ *
+ * outside CUB → route to CUB CachingDeviceAllocator (bin + cache)
+ * inside CUB  → pass through to real cudaMalloc/cudaFree (no recursion)
  * ======================================================================== */
 
 extern "C" cudaError_t cudaMalloc(void** devPtr, size_t size)
 {
-    if (!g_preload_active) {
+    if (!g_preload_active || inside_cub) {
         return get_real_malloc()(devPtr, size);
     }
-    return get_allocator().DeviceAllocate(devPtr, size);
+    inside_cub = true;
+    cudaError_t err = get_allocator().DeviceAllocate(devPtr, size);
+    inside_cub = false;
+    return err;
 }
 
 extern "C" cudaError_t cudaFree(void* devPtr)
 {
-    if (!g_preload_active || devPtr == nullptr) {
+    if (!g_preload_active || inside_cub || devPtr == nullptr) {
         return get_real_free()(devPtr);
     }
-    return get_allocator().DeviceFree(devPtr);
+    inside_cub = true;
+    cudaError_t err = get_allocator().DeviceFree(devPtr);
+    inside_cub = false;
+    return err;
 }
