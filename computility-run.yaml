@@ -48,6 +48,6 @@ env:
     - name: BI100_MOE_COREX_TOPK_SOFTMAX
       value: '1'
     - name: PYTORCH_CUDA_ALLOC_CONF
-      value: expandable_segments:True
+      value: max_split_size_mb:512
     - name: LD_PRELOAD
       value: /workspace/qwen3_6_scripts/cccl_preload/libcccl_allocator.so
