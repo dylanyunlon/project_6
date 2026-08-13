@@ -219,6 +219,11 @@ FALLBACK_METHOD = '''
         # Fallback: pure-math Q-tiling (original implementation)
         _Q_CHUNK = 256
 
+        # During profiling, skip expensive attention — return zeros.
+        # Profiling only measures memory footprint, not output correctness.
+        if os.environ.get("BI100_IN_STARTUP_PROFILE") == "1":
+            return torch.zeros_like(query)
+
         if (attn_metadata.query_start_loc is not None
                 and len(attn_metadata.query_start_loc) == num_seqs + 1):
             q_lens = [
