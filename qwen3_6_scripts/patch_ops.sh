@@ -247,8 +247,15 @@ if source != installed:
 PY
 
 build_stage "compiling CCCL CachingDeviceAllocator LD_PRELOAD module"
-bash ./build_cccl_preload_allocator.sh /workspace/qwen3_6_scripts || \
-    echo "[WARN] CCCL preload allocator build failed — will use default allocator"
+if bash ./cccl_preload/build_cccl_preload.sh /workspace/qwen3_6_scripts; then
+    if [[ -s /workspace/qwen3_6_scripts/libcccl_allocator.so ]]; then
+        echo "[OK] libcccl_allocator.so built successfully"
+    else
+        echo "[WARN] libcccl_allocator.so is empty or missing after build"
+    fi
+else
+    echo "[WARN] CCCL preload allocator build failed — LD_PRELOAD will be ignored at runtime"
+fi
 
 build_stage "compiling CoreX CUDA extensions (moe_index_combine + gdn_chunk_recurrent)"
 if [[ -x /usr/local/corex-3.2.3/bin/clang++ ]]; then

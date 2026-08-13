@@ -1,3 +1,18 @@
 **/__pycache__
 **/*.pyc
 **/.git
+
+# Large directories not needed in Docker image
+cccl_upstream/
+upstream_ref/
+vllm/
+ixformer_sdk/
+muh/
+ex_engine/
+docs/
+*.zip
+*.txt
+*.md
+*.json
+
+# Keep only qwen3_6_scripts/ computility-run.yaml Dockerfile
