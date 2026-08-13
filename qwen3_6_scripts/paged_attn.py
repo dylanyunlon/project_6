@@ -1585,11 +1585,37 @@ class PagedAttention:
                         f"[{min_block}, {max_block}] outside "
                         f"[0, {key_cache.shape[0] - 1}]")
 
-        if actual_max > PagedAttention._PYTORCH_DECODE_THRESHOLD:
-            with bi100_timer("paged_attn.decode_pytorch"):
-                return PagedAttention._forward_decode_pytorch(
-                    query, key_cache, value_cache, block_tables, seq_lens,
-                    scale)
+        # BI-V100: paged_attention_v1 supports max_context_len<=32768.
+        # For longer contexts, use v2 with layout conversion (5D→4D).
+        # v1 key: [blocks, kv_h, head_dim//x, block_size, x]
+        # v2 key: [blocks, kv_h, block_size, head_dim]
+        if actual_max > 32768:
+            num_kv_heads = key_cache.shape[1]
+            key_cache_v2 = (key_cache
+                            .permute(0, 1, 3, 2, 4)
+                            .contiguous()
+                            .view(key_cache.shape[0], num_kv_heads,
+                                  block_size, head_size))
+            value_cache_v2 = (value_cache
+                              .permute(0, 1, 3, 2)
+                              .contiguous())
+            output = torch.empty_like(query)
+            _partition = 512
+            max_num_partitions = ((max_seq_len + _partition - 1) //
+                                  _partition)
+            tmp_output = torch.empty(
+                size=(num_seqs, num_heads, max_num_partitions, head_size),
+                dtype=output.dtype, device=output.device)
+            exp_sums = torch.empty(
+                size=(num_seqs, num_heads, max_num_partitions),
+                dtype=torch.float32, device=output.device)
+            max_logits = torch.empty_like(exp_sums)
+            import ixformer.functions as _ixf_F
+            _ixf_F.vllm_single_query_cached_kv_attention_v2(
+                output, _partition, exp_sums, max_logits, tmp_output,
+                query, key_cache_v2, value_cache_v2, head_mapping, scale,
+                block_tables, seq_lens, block_size, max_seq_len)
+            return output
 
         if blocksparse_vert_stride is not None and blocksparse_vert_stride > 1:
             # use blocksparse paged attention
