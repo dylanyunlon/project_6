@@ -46,6 +46,6 @@ env:
     - name: BI100_GDN_RESTORE_MODE
       value: hybrid64
     - name: BI100_MOE_COREX_TOPK_SOFTMAX
-      value: '0'
+      value: '1'
     - name: PYTORCH_CUDA_ALLOC_CONF
       value: expandable_segments:True
