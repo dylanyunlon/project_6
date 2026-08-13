@@ -1,7 +1,0 @@
-# Exclude everything
-*
-
-# Only include what Dockerfile needs
-!Dockerfile
-!computility-run.yaml
-!qwen3_6_scripts/
