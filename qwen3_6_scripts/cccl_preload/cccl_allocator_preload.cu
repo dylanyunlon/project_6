@@ -1,154 +1,53 @@
-/*
- * cccl_allocator_preload.cu
- *
- * LD_PRELOAD .so — CUB CachingDeviceAllocator from CCCL upstream.
- * Full dependency chain (288 files) extracted into include/.
- *
- * Intercepts cudaMalloc/cudaFree, routes through CUB's geometric-bin
- * caching allocator. Strips expandable_segments from
- * PYTORCH_CUDA_ALLOC_CONF before libtorch reads it.
- *
- * CRITICAL: CUB's allocator internally calls cudaMalloc/cudaFree for
- * cache misses. We use a thread-local reentrant guard so internal calls
- * go straight to the real CUDA runtime, avoiding infinite recursion.
- *
- * Source: CCCL cub/cub/util_allocator.cuh (BSD-3, NVIDIA)
- * Build:  bash build_cccl_preload.sh
- */
-
-/* ---- CCCL include chain (288 files from cccl_upstream) ---- */
 #include <cub/util_allocator.cuh>
-
-/* ---- System ---- */
 #include <dlfcn.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 
-/* ========================================================================
- * Configuration for BI-V100 (32GB × 4 cards)
- * ======================================================================== */
+static constexpr unsigned int ALLOC_BIN_GROWTH = 2;
+static constexpr unsigned int ALLOC_MIN_BIN    = 8;
+static constexpr unsigned int ALLOC_MAX_BIN    = 32;
+static constexpr size_t       ALLOC_MAX_CACHED = (size_t)8*1024*1024*1024;
 
-static constexpr unsigned int ALLOC_BIN_GROWTH   = 2;
-static constexpr unsigned int ALLOC_MIN_BIN      = 8;   /* 2^8  = 256 bytes */
-static constexpr unsigned int ALLOC_MAX_BIN      = 32;  /* 2^32 = 4 GB */
-static constexpr size_t       ALLOC_MAX_CACHED   = (size_t)8 * 1024 * 1024 * 1024;
-
-/* ---- Global allocator singleton ---- */
 using CubAllocator = CUB_NS_QUALIFIER::CachingDeviceAllocator;
 
 static CubAllocator& get_allocator() {
-    static CubAllocator instance(
-        ALLOC_BIN_GROWTH, ALLOC_MIN_BIN, ALLOC_MAX_BIN,
-        ALLOC_MAX_CACHED,
-        true  /* skip_cleanup: CoreX may tear down CUDA before dtor */
-    );
+    static CubAllocator instance(ALLOC_BIN_GROWTH, ALLOC_MIN_BIN, ALLOC_MAX_BIN, ALLOC_MAX_CACHED, true);
     return instance;
 }
 
 static bool g_preload_active = false;
 static bool g_debug = false;
-
-/*
- * Reentrant guard: CUB's DeviceAllocate/DeviceFree internally call
- * cudaMalloc/cudaFree (for cache misses and evictions). Without this
- * guard, our intercept would call DeviceAllocate again → infinite
- * recursion → stack overflow → segfault.
- *
- * When inside_cub == true, cudaMalloc/cudaFree go straight to the
- * real CUDA runtime via dlsym(RTLD_NEXT).
- */
 static thread_local bool inside_cub = false;
 
-/* ---- Real cudaMalloc/cudaFree via dlsym(RTLD_NEXT) ---- */
-using RealMalloc_t = cudaError_t (*)(void**, size_t);
-using RealFree_t   = cudaError_t (*)(void*);
+using RealMalloc_t = cudaError_t(*)(void**,size_t);
+using RealFree_t   = cudaError_t(*)(void*);
+static RealMalloc_t get_real_malloc(){ static RealMalloc_t fn=(RealMalloc_t)dlsym(RTLD_NEXT,"cudaMalloc"); return fn; }
+static RealFree_t   get_real_free()  { static RealFree_t fn=(RealFree_t)dlsym(RTLD_NEXT,"cudaFree"); return fn; }
 
-static RealMalloc_t get_real_malloc() {
-    static RealMalloc_t fn = (RealMalloc_t)dlsym(RTLD_NEXT, "cudaMalloc");
-    return fn;
-}
-static RealFree_t get_real_free() {
-    static RealFree_t fn = (RealFree_t)dlsym(RTLD_NEXT, "cudaFree");
-    return fn;
-}
-
-/* ========================================================================
- * Constructor: runs at LD_PRELOAD load time
- * ======================================================================== */
 __attribute__((constructor))
 static void cccl_preload_init() {
-    const char* debug_env = getenv("CCCL_ALLOC_DEBUG");
-    g_debug = (debug_env && atoi(debug_env) > 0);
-
-    const char* disable_env = getenv("CCCL_ALLOC_DISABLE");
-    if (disable_env && atoi(disable_env) > 0) {
-        fprintf(stderr, "[cccl_alloc] DISABLED by CCCL_ALLOC_DISABLE=1\n");
-        return;
+    g_debug = (getenv("CCCL_ALLOC_DEBUG") && atoi(getenv("CCCL_ALLOC_DEBUG"))>0);
+    if (getenv("CCCL_ALLOC_DISABLE") && atoi(getenv("CCCL_ALLOC_DISABLE"))>0) return;
+    const char* ac = getenv("PYTORCH_CUDA_ALLOC_CONF");
+    if (ac) {
+        std::string conf(ac), clean; size_t p=0;
+        while(p<conf.size()){ size_t c=conf.find(',',p); if(c==std::string::npos)c=conf.size();
+            std::string t=conf.substr(p,c-p); if(t.find("expandable_segments")==std::string::npos){if(!clean.empty())clean+=",";clean+=t;} p=c+1;}
+        if(clean.empty()) unsetenv("PYTORCH_CUDA_ALLOC_CONF"); else setenv("PYTORCH_CUDA_ALLOC_CONF",clean.c_str(),1);
+        fprintf(stderr,"[cccl_alloc] PYTORCH_CUDA_ALLOC_CONF: \"%s\" -> \"%s\"\n",ac,clean.empty()?"(unset)":clean.c_str());
     }
-
-    /* Strip expandable_segments from PYTORCH_CUDA_ALLOC_CONF */
-    const char* alloc_conf = getenv("PYTORCH_CUDA_ALLOC_CONF");
-    if (alloc_conf) {
-        std::string conf(alloc_conf);
-        std::string clean;
-        size_t pos = 0;
-        while (pos < conf.size()) {
-            size_t comma = conf.find(',', pos);
-            if (comma == std::string::npos) comma = conf.size();
-            std::string token = conf.substr(pos, comma - pos);
-            if (token.find("expandable_segments") == std::string::npos) {
-                if (!clean.empty()) clean += ",";
-                clean += token;
-            }
-            pos = comma + 1;
-        }
-        if (clean.empty())
-            unsetenv("PYTORCH_CUDA_ALLOC_CONF");
-        else
-            setenv("PYTORCH_CUDA_ALLOC_CONF", clean.c_str(), 1);
-
-        fprintf(stderr, "[cccl_alloc] PYTORCH_CUDA_ALLOC_CONF: \"%s\" -> \"%s\"\n",
-                alloc_conf, clean.empty() ? "(unset)" : clean.c_str());
-    }
-
-    auto& alloc = get_allocator();
-    if (g_debug) alloc.debug = true;
-
-    g_preload_active = true;
-    fprintf(stderr,
-        "[cccl_alloc] LD_PRELOAD active — CUB CachingDeviceAllocator "
-        "(growth=%u, bins=[%u..%u], max_cached=%.1fGB)\n",
-        ALLOC_BIN_GROWTH, ALLOC_MIN_BIN, ALLOC_MAX_BIN,
-        (double)ALLOC_MAX_CACHED / (1024.0*1024.0*1024.0));
+    auto& a=get_allocator(); if(g_debug)a.debug=true; g_preload_active=true;
+    fprintf(stderr,"[cccl_alloc] LD_PRELOAD active — CUB CachingDeviceAllocator (growth=%u, bins=[%u..%u], max_cached=%.1fGB)\n",
+        ALLOC_BIN_GROWTH,ALLOC_MIN_BIN,ALLOC_MAX_BIN,(double)ALLOC_MAX_CACHED/(1024.0*1024.0*1024.0));
 }
 
-/* ========================================================================
- * cudaMalloc / cudaFree intercepts
- *
- * outside CUB → route to CUB CachingDeviceAllocator (bin + cache)
- * inside CUB  → pass through to real cudaMalloc/cudaFree (no recursion)
- * ======================================================================== */
-
-extern "C" cudaError_t cudaMalloc(void** devPtr, size_t size)
-{
-    if (!g_preload_active || inside_cub) {
-        return get_real_malloc()(devPtr, size);
-    }
-    inside_cub = true;
-    cudaError_t err = get_allocator().DeviceAllocate(devPtr, size);
-    inside_cub = false;
-    return err;
+extern "C" cudaError_t cudaMalloc(void** p, size_t s) {
+    if(!g_preload_active||inside_cub) return get_real_malloc()(p,s);
+    inside_cub=true; auto e=get_allocator().DeviceAllocate(p,s); inside_cub=false; return e;
 }
-
-extern "C" cudaError_t cudaFree(void* devPtr)
-{
-    if (!g_preload_active || inside_cub || devPtr == nullptr) {
-        return get_real_free()(devPtr);
-    }
-    inside_cub = true;
-    cudaError_t err = get_allocator().DeviceFree(devPtr);
-    inside_cub = false;
-    return err;
+extern "C" cudaError_t cudaFree(void* p) {
+    if(!g_preload_active||inside_cub||!p) return get_real_free()(p);
+    inside_cub=true; auto e=get_allocator().DeviceFree(p); inside_cub=false; return e;
 }
