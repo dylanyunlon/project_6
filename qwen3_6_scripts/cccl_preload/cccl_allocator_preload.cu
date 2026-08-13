@@ -123,20 +123,32 @@ static void cccl_preload_init() {
 
 /* ========================================================================
  * cudaMalloc / cudaFree intercepts
+ *
+ * CUB's DeviceAllocate internally calls cudaMalloc on cache miss.
+ * We must detect this reentrant call and forward to the real function,
+ * otherwise we get infinite recursion → segfault.
  * ======================================================================== */
+
+static thread_local bool g_in_allocator = false;
 
 extern "C" cudaError_t cudaMalloc(void** devPtr, size_t size)
 {
-    if (!g_preload_active) {
+    if (!g_preload_active || g_in_allocator) {
         return get_real_malloc()(devPtr, size);
     }
-    return get_allocator().DeviceAllocate(devPtr, size);
+    g_in_allocator = true;
+    cudaError_t err = get_allocator().DeviceAllocate(devPtr, size);
+    g_in_allocator = false;
+    return err;
 }
 
 extern "C" cudaError_t cudaFree(void* devPtr)
 {
-    if (!g_preload_active || devPtr == nullptr) {
+    if (!g_preload_active || devPtr == nullptr || g_in_allocator) {
         return get_real_free()(devPtr);
     }
-    return get_allocator().DeviceFree(devPtr);
+    g_in_allocator = true;
+    cudaError_t err = get_allocator().DeviceFree(devPtr);
+    g_in_allocator = false;
+    return err;
 }
