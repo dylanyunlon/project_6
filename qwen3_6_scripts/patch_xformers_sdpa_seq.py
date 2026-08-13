@@ -200,10 +200,6 @@ FALLBACK_METHOD = '''
         max_seqlen = max(seq_lens_list)
 
         try:
-            # Skip flash_attn during profiling — OOMs on large dummy batch
-            import os
-            if os.environ.get("BI100_IN_STARTUP_PROFILE") == "1":
-                raise RuntimeError("skip flash_attn during profiling")
             out = _ixf.flash_attn_varlen_func(
                 q_flat.to(torch.float16),
                 k_flat.to(torch.float16),
