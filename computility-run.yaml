@@ -10,7 +10,7 @@ command:
     - --max-model-len
     - '80000'
     - --gpu-memory-utilization
-    - '0.85'
+    - '0.80'
     - --trust-remote-code
     - -tp
     - '4'
@@ -19,7 +19,7 @@ command:
     - --disable-log-requests
     - --disable-frontend-multiprocessing
     - --max-num-batched-tokens
-    - '8192'
+    - '4096'
     - --enable-chunked-prefill
     - --max-seq-len-to-capture
     - '32768'
@@ -32,8 +32,6 @@ command:
     - --enforce-eager
     - --dtype
     - half
-    - --num-gpu-blocks-override
-    - '5500'
 env:
     - name: VLLM_ENGINE_ITERATION_TIMEOUT_S
       value: 3600
