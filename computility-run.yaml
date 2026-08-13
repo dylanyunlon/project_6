@@ -49,5 +49,4 @@ env:
       value: '1'
     - name: PYTORCH_CUDA_ALLOC_CONF
       value: max_split_size_mb:512
-    - name: LD_PRELOAD
-      value: /workspace/qwen3_6_scripts/cccl_preload/libcccl_allocator.so
+
