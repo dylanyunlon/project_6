@@ -19,7 +19,8 @@ command:
     - --disable-log-requests
     - --disable-frontend-multiprocessing
     - --max-num-batched-tokens
-    - '2048'
+    - '256'
+    - --enable-chunked-prefill
     - --max-seq-len-to-capture
     - '32768'
     - --enable-auto-tool-choice
