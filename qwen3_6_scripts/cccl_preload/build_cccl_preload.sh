@@ -75,6 +75,7 @@ COMMON_FLAGS=(
     # CUB needs this for non-NVCC compilers
     -D__CUDA_ARCH_LIST__=700
     -DCUB_DISABLE_NAMESPACE_MAGIC
+    -DCUB_WRAPPED_NAMESPACE=cccl_preload
 )
 
 if [[ "${CXX}" == *clang++* ]]; then

@@ -41,8 +41,8 @@ static constexpr unsigned int ALLOC_MAX_BIN      = 32;  /* 4 GB */
 static constexpr size_t       ALLOC_MAX_CACHED   = (size_t)8 * 1024 * 1024 * 1024; /* 8GB */
 
 /* ---- Global allocator singleton ---- */
-static cub::CachingDeviceAllocator& get_allocator() {
-    static cub::CachingDeviceAllocator instance(
+static cccl_preload::cub::CachingDeviceAllocator& get_allocator() {
+    static cccl_preload::cub::CachingDeviceAllocator instance(
         ALLOC_BIN_GROWTH,
         ALLOC_MIN_BIN,
         ALLOC_MAX_BIN,
