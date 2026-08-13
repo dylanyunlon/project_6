@@ -93,7 +93,7 @@ if [[ -n "$YAML_PRELOAD" ]]; then
     echo "  ✓ LD_PRELOAD已配置: $YAML_PRELOAD"
     PASS=$((PASS+1))
     # 检查路径与build输出一致
-    BUILD_OUTPUT_DIR=$(grep "build_cccl_preload.sh" qwen3_6_scripts/patch_ops.sh | grep -o '/workspace/[^ ]*' | head -1)
+    BUILD_OUTPUT_DIR=$(grep "build_cccl_preload.sh" qwen3_6_scripts/patch_ops.sh | grep -oP '/workspace/\S+' | head -1 | tr -d ';')
     EXPECTED_SO="${BUILD_OUTPUT_DIR}/libcccl_allocator.so"
     if [[ "$YAML_PRELOAD" == "$EXPECTED_SO" || "$YAML_PRELOAD" == "/workspace/qwen3_6_scripts/libcccl_allocator.so" ]]; then
         echo "  ✓ 路径匹配build输出"
