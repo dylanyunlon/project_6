@@ -246,6 +246,10 @@ if source != installed:
     raise SystemExit("runtime api_server overlay identity mismatch")
 PY
 
+build_stage "compiling CCCL CachingDeviceAllocator LD_PRELOAD module"
+bash ./build_cccl_preload_allocator.sh /workspace/qwen3_6_scripts || \
+    echo "[WARN] CCCL preload allocator build failed — will use default allocator"
+
 build_stage "compiling CoreX CUDA extensions (moe_index_combine + gdn_chunk_recurrent)"
 if [[ -x /usr/local/corex-3.2.3/bin/clang++ ]]; then
     bash ./build_corex_moe_index_combine.sh "${VLLM_ROOT}" || \
