@@ -13,7 +13,7 @@ def load_mod():
     if not os.path.exists(so):
         print("Run verify_gdn_cpp.py first to compile")
         return None
-    spec = importlib.util.spec_from_file_location("m", so)
+    spec = importlib.util.spec_from_file_location("corex_gdn_chunk_recurrent", so)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
