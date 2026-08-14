@@ -24,7 +24,6 @@ limitations under the License.
 #include <cub/util_type.cuh>
 
 #if !defined(USE_DCU) && !defined(USE_MACA)
-#include <cuda/functional>
 #endif
 
 #include "kernels/cuda/device_utils.cuh"
