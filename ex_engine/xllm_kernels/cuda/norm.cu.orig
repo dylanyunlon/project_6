@@ -28,9 +28,9 @@ limitations under the License.
 // https://github.com/vllm-project/vllm/blob/main/csrc/layernorm_kernels.cu
 
 #if CUB_VERSION >= 200800
-// corex CUB (CUDA 10.2) — no cuda::std::functional
-using CubAddOp = cub::Sum;
-using CubMaxOp = cub::Max;
+#include <cuda/std/functional>
+using CubAddOp = ::cuda::std::plus<>;
+using CubMaxOp = ::cuda::maximum<>;
 #else   // if CUB_VERSION < 200800
 using CubAddOp = cub::Sum;
 using CubMaxOp = cub::Max;
