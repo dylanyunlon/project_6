@@ -20,14 +20,12 @@ CAPACITY_ANCHOR = """\
 CAPACITY_REPLACEMENT = """\
         num_gpu_blocks = reserve_block_major_gpu_blocks(
             num_gpu_blocks, cache_block_size)
-        # BI100: cap GPU blocks — profiling with zero-tensor attention
-        # underestimates memory, causing runtime OOM if uncapped.
-        _bi100_max = int(os.environ.get("BI100_MAX_GPU_BLOCKS", "0"))
-        if _bi100_max > 0 and num_gpu_blocks > _bi100_max:
+        # BI100: profiling with zero-tensor attention underestimates memory.
+        # Hardcap at 5000 blocks (80K tokens) to prevent runtime OOM.
+        if num_gpu_blocks > 5000:
             logger.warning(
-                "[BI100] capping num_gpu_blocks: %d -> %d (BI100_MAX_GPU_BLOCKS)",
-                num_gpu_blocks, _bi100_max)
-            num_gpu_blocks = _bi100_max
+                "[BI100] capping num_gpu_blocks: %d -> 5000", num_gpu_blocks)
+            num_gpu_blocks = 5000
         num_gpu_blocks = max(num_gpu_blocks, 0)
         num_cpu_blocks = max(num_cpu_blocks, 0)
 """
