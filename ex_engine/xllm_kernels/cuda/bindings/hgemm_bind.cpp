@@ -7,6 +7,8 @@
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
 #include <vector>
 
 // Forward declarations from hgemm_blocktiling.cu
@@ -50,7 +52,7 @@ torch::Tensor hgemm(torch::Tensor A, torch::Tensor B) {
     __half alpha = __float2half(1.0f);
     __half beta  = __float2half(0.0f);
 
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
 
     launch_hgemm_blocktiling(
         M, N, K, &alpha,
@@ -107,7 +109,7 @@ torch::Tensor moe_expert_gemm(
         cumsum += counts[i];
     }
 
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
 
     launch_moe_expert_hgemm(
         num_experts,
