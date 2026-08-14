@@ -149,7 +149,7 @@ torch::Tensor ix_group_gemm(
       output, inputs, weights, token_count,
       /*dst_to_src=*/kNoneTensor,
       /*bias=*/kNoneTensor,
-      /*format=*/"NT",
+      /*format=*/"TN",
       /*persistent=*/0,
       /*output_n=*/output_n);
   return output;

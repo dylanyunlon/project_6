@@ -204,6 +204,26 @@ _USE_COREX_MOE_INDEX_COMBINE = (
     and env_bool("BI100_MOE_COREX_INDEX_COMBINE", True))
 _USE_FUSED_MOE_ACTIVATION = env_bool("BI100_MOE_FUSED_ACTIVATION", True)
 
+# ix_fused_moe: full 7-step fused MoE pipeline via ixformer C++ API
+# Source: xllm/core/layers/ilu/fused_moe.cpp → ix_moe_bridge.so
+try:
+    from vllm.model_executor.models import ix_fused_moe as _ix_fused_moe
+    _HAS_IX_FUSED_MOE = _ix_fused_moe.is_available()
+except ImportError:
+    try:
+        import ix_fused_moe as _ix_fused_moe
+        _HAS_IX_FUSED_MOE = _ix_fused_moe.is_available()
+    except ImportError:
+        _ix_fused_moe = None
+        _HAS_IX_FUSED_MOE = False
+_USE_IX_FUSED_MOE = (
+    _HAS_IX_FUSED_MOE
+    and env_bool("BI100_MOE_IX_FUSED", True))
+if _USE_IX_FUSED_MOE:
+    logger.info("ix_fused_moe ENABLED — full 7-step fused MoE pipeline")
+else:
+    logger.info("ix_fused_moe unavailable — using point-optimized Python MoE")
+
 
 # ---------------------------------------------------------------------------
 # Qwen3.6 vision tower and vLLM 0.6 multimodal input integration
@@ -1620,13 +1640,30 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
-        """Pure-PyTorch MoE (ixformer has no MoE kernels on BI-V100).
+        """MoE expert dispatch — fused C++ pipeline when available.
 
         w13_weight: (num_experts, 2*inter_per_partition, hidden)  [TP-sharded]
         w2_weight:  (num_experts, hidden,  inter_per_partition)   [TP-sharded]
         Output is partial (pre-all-reduce), same contract as FusedMoE
         with reduce_results=False.
         """
+        # ---------------------------------------------------------------
+        # Tier 0: Full fused MoE via ix_moe_bridge (xllm 7-step pipeline)
+        # topk → gen_idx → expand → group_gemm → silu → group_gemm → combine
+        # Source: xllm/core/layers/ilu/fused_moe.cpp
+        # ---------------------------------------------------------------
+        if _USE_IX_FUSED_MOE:
+            w13 = self.experts.w13_weight  # (E, 2*I, H)
+            w2 = self.experts.w2_weight    # (E, H, I)
+            return _ix_fused_moe.fused_moe_forward(
+                hidden_states, router_logits,
+                w13, w2,
+                self.top_k, w13.shape[0],
+                True)  # renormalize
+
+        # ---------------------------------------------------------------
+        # Tier 1: Point-optimized Python loop (individual corex .so)
+        # ---------------------------------------------------------------
         # Fused topk+softmax: single CUB kernel vs 2 PyTorch ops.
         # Source: xllm/core/kernels/cuda/moe/moe_topk_softmax_kernels.cuh
         if _USE_COREX_MOE_TOPK_SOFTMAX:

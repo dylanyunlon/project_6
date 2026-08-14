@@ -185,7 +185,19 @@ build_stage "installing vLLM Qwen3.6 model implementation"
 # --- vllm model: Qwen3.6-35B-A3B (Qwen3_5 MoE arch) -------------------------
 cp ./mamba_cache.py "${VLLM_ROOT}/model_executor/models/"
 cp ./qwen3_5.py "${VLLM_ROOT}/model_executor/models/qwen3_5.py"
+cp ./ix_fused_moe.py "${VLLM_ROOT}/model_executor/models/ix_fused_moe.py" || true
 python3 ./patch_vllm_qwen3_5.py
+
+# --- Deploy prebuilt .so into vllm package for import -----------------------
+PREBUILT_DIR="./prebuilt/corex-3.2.3-ivcore10"
+if [ -d "$PREBUILT_DIR" ]; then
+    for so_file in "$PREBUILT_DIR"/*.so; do
+        base=$(basename "$so_file" .so)
+        # Deploy corex_*.so as vllm submodules (import from vllm import corex_xxx)
+        cp "$so_file" "${VLLM_ROOT}/${base}.so" 2>/dev/null || true
+        echo "[patch_ops] deployed ${base}.so → ${VLLM_ROOT}/"
+    done
+fi
 
 # --- sequence.py: fix completion_tokens inflation under chunked prefill ------
 # Bug: get_output_token_ids_to_return(delta=True) with num_new_tokens=0
