@@ -6,3 +6,4 @@ baseline.muh
 pkgs/
 enginex_base/
 __pycache__/
+*.pyc
