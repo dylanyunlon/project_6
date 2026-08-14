@@ -157,6 +157,14 @@ except ImportError:
         _xllm_moe = None
 
 try:
+    from vllm import xllm_moe_gemm as _xllm_moe_gemm
+except ImportError:
+    try:
+        import xllm_moe_gemm as _xllm_moe_gemm
+    except ImportError:
+        _xllm_moe_gemm = None
+
+try:
     from vllm import corex_gdn_chunk_recurrent as _corex_gdn_chunk_recurrent
 except ImportError:
     _corex_gdn_chunk_recurrent = None
@@ -213,8 +221,13 @@ _USE_COREX_MOE_INDEX_COMBINE = (
 _USE_XLLM_MOE = (
     _xllm_moe is not None
     and env_bool("BI100_MOE_XLLM", True))
+_USE_XLLM_MOE_GEMM = (
+    _xllm_moe_gemm is not None
+    and env_bool("BI100_MOE_XLLM_GEMM", True))
 if _USE_XLLM_MOE:
     logger.info("xllm_moe ENABLED — fused_topk + compute_index + combine_result")
+if _USE_XLLM_MOE_GEMM:
+    logger.info("xllm_moe_gemm ENABLED — batched expert GEMM (replaces Python loop)")
 _USE_FUSED_MOE_ACTIVATION = env_bool("BI100_MOE_FUSED_ACTIVATION", True)
 
 # ix_fused_moe: full 7-step fused MoE pipeline via ixformer C++ API
@@ -1808,21 +1821,37 @@ class Qwen3_5MoeSparseBlock(nn.Module):
                 expert_counts = torch.bincount(
                     flat_eids, minlength=w13.shape[0]).tolist()
 
-            start = 0
-            for eid, count in enumerate(expert_counts):
-                end = start + count
-                if count == 0:
+            if _USE_XLLM_MOE_GEMM:
+                # Batched expert GEMM via CUDA — eliminates Python for-loop
+                # Build expert_offsets from expert_counts (cumsum with leading 0)
+                expert_counts_t = torch.tensor(
+                    expert_counts if isinstance(expert_counts, list)
+                    else expert_counts.tolist(),
+                    dtype=torch.int64, device=hidden_states.device)
+                expert_offsets = torch.zeros(
+                    len(expert_counts) + 1, dtype=torch.int64,
+                    device=hidden_states.device)
+                torch.cumsum(expert_counts_t, dim=0, out=expert_offsets[1:])
+                out = _xllm_moe_gemm.moe_experts_forward(
+                    hidden_states, w13, w2,
+                    sorted_tok_ids, sorted_weights.float(),
+                    expert_offsets, self.top_k)
+            else:
+                start = 0
+                for eid, count in enumerate(expert_counts):
+                    end = start + count
+                    if count == 0:
+                        start = end
+                        continue
+                    tok_ids = sorted_tok_ids[start:end]
+                    tokens = hidden_states[tok_ids]                # (n, H)
+                    gate_up = F.linear(tokens, w13[eid])           # (n, 2*I)
+                    gate, up = gate_up.chunk(2, dim=-1)
+                    act = F.silu(gate) * up                        # (n, I)
+                    expert_out = F.linear(act, w2[eid])            # (n, H)
+                    weights = sorted_weights[start:end].unsqueeze(-1)
+                    out.index_add_(0, tok_ids, (expert_out * weights).to(out.dtype))
                     start = end
-                    continue
-                tok_ids = sorted_tok_ids[start:end]
-                tokens = hidden_states[tok_ids]                # (n, H)
-                gate_up = F.linear(tokens, w13[eid])           # (n, 2*I)
-                gate, up = gate_up.chunk(2, dim=-1)
-                act = F.silu(gate) * up                        # (n, I)
-                expert_out = F.linear(act, w2[eid])            # (n, H)
-                weights = sorted_weights[start:end].unsqueeze(-1)
-                out.index_add_(0, tok_ids, (expert_out * weights).to(out.dtype))
-                start = end
 
         return out  # partial, all-reduce done in forward()
 
