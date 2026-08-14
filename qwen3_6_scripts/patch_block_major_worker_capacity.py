@@ -21,11 +21,12 @@ CAPACITY_REPLACEMENT = """\
         num_gpu_blocks = reserve_block_major_gpu_blocks(
             num_gpu_blocks, cache_block_size)
         # BI100: profiling with zero-tensor attention underestimates memory.
-        # Hardcap at 5000 blocks (80K tokens) to prevent runtime OOM.
-        if num_gpu_blocks > 5000:
+        # Hardcap at 3000 blocks (48K tokens) to prevent runtime OOM.
+        # Must leave ~4GB free for flash_attn_varlen_func temp buffers.
+        if num_gpu_blocks > 3000:
             logger.warning(
-                "[BI100] capping num_gpu_blocks: %d -> 5000", num_gpu_blocks)
-            num_gpu_blocks = 5000
+                "[BI100] capping num_gpu_blocks: %d -> 3000", num_gpu_blocks)
+            num_gpu_blocks = 3000
         num_gpu_blocks = max(num_gpu_blocks, 0)
         num_cpu_blocks = max(num_cpu_blocks, 0)
 """
