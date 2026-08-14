@@ -25,10 +25,6 @@ limitations under the License.
 
 #include "device_utils.cuh"
 
-#ifndef DEVICE_INLINE
-#define DEVICE_INLINE __device__ __forceinline__
-#define HOST_DEVICE_INLINE __host__ __device__ __forceinline__
-#endif
 
 
 namespace xllm::kernel::cuda {

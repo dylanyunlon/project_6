@@ -116,6 +116,20 @@ struct TopkConstants {
 }  // namespace xllm::kernel::cuda
 
 // ============================================================================
+// Portable macros and utilities (from xllm/core/kernels/cuda/utils.h)
+// ============================================================================
+#ifndef DEVICE_INLINE
+#define DEVICE_INLINE __device__ __forceinline__
+#define HOST_DEVICE_INLINE __host__ __device__ __forceinline__
+#endif
+
+template <typename T>
+HOST_DEVICE_INLINE constexpr std::enable_if_t<std::is_integral_v<T>, T>
+ceil_div(T a, T b) {
+    return (a + b - 1) / b;
+}
+
+// ============================================================================
 // Dispatch macros (from xllm/core/kernels/cuda/utils.h)
 // These wrap AT_DISPATCH_SWITCH for float16/bfloat16/float32 dispatch.
 // Placed here because cuda_ops_api.h → utils.h is not available on corex
