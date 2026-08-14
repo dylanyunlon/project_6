@@ -143,6 +143,18 @@ install_patch_file \
 build_stage "installing hash-pinned CoreX 3.2.3 extensions"
 bash ./install_prebuilt_corex.sh "${VLLM_ROOT}"
 
+build_stage "building ix_full_bridge.so (ixformer_torch_ext C++ bridge)"
+bash ./build_ix_bridge.sh "${VLLM_ROOT}" || {
+    echo "[WARN] ix_full_bridge build failed — bridge functions unavailable"
+}
+
+build_stage "building corex_moe_index_combine.so (CUB block_scan)"
+if [[ ! -f "${VLLM_ROOT}/corex_moe_index_combine.so" ]]; then
+    bash ./build_corex_moe_index_combine.sh "${VLLM_ROOT}" || {
+        echo "[WARN] corex_moe_index_combine build failed"
+    }
+fi
+
 build_stage "installing BI100 runtime modules"
 cp ./bi100_env.py "${VLLM_ROOT}/bi100_env.py"
 cp ./bi100_profile.py "${VLLM_ROOT}/bi100_profile.py"
