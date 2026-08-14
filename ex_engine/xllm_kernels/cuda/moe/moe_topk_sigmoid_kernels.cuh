@@ -26,7 +26,7 @@ limitations under the License.
 #if !defined(USE_DCU) && !defined(USE_MACA)
 #endif
 
-#include "kernels/cuda/device_utils.cuh"
+#include "device_utils.cuh"
 
 namespace {
 

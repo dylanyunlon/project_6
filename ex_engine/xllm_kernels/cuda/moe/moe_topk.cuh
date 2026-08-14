@@ -35,14 +35,14 @@
 #include <hipcub/hipcub.hpp>
 #endif
 
-#include "core/kernels/cuda/arch_condition.h"
+#include "arch_condition.h"
 
 #if defined(USE_DCU)
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
 #endif
 
-#include "core/kernels/cuda/device_utils.cuh"
+#include "device_utils.cuh"
 
 namespace xllm::kernel::cuda {
 namespace reduce_topk {
