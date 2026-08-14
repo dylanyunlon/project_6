@@ -149,6 +149,14 @@ except ImportError:
     _corex_moe_index_combine = None
 
 try:
+    from vllm import xllm_moe as _xllm_moe
+except ImportError:
+    try:
+        import xllm_moe as _xllm_moe
+    except ImportError:
+        _xllm_moe = None
+
+try:
     from vllm import corex_gdn_chunk_recurrent as _corex_gdn_chunk_recurrent
 except ImportError:
     _corex_gdn_chunk_recurrent = None
@@ -202,6 +210,11 @@ _USE_COREX_MOE_TOPK_SOFTMAX = (
 _USE_COREX_MOE_INDEX_COMBINE = (
     _corex_moe_index_combine is not None
     and env_bool("BI100_MOE_COREX_INDEX_COMBINE", True))
+_USE_XLLM_MOE = (
+    _xllm_moe is not None
+    and env_bool("BI100_MOE_XLLM", True))
+if _USE_XLLM_MOE:
+    logger.info("xllm_moe ENABLED — fused_topk + compute_index + combine_result")
 _USE_FUSED_MOE_ACTIVATION = env_bool("BI100_MOE_FUSED_ACTIVATION", True)
 
 # ix_fused_moe: full 7-step fused MoE pipeline via ixformer C++ API
@@ -1666,7 +1679,12 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         # ---------------------------------------------------------------
         # Fused topk+softmax: single CUB kernel vs 2 PyTorch ops.
         # Source: xllm/core/kernels/cuda/moe/moe_topk_softmax_kernels.cuh
-        if _USE_COREX_MOE_TOPK_SOFTMAX:
+        if _USE_XLLM_MOE:
+            topk_weights, topk_ids = _xllm_moe.moe_fused_topk(
+                router_logits, self.top_k, True, None, "softmax")
+            topk_ids = topk_ids.to(torch.int64)
+            topk_weights = topk_weights.to(hidden_states.dtype)
+        elif _USE_COREX_MOE_TOPK_SOFTMAX:
             topk_weights, topk_ids = _corex_moe_topk_softmax.moe_topk_softmax(
                 router_logits.float(), self.top_k, True)
             topk_ids = topk_ids.to(torch.int64)
@@ -1762,7 +1780,16 @@ class Qwen3_5MoeSparseBlock(nn.Module):
             out = torch.zeros_like(hidden_states)
             flat_eids = topk_ids.reshape(-1)
 
-            if _USE_COREX_MOE_INDEX_COMBINE:
+            if _USE_XLLM_MOE:
+                # xllm CUDA: histogram + prefix_sum + place
+                src_dst, dst_src, expert_sizes = \
+                    _xllm_moe.moe_compute_index(flat_eids, w13.shape[0])
+                sorted_tok_ids = torch.arange(
+                    T, device=topk_ids.device
+                ).repeat_interleave(self.top_k)[dst_src.long()]
+                sorted_weights = topk_weights.reshape(-1)[dst_src.long()]
+                expert_counts = expert_sizes.tolist()
+            elif _USE_COREX_MOE_INDEX_COMBINE:
                 # Fused CUDA: histogram + prefix_sum + place (11.5x faster)
                 src_dst, dst_src, expert_sizes = \
                     _corex_moe_index_combine.moe_compute_index(
