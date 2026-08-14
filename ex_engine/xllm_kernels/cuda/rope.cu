@@ -16,7 +16,7 @@ limitations under the License.
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>
 
-#include "cuda_ops_api.h"
+
 #include "device_utils.cuh"
 
 // ref to:

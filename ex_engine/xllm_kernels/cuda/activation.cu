@@ -17,7 +17,7 @@ limitations under the License.
 
 #include <cstdint>
 
-#include "cuda_ops_api.h"
+
 #include "device_utils.cuh"
 
 // ref to:

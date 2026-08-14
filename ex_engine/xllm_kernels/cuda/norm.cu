@@ -19,7 +19,6 @@ limitations under the License.
 #include <cstdint>
 #include <cub/cub.cuh>
 
-#include "cuda_ops_api.h"
 #include "device_utils.cuh"
 #include "fp8_quant_utils.cuh"
 #include "type_convert.cuh"
@@ -27,14 +26,10 @@ limitations under the License.
 // ref to:
 // https://github.com/vllm-project/vllm/blob/main/csrc/layernorm_kernels.cu
 
-#if CUB_VERSION >= 200800
-// corex CUB (CUDA 10.2) — no cuda::std::functional
+// corex CUB (CUDA 10.2) — use old-style CUB operators
 using CubAddOp = cub::Sum;
 using CubMaxOp = cub::Max;
-#else   // if CUB_VERSION < 200800
-using CubAddOp = cub::Sum;
-using CubMaxOp = cub::Max;
-#endif  // CUB_VERSION
+
 
 namespace {
 

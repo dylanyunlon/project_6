@@ -27,7 +27,7 @@ limitations under the License.
 
 #include <cub/block/block_scan.cuh>
 
-#include "kernels/cuda/cuda_ops_api.h"
+#include "device_utils.cuh"
 
 namespace xllm::kernel::cuda {
 

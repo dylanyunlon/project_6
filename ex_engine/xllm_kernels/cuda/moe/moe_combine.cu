@@ -28,7 +28,7 @@ limitations under the License.
 #include <c10/cuda/CUDAGuard.h>
 
 #include "device_utils.cuh"
-#include "kernels/cuda/cuda_ops_api.h"
+#include "device_utils.cuh"
 
 namespace xllm::kernel::cuda {
 

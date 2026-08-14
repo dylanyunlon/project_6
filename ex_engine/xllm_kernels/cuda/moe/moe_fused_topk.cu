@@ -15,7 +15,7 @@ limitations under the License.
 #if defined(USE_DCU)
 #include "kernels/dcu/dcu_ops_api.h"
 #else
-#include "kernels/cuda/cuda_ops_api.h"
+#include "device_utils.cuh"
 #endif
 #include "moe_topk_sigmoid_kernels.cuh"
 #include "moe_topk_softmax_kernels.cuh"

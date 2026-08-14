@@ -23,7 +23,7 @@ limitations under the License.
 #include <cstdint>
 #include <type_traits>
 
-#include "cuda_ops_api.h"
+#include "device_utils.cuh"
 #include "utils.h"
 
 namespace xllm::kernel::cuda {
