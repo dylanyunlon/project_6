@@ -128,7 +128,7 @@ def test_rope():
     inv_freq = 1.0 / (10000.0 ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim))
     t = torch.arange(max_pos, dtype=torch.float32)
     freqs = torch.outer(t, inv_freq)
-    cos_sin_cache = torch.cat([freqs.cos(), freqs.sin()], dim=-1).to("cuda")
+    cos_sin_cache = torch.cat([freqs.cos(), freqs.sin()], dim=-1).half().to("cuda")
 
     positions = torch.arange(num_tokens, dtype=torch.long, device="cuda")
     q = torch.randn(num_tokens, num_heads * head_size, dtype=torch.float16, device="cuda")
