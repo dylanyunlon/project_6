@@ -160,7 +160,7 @@ def test_cache():
     n_blocks = 8
     block_size = 16
 
-    slot_ids = torch.tensor([0, 1, 16, 17], dtype=torch.long, device="cuda")
+    slot_ids = torch.tensor([0, 1, 16, 17], dtype=torch.int32, device="cuda")
     keys = torch.randn(n_tokens, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
     values = torch.randn(n_tokens, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
     key_cache = torch.zeros(n_blocks, block_size, n_kv_heads, head_dim,
