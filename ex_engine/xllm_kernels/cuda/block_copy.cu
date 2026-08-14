@@ -24,7 +24,6 @@ limitations under the License.
 #include <type_traits>
 
 #include "device_utils.cuh"
-#include "utils.h"
 
 namespace xllm::kernel::cuda {
 namespace {
@@ -133,11 +132,11 @@ void block_copy(torch::Tensor key_cache_ptrs,
     return;
   }
 
-  CHECK(key_cache_ptrs.is_cuda());
-  CHECK(value_cache_ptrs.is_cuda());
-  CHECK(src_block_indices.is_cuda());
-  CHECK(dst_block_indices.is_cuda());
-  CHECK(cum_sum.is_cuda());
+  TORCH_CHECK(key_cache_ptrs.is_cuda());
+  TORCH_CHECK(value_cache_ptrs.is_cuda());
+  TORCH_CHECK(src_block_indices.is_cuda());
+  TORCH_CHECK(dst_block_indices.is_cuda());
+  TORCH_CHECK(cum_sum.is_cuda());
   CHECK_EQ(key_cache_ptrs.scalar_type(), torch::kInt64);
   CHECK_EQ(value_cache_ptrs.scalar_type(), torch::kInt64);
   CHECK_EQ(src_block_indices.scalar_type(), torch::kInt32);
@@ -148,11 +147,11 @@ void block_copy(torch::Tensor key_cache_ptrs,
   CHECK_EQ(src_block_indices.dim(), 1);
   CHECK_EQ(dst_block_indices.dim(), 1);
   CHECK_EQ(cum_sum.dim(), 1);
-  CHECK(key_cache_ptrs.is_contiguous());
-  CHECK(value_cache_ptrs.is_contiguous());
-  CHECK(src_block_indices.is_contiguous());
-  CHECK(dst_block_indices.is_contiguous());
-  CHECK(cum_sum.is_contiguous());
+  TORCH_CHECK(key_cache_ptrs.is_contiguous());
+  TORCH_CHECK(value_cache_ptrs.is_contiguous());
+  TORCH_CHECK(src_block_indices.is_contiguous());
+  TORCH_CHECK(dst_block_indices.is_contiguous());
+  TORCH_CHECK(cum_sum.is_contiguous());
   CHECK_EQ(key_cache_ptrs.size(0), value_cache_ptrs.size(0));
   CHECK_EQ(src_block_indices.size(0), cum_sum.size(0));
   CHECK_GT(numel_per_block, 0);
