@@ -5,6 +5,7 @@
 //   moe_expert_gemm(input, weights, expert_counts) → output
 
 #include <torch/extension.h>
+#include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <vector>
 
