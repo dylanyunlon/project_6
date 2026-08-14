@@ -260,6 +260,10 @@ else
     echo "[WARN] corex clang++ not found — skipping extension builds"
 fi
 
+build_stage "compiling ixformer bridge .so (MoE + Attention + Norm)"
+bash ./build_ix_bridge.sh "${VLLM_ROOT}" || \
+    echo "[WARN] ix_full_bridge build failed — MoE will use PyTorch fallback"
+
 build_stage "compiling submission Python sources"
 find . -path './wheels' -prune -o -name '*.py' -print0 | xargs -0 python3 -m py_compile
 build_stage "patch script completed"
