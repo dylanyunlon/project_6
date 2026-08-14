@@ -182,7 +182,7 @@ torch::Tensor ix_silu_and_mul(torch::Tensor input) {
 void ix_rms_norm(torch::Tensor output, torch::Tensor input,
                  torch::Tensor weight, double eps) {
     ixformer::infer::rms_norm(input, weight, output,
-                              /*fused_bias=*/std::nullopt, eps);
+                              /*fused_bias=*/c10::nullopt, eps);
 }
 
 // --- fused_add_rms_norm ---
@@ -193,7 +193,7 @@ void ix_fused_add_rms_norm(torch::Tensor input, torch::Tensor residual,
                            torch::Tensor residual_output, double eps) {
     ixformer::infer::residual_rms_norm(input, residual, weight,
                                        output, residual_output,
-                                       /*fused_bias=*/std::nullopt,
+                                       /*fused_bias=*/c10::nullopt,
                                        /*alpha=*/1.0, eps,
                                        /*is_post=*/false);
 }
@@ -209,7 +209,7 @@ torch::Tensor ix_linear(torch::Tensor input, torch::Tensor weight,
     }
     return ixformer::infer::ixformer_linear(
         input, weight, /*act_type=*/0, bias,
-        /*out=*/std::nullopt, /*persistent=*/std::nullopt);
+        /*out=*/c10::nullopt, /*persistent=*/c10::nullopt);
 }
 
 // --- rotary_embedding ---
@@ -250,7 +250,7 @@ torch::Tensor ix_paged_attention(
         block_size, max_context_len, alibi_slopes,
         /*causal=*/true, /*window_left=*/-1, /*window_right=*/-1,
         /*softcap=*/0.0, /*enable_cuda_graph=*/false,
-        /*use_sqrt_alibi=*/false, /*sinks=*/std::nullopt);
+        /*use_sqrt_alibi=*/false, /*sinks=*/c10::nullopt);
 }
 
 // --- flash_attn_prefill ---
@@ -261,13 +261,13 @@ torch::Tensor ix_flash_attn_prefill(
     int64_t max_query_len, int64_t max_seq_len,
     double scale, bool is_causal,
     int64_t window_left, int64_t window_right) {
-    c10::optional<torch::Tensor> lse = std::nullopt;
+    c10::optional<torch::Tensor> lse = c10::nullopt;
     return ixformer::infer::ixinfer_flash_attn_unpad_with_block_tables(
         query, key_cache, value_cache, output, block_tables,
         cu_seq_q, cu_seq_k, max_query_len, max_seq_len,
         is_causal, window_left, window_right, scale,
         /*softcap=*/0.0, /*sqrt_alibi=*/false,
-        /*alibi_slopes=*/std::nullopt, /*sinks=*/std::nullopt, lse);
+        /*alibi_slopes=*/c10::nullopt, /*sinks=*/c10::nullopt, lse);
 }
 
 // --- MoE: topk_softmax ---
