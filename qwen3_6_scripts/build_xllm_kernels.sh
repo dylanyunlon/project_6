@@ -64,5 +64,8 @@ build_kernel "xllm_rope" \
 build_kernel "xllm_cache" \
     "${CUDA_DIR}/reshape_paged_cache.cu" "${CUDA_DIR}/block_copy.cu" "${BIND_DIR}/xllm_cache_bind.cpp"
 
+build_kernel "xllm_moe" \
+    "${CUDA_DIR}/moe/moe_fused_topk.cu" "${CUDA_DIR}/moe/moe_compute_index.cu" "${CUDA_DIR}/moe/moe_combine.cu" "${BIND_DIR}/xllm_moe_bind.cpp"
+
 echo "=== All kernels built ==="
 ls -lh "${PREBUILT_DIR}"/xllm_*.so 2>/dev/null || echo "No .so files found"

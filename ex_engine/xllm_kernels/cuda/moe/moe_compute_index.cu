@@ -24,6 +24,7 @@ limitations under the License.
 // expert_offsets = exclusive prefix sum of counts       (scratch, reused)
 
 #include <c10/cuda/CUDAGuard.h>
+#include <torch/extension.h>
 
 #include <cub/block/block_scan.cuh>
 
@@ -115,7 +116,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> moe_compute_index(
   auto stream = at::cuda::getCurrentCUDAStream();
   int64_t N = expert_id.numel();
   int32_t E = static_cast<int32_t>(num_experts);
-  CHECK_LE(E, kMoeIndexBlock) << "num_experts cannot exceed " << kMoeIndexBlock;
+  TORCH_CHECK(E <= kMoeIndexBlock, "num_experts cannot exceed ", kMoeIndexBlock);
   auto expert_id_i32 = expert_id.to(torch::kInt32).contiguous();
   auto opt_i32 = expert_id_i32.options();
 

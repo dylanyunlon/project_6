@@ -179,7 +179,51 @@ def test_cache():
     report("cache.block_copy", "PASS", "loaded OK (complex setup needed for full test)")
 
 # =========================================================================
-# 5. Compare against ixformer (base image) if available
+# 5. xllm_moe — moe_fused_topk, moe_compute_index, moe_combine_result
+# =========================================================================
+def test_moe():
+    mod = load_so("xllm_moe")
+    if mod is None:
+        report("xllm_moe", "SKIP", "not found")
+        return
+
+    num_tokens = 8
+    num_experts = 64
+    topk = 8
+    H = 256
+
+    # --- moe_fused_topk ---
+    gating = torch.randn(num_tokens, num_experts, dtype=torch.float32, device="cuda")
+    weights, ids = mod.moe_fused_topk(gating, topk, True, None, "softmax")
+    assert weights.shape == (num_tokens, topk), f"weights shape {weights.shape}"
+    assert ids.shape == (num_tokens, topk), f"ids shape {ids.shape}"
+    w_sum_err = (weights.sum(-1) - 1.0).abs().max().item()
+    report("moe.fused_topk", "PASS" if w_sum_err < 0.01 else "FAIL",
+           f"shape=({num_tokens},{topk}) weight_sum_err={w_sum_err:.6f}")
+
+    # --- moe_compute_index ---
+    expert_ids = ids.reshape(-1)  # (num_tokens * topk,)
+    src_dst, dst_src, expert_sizes = mod.moe_compute_index(expert_ids, num_experts)
+    total = expert_sizes.sum().item()
+    report("moe.compute_index", "PASS" if total == num_tokens * topk else "FAIL",
+           f"total={total} expected={num_tokens * topk}")
+
+    # --- moe_combine_result ---
+    gemm2 = torch.randn(num_tokens * topk, H, dtype=torch.float16, device="cuda")
+    rw = weights  # (num_tokens, topk)
+    out = mod.moe_combine_result(gemm2, rw, num_tokens, topk)
+    assert out.shape == (num_tokens, H), f"output shape {out.shape}"
+    # Reference: manual weighted sum
+    ref = torch.zeros(num_tokens, H, dtype=torch.float32, device="cuda")
+    for i in range(num_tokens):
+        for k in range(topk):
+            ref[i] += rw[i, k] * gemm2[i * topk + k].float()
+    err = (out.float() - ref).abs().max().item()
+    report("moe.combine_result", "PASS" if err < 0.1 else "FAIL",
+           f"max_err={err:.6f}")
+
+# =========================================================================
+# 6. Compare against ixformer (base image) if available
 # =========================================================================
 def test_vs_ixformer():
     """Compare our xllm .so output against ixformer's implementation."""
@@ -244,7 +288,10 @@ if __name__ == "__main__":
     print("[4/5] xllm_cache")
     test_cache()
 
-    print("[5/5] vs ixformer (base image)")
+    print("[5/6] xllm_moe")
+    test_moe()
+
+    print("[6/6] vs ixformer (base image)")
     test_vs_ixformer()
 
     elapsed = time.time() - t0

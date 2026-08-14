@@ -28,7 +28,7 @@ limitations under the License.
 #include <c10/cuda/CUDAGuard.h>
 
 #include "device_utils.cuh"
-#include "device_utils.cuh"
+#include <torch/extension.h>
 
 namespace xllm::kernel::cuda {
 

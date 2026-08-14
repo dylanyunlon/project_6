@@ -16,6 +16,7 @@ limitations under the License.
 #include "kernels/dcu/dcu_ops_api.h"
 #else
 #include "device_utils.cuh"
+#include <torch/extension.h>
 #endif
 #include "moe_topk_sigmoid_kernels.cuh"
 #include "moe_topk_softmax_kernels.cuh"
@@ -49,8 +50,7 @@ std::tuple<torch::Tensor, torch::Tensor> moe_fused_topk(
     topk_sigmoid(
         topk_weights, topk_ids, gating_output, renormalize, correction_bias);
   } else {
-    LOG(FATAL) << "Unsupported scoring function for moe topk: " << scoring_func
-               << "only softmax and sigmoid are supported";
+    TORCH_CHECK(false, "Unsupported scoring function: ", scoring_func);
   }
 
   return std::make_tuple(topk_weights, topk_ids);
