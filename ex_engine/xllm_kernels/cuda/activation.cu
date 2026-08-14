@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/cuda.h>
+#include <torch/extension.h>
 
 #include <cstdint>
 
@@ -166,8 +167,8 @@ void act_and_mul(torch::Tensor out,
                  const std::string& act_mode) {
   if (act_mode != "silu" && act_mode != "gelu" && act_mode != "gelu_tanh" &&
       act_mode != "gelu_pytorch_tanh") {
-    LOG(FATAL) << "Unsupported act mode: " << act_mode
-               << ", only support silu, gelu, gelu_tanh, gelu_pytorch_tanh";
+    TORCH_CHECK(false, "Unsupported act mode: ", act_mode,
+                ", only support silu, gelu, gelu_tanh, gelu_pytorch_tanh");
   }
 
   // flashinfer act_and_mul ops

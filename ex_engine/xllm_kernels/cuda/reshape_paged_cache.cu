@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include <c10/cuda/CUDAStream.h>
+#include <torch/extension.h>
 
 
 #include "device_utils.cuh"
