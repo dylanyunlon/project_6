@@ -166,9 +166,9 @@ _MM_PREFIX_NEW_BLOCK = """\
 
 FALLBACK_METHOD = '''
     # --- flash_attn_varlen_func backend (loaded once) ---
-    # Import path: ixformer.contrib.vllm_flash_attn (canonical, matches
-    # ex_engine/python/corex_fa2.py Tier 1 and ixformer_sdk).
-    # Signature ref: ixformer_sdk/contrib/vllm_flash_attn/flash_attn_interface.py
+    # Import path: ixformer.functions (re-exports from inference.functions)
+    # ixformer.contrib.vllm_flash_attn does NOT exist on BI-V100 system ixformer.
+    # Signature ref: ixformer_sdk/inference/functions/flash_attn_lib.py
     _flash_varlen_func = None
     _flash_varlen_checked = False
 
@@ -177,7 +177,7 @@ FALLBACK_METHOD = '''
         if not cls._flash_varlen_checked:
             cls._flash_varlen_checked = True
             try:
-                from ixformer.contrib.vllm_flash_attn import (
+                from ixformer.functions import (
                     flash_attn_varlen_func as _fn,
                 )
                 cls._flash_varlen_func = _fn
