@@ -153,7 +153,11 @@ try:
 except ImportError:
     _corex_gdn_chunk_recurrent = None
 
-_HAS_COREX_GDN_CHUNK = _corex_gdn_chunk_recurrent is not None
+# DISABLED: corex_gdn_chunk_recurrent.so pybind uses positional args only,
+# but the call site passes keyword args (initial_state=, output_final_state=).
+# This causes "incompatible function arguments" crash during profiling.
+# Force Python fallback until .so signature is fixed.
+_HAS_COREX_GDN_CHUNK = False
 
 from vllm.model_executor.models.interfaces import (HasInnerState, SupportsLoRA,
                                                    SupportsMultiModal)
