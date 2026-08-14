@@ -165,26 +165,6 @@ _MM_PREFIX_NEW_BLOCK = """\
 """
 
 FALLBACK_METHOD = '''
-    # --- flash_attn_varlen_func backend (loaded once) ---
-    # Import path: ixformer.functions (re-exports from inference.functions)
-    # ixformer.contrib.vllm_flash_attn does NOT exist on BI-V100 system ixformer.
-    # Signature ref: ixformer_sdk/inference/functions/flash_attn_lib.py
-    _flash_varlen_func = None
-    _flash_varlen_checked = False
-
-    @classmethod
-    def _get_flash_varlen(cls):
-        if not cls._flash_varlen_checked:
-            cls._flash_varlen_checked = True
-            try:
-                from ixformer.functions import (
-                    flash_attn_varlen_func as _fn,
-                )
-                cls._flash_varlen_func = _fn
-            except ImportError:
-                pass
-        return cls._flash_varlen_func
-
     def _run_sdpa_fallback(
         self,
         query: torch.Tensor,
@@ -192,17 +172,18 @@ FALLBACK_METHOD = '''
         value: torch.Tensor,
         attn_metadata: "XFormersMetadata",
     ) -> torch.Tensor:
-        """Prefill attention fallback for head_dim > 128.
+        """纯数学 causal attention fallback，带 Q-tiling 内存优化。
 
-        Dispatch priority (ref: ex_engine/python/corex_fa2.py):
-          1. ixformer flash_attn_varlen_func  — fused kernel, O(L) memory
-          2. Pure-math Q-tiling fallback       — safe for profiling / any HW
+        调用时机：kv_cache.numel()==0（profiling 阶段）。
+        此路径无 KV 缓存前缀，KV 长度 == query 长度。
 
-        Profiling guard: when kv_cache is empty (profiling stage), vllm feeds
-        a dummy sequence up to max_model_len (131K). flash_attn temp buffers
-        at that length can exceed GPU memory. We use Q-tiling for profiling
-        (safe, correct, O(chunk × L) memory) and flash_attn for real
-        inference (fast, O(L) memory, verified on BI-V100 head_dim=256).
+        内存优化（Q-tiling，与 Flash Attention 同思路）：
+          将 Q 分成 _Q_CHUNK 大小的子块逐块计算，每块峰值内存
+          O(_Q_CHUNK × q_len) 而非 O(q_len²)。
+          profiling 阶段序列可能达到 max_model_len（如 20K tokens），
+          不加 Q-tiling 会产生 9.6 GB 矩阵直接 OOM。
+
+        softmax 在 float32 下计算以防止 float16 溢出，结果转回原始 dtype。
 
         Args:
             query : [1, total_query_tokens, num_heads,    head_dim]
@@ -211,50 +192,15 @@ FALLBACK_METHOD = '''
         Returns:
             [1, total_query_tokens, num_heads, head_dim]
         """
+        _Q_CHUNK = 256  # 与 _forward_prefix_pytorch 的 _ATTN_Q_CHUNK 保持一致
+
         assert attn_metadata.seq_lens is not None
         orig_dtype = query.dtype
         num_seqs = len(attn_metadata.seq_lens)
-        max_seqlen = max(attn_metadata.seq_lens)
 
-        # Detect profiling: attn_metadata.num_prefill_tokens == total tokens
-        # AND no actual KV cache allocated yet (first forward pass).
-        # Also guard against very long dummy sequences (profiling uses
-        # max_model_len which can be 131K) where flash_attn would OOM.
-        _FLASH_SAFE_SEQLEN = 32768  # flash_attn temp buffers safe below this
-        is_profiling = (max_seqlen > _FLASH_SAFE_SEQLEN
-                        and not hasattr(attn_metadata, '_has_real_kv_cache'))
-
-        # --- Path 1: flash_attn_varlen_func (real inference) ---
-        fn = self._get_flash_varlen()
-        if fn is not None and not is_profiling:
-            try:
-                q_flat = query.squeeze(0)    # [T, H, D]
-                k_flat = key.squeeze(0)      # [T, Hkv, D]
-                v_flat = value.squeeze(0)
-
-                cu_seqlens = torch.zeros(
-                    num_seqs + 1, dtype=torch.int32, device=query.device)
-                for i, sl in enumerate(attn_metadata.seq_lens):
-                    cu_seqlens[i + 1] = cu_seqlens[i] + sl
-
-                out = fn(
-                    q=q_flat.to(torch.float16),
-                    k=k_flat.to(torch.float16),
-                    v=v_flat.to(torch.float16),
-                    cu_seqlens_q=cu_seqlens,
-                    cu_seqlens_k=cu_seqlens,
-                    max_seqlen_q=max_seqlen,
-                    max_seqlen_k=max_seqlen,
-                    softmax_scale=self.scale,
-                    causal=True,
-                )
-                return out.to(orig_dtype).unsqueeze(0)
-            except Exception:
-                pass  # fall through to Q-tiling
-
-        # --- Path 2: Q-tiling (profiling or flash_attn unavailable) ---
-        _Q_CHUNK = 256
-
+        # 推导每条序列的实际 query 长度。
+        # 正常 prefill 时 q_len == seq_len；如果将来遇到 chunked 场景，
+        # query_start_loc 记录的是真实 query token 数（非全序列长度）。
         if (attn_metadata.query_start_loc is not None
                 and len(attn_metadata.query_start_loc) == num_seqs + 1):
             q_lens = [
@@ -265,8 +211,8 @@ FALLBACK_METHOD = '''
         else:
             q_lens = list(attn_metadata.seq_lens)
 
-        q_flat = query.squeeze(0)
-        k_flat = key.squeeze(0)
+        q_flat = query.squeeze(0)   # [T, H,   D]
+        k_flat = key.squeeze(0)     # [T, Hkv, D]
         v_flat = value.squeeze(0)
 
         output = torch.empty_like(q_flat)
@@ -274,37 +220,44 @@ FALLBACK_METHOD = '''
         for q_len in q_lens:
             seq_end = seq_start + q_len
 
-            k_s = k_flat[seq_start:seq_end].permute(1, 0, 2).float()
-            v_s = v_flat[seq_start:seq_end].permute(1, 0, 2).float()
+            # 当前序列的完整 K/V（此路径无前缀，KV == Q）
+            k_s = k_flat[seq_start:seq_end].permute(1, 0, 2).float()  # [Hkv, q_len, D]
+            v_s = v_flat[seq_start:seq_end].permute(1, 0, 2).float()  # [Hkv, q_len, D]
 
+            # GQA：展开 KV heads 至与 query heads 一致
             if k_s.shape[0] != self.num_heads:
                 n = self.num_heads // k_s.shape[0]
                 k_s = k_s.repeat_interleave(n, dim=0).contiguous()
                 v_s = v_s.repeat_interleave(n, dim=0).contiguous()
 
+            # k_pos 用于因果掩码
             k_pos = torch.arange(q_len, device=query.device)
 
+            # Q-tiling：分块处理 query，峰值内存 O(_Q_CHUNK × q_len)
             for qc_start in range(0, q_len, _Q_CHUNK):
                 qc_end = min(qc_start + _Q_CHUNK, q_len)
 
+                # [H, qc, D]
                 q_c = q_flat[seq_start + qc_start:seq_start + qc_end] \
                       .permute(1, 0, 2).float()
 
+                # [H, qc, q_len]
                 attn_w = torch.matmul(q_c, k_s.transpose(-2, -1)) * self.scale
 
+                # 因果掩码：q_c 里位置 j 只能看 k_pos <= j（相对位置）
                 qc_q_pos = torch.arange(qc_start, qc_end, device=query.device)
                 mask = k_pos.unsqueeze(0) > qc_q_pos.unsqueeze(1)
                 attn_w = attn_w.masked_fill(mask.unsqueeze(0), float("-inf"))
 
                 attn_w = torch.softmax(attn_w, dim=-1)
-                out_c = torch.matmul(attn_w, v_s).to(orig_dtype)
+                out_c = torch.matmul(attn_w, v_s).to(orig_dtype)  # [H, qc, D]
 
                 output[seq_start + qc_start:seq_start + qc_end] = (
                     out_c.permute(1, 0, 2))
 
             seq_start = seq_end
 
-        return output.unsqueeze(0)
+        return output.unsqueeze(0)  # [1, T, H, D]
 
 '''
 
