@@ -17,7 +17,7 @@
 #include <vector>
 #include <optional>
 
-static const std::optional<torch::Tensor> kNoneTensor = {};
+static const c10::optional<torch::Tensor> kNoneTensor = {};
 
 // Forward-declare ixformer C++ API (from base image SDK)
 namespace ixformer {
@@ -34,9 +34,9 @@ void moe_compute_token_index_api(
     torch::Tensor& src_dst,
     torch::Tensor& dst_src,
     torch::Tensor& expert_sizes_gpu,
-    const std::optional<torch::Tensor>& expert_mask,
-    const std::optional<torch::Tensor>& expert_sizes_cpu,
-    const std::optional<torch::Tensor>& expand_tokens_gpu,
+    const c10::optional<torch::Tensor>& expert_mask,
+    const c10::optional<torch::Tensor>& expert_sizes_cpu,
+    const c10::optional<torch::Tensor>& expand_tokens_gpu,
     int64_t start_expert_id,
     int64_t end_expert_id,
     int64_t num_experts);
@@ -44,7 +44,7 @@ void moe_compute_token_index_api(
 void moe_expand_input(torch::Tensor outputs,
                       torch::Tensor inputs,
                       torch::Tensor dst_to_src,
-                      const std::optional<torch::Tensor>& src_to_dst,
+                      const c10::optional<torch::Tensor>& src_to_dst,
                       int64_t dst_tokens,
                       int64_t expand_factor);
 
@@ -52,17 +52,17 @@ void moe_w16a16_group_gemm(torch::Tensor output,
                            torch::Tensor inputs,
                            torch::Tensor weights,
                            torch::Tensor tokens_per_experts,
-                           const std::optional<torch::Tensor>& dst_to_src,
-                           const std::optional<torch::Tensor>& bias,
+                           const c10::optional<torch::Tensor>& dst_to_src,
+                           const c10::optional<torch::Tensor>& bias,
                            std::string format,
                            int64_t persistent,
                            int64_t output_n);
 
 void moe_output_reduce_sum(torch::Tensor outputs,
                            torch::Tensor inputs,
-                           const std::optional<torch::Tensor>& mul_weight,
-                           const std::optional<torch::Tensor>& mask,
-                           const std::optional<torch::Tensor>& extra_residual,
+                           const c10::optional<torch::Tensor>& mul_weight,
+                           const c10::optional<torch::Tensor>& mask,
+                           const c10::optional<torch::Tensor>& extra_residual,
                            double scaling_factor);
 
 void silu_and_mul(torch::Tensor& input, torch::Tensor& output);

@@ -46,9 +46,9 @@ torch::Tensor ixinfer_flash_attn_unpad_with_block_tables(
     double scale,
     double softcap,
     bool sqrt_alibi,
-    const std::optional<torch::Tensor>& alibi_slopes,
-    const std::optional<torch::Tensor>& sinks,
-    std::optional<torch::Tensor>& lse);
+    const c10::optional<torch::Tensor>& alibi_slopes,
+    const c10::optional<torch::Tensor>& sinks,
+    c10::optional<torch::Tensor>& lse);
 
 torch::Tensor xllm_paged_attention(
     torch::Tensor& out,
@@ -61,14 +61,14 @@ torch::Tensor xllm_paged_attention(
     torch::Tensor& context_lens,
     int64_t block_size,
     int64_t max_context_len,
-    const std::optional<torch::Tensor>& alibi_slopes,
+    const c10::optional<torch::Tensor>& alibi_slopes,
     bool causal,
     int32_t window_left,
     int32_t window_right,
     double softcap,
     bool enable_cuda_graph,
     bool use_sqrt_alibi,
-    const std::optional<torch::Tensor>& sinks);
+    const c10::optional<torch::Tensor>& sinks);
 
 // --- Activation ---
 void silu_and_mul(torch::Tensor& input, torch::Tensor& output);
@@ -77,9 +77,9 @@ void silu_and_mul(torch::Tensor& input, torch::Tensor& output);
 torch::Tensor ixformer_linear(torch::Tensor& input,
                               torch::Tensor& weight,
                               int64_t act_type,
-                              const std::optional<torch::Tensor>& bias,
-                              const std::optional<torch::Tensor>& out,
-                              const std::optional<bool> persistent);
+                              const c10::optional<torch::Tensor>& bias,
+                              const c10::optional<torch::Tensor>& out,
+                              const c10::optional<bool> persistent);
 
 torch::Tensor ixformer_linear_ex(torch::Tensor& input,
                                  torch::Tensor& weight,
@@ -109,7 +109,7 @@ void residual_rms_norm(torch::Tensor& input,
                        torch::Tensor& weight,
                        torch::Tensor& output,
                        torch::Tensor& residual_output,
-                       const std::optional<torch::Tensor>& fused_bias,
+                       const c10::optional<torch::Tensor>& fused_bias,
                        double alpha,
                        double eps,
                        bool is_post);
@@ -117,7 +117,7 @@ void residual_rms_norm(torch::Tensor& input,
 void rms_norm(torch::Tensor& input,
               torch::Tensor& weight,
               torch::Tensor& output,
-              const std::optional<torch::Tensor>& fused_bias,
+              const c10::optional<torch::Tensor>& fused_bias,
               double eps);
 
 // --- MoE ---
@@ -261,7 +261,7 @@ torch::Tensor ix_flash_attn_prefill(
     int64_t max_query_len, int64_t max_seq_len,
     double scale, bool is_causal,
     int64_t window_left, int64_t window_right) {
-    std::optional<torch::Tensor> lse = std::nullopt;
+    c10::optional<torch::Tensor> lse = std::nullopt;
     return ixformer::infer::ixinfer_flash_attn_unpad_with_block_tables(
         query, key_cache, value_cache, output, block_tables,
         cu_seq_q, cu_seq_k, max_query_len, max_seq_len,
