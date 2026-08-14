@@ -140,20 +140,8 @@ install_patch_file \
     "${VLLM_OVERRIDE_ROOT}/model_executor/layers/sampler.py" \
     "${VLLM_ROOT}/model_executor/layers/sampler.py"
 
-build_stage "installing hash-pinned CoreX 3.2.3 extensions"
+build_stage "installing hash-pinned CoreX 3.2.3 extensions (16 prebuilt .so)"
 bash ./install_prebuilt_corex.sh "${VLLM_ROOT}"
-
-build_stage "building ix_full_bridge.so (ixformer_torch_ext C++ bridge)"
-bash ./build_ix_bridge.sh "${VLLM_ROOT}" || {
-    echo "[WARN] ix_full_bridge build failed — bridge functions unavailable"
-}
-
-build_stage "building corex_moe_index_combine.so (CUB block_scan)"
-if [[ ! -f "${VLLM_ROOT}/corex_moe_index_combine.so" ]]; then
-    bash ./build_corex_moe_index_combine.sh "${VLLM_ROOT}" || {
-        echo "[WARN] corex_moe_index_combine build failed"
-    }
-fi
 
 build_stage "installing BI100 runtime modules"
 cp ./bi100_env.py "${VLLM_ROOT}/bi100_env.py"
@@ -272,31 +260,6 @@ if source != installed:
 if b"max_completion_tokens" not in installed:
     raise SystemExit("protocol.py missing max_completion_tokens field")
 PY
-
-build_stage "building missing CoreX extensions on-site"
-# corex_moe_index_combine: has .cu + build script but no prebuilt .so
-# Uses CUB block_scan from CCCL upstream — must compile with CoreX clang
-if [[ ! -f "${VLLM_ROOT}/corex_moe_index_combine.so" ]]; then
-    COREX_ROOT=${COREX_ROOT:-/usr/local/corex}
-    # Try multiple CoreX paths (3.2.3 may be at different locations)
-    for corex_candidate in \
-        /usr/local/corex-3.2.3 \
-        /usr/local/corex \
-        /opt/corex; do
-        if [[ -x "${corex_candidate}/bin/clang++" ]]; then
-            COREX_ROOT="${corex_candidate}"
-            break
-        fi
-    done
-    if [[ -x "${COREX_ROOT}/bin/clang++" ]]; then
-        build_stage "compiling corex_moe_index_combine.so (CUB block_scan)"
-        bash ./build_corex_moe_index_combine.sh "${VLLM_ROOT}" || {
-            echo "[WARN] corex_moe_index_combine build failed — kernel disabled"
-        }
-    else
-        echo "[WARN] CoreX compiler not found — corex_moe_index_combine disabled"
-    fi
-fi
 
 build_stage "compiling submission Python sources"
 find . -path './wheels' -prune -o -name '*.py' -print0 | xargs -0 python3 -m py_compile

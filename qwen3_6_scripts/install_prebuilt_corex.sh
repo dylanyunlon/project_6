@@ -16,14 +16,14 @@ MANIFEST=${BUNDLE_DIR}/SHA256SUMS
 }
 
 mapfile -t artifacts < <(awk '{print $2}' "$MANIFEST")
-[[ "${#artifacts[@]}" -eq 14 ]] || {
-    printf 'expected 14 prebuilt CoreX artifacts, found %s\n' \
+[[ "${#artifacts[@]}" -eq 16 ]] || {
+    printf 'expected 16 prebuilt CoreX artifacts, found %s\n' \
         "${#artifacts[@]}" >&2
     exit 2
 }
 
 for artifact in "${artifacts[@]}"; do
-    [[ "$artifact" == corex_*.so && "$artifact" != */* ]] || {
+    [[ ("$artifact" == corex_*.so || "$artifact" == ix_full_bridge.so) && "$artifact" != */* ]] || {
         printf 'invalid prebuilt artifact name: %s\n' "$artifact" >&2
         exit 2
     }
