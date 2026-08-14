@@ -270,7 +270,24 @@ std::tuple<torch::Tensor, torch::Tensor> torch_chunk_gated_delta_rule(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("torch_chunk_gated_delta_rule", &torch_chunk_gated_delta_rule,
-        "C++ chunked gated delta rule (from xllm upstream)");
+        "C++ chunked gated delta rule (from xllm upstream)",
+        py::arg("query"),
+        py::arg("key"),
+        py::arg("value"),
+        py::arg("g"),
+        py::arg("beta"),
+        py::arg("chunk_size") = 64,
+        py::arg("initial_state") = c10::nullopt,
+        py::arg("output_final_state") = false,
+        py::arg("use_qk_l2norm_in_kernel") = false);
   m.def("torch_recurrent_gated_delta_rule", &torch_recurrent_gated_delta_rule,
-        "C++ recurrent gated delta rule (from xllm upstream)");
+        "C++ recurrent gated delta rule (from xllm upstream)",
+        py::arg("query"),
+        py::arg("key"),
+        py::arg("value"),
+        py::arg("g"),
+        py::arg("beta"),
+        py::arg("initial_state") = c10::nullopt,
+        py::arg("output_final_state") = false,
+        py::arg("use_qk_l2norm_in_kernel") = false);
 }
