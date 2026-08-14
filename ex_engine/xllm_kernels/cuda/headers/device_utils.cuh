@@ -114,3 +114,23 @@ struct TopkConstants {
 };
 
 }  // namespace xllm::kernel::cuda
+
+// ============================================================================
+// Dispatch macros (from xllm/core/kernels/cuda/utils.h)
+// These wrap AT_DISPATCH_SWITCH for float16/bfloat16/float32 dispatch.
+// Placed here because cuda_ops_api.h → utils.h is not available on corex
+// (glog/logging.h dependency).
+// ============================================================================
+#ifndef DISPATCH_FLOATING_TYPES
+#define DISPATCH_CASE_FLOATING_TYPES(...)              \
+  AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__) \
+  AT_DISPATCH_CASE(at::ScalarType::Half, __VA_ARGS__)  \
+  AT_DISPATCH_CASE(at::ScalarType::BFloat16, __VA_ARGS__)
+#define DISPATCH_FLOATING_TYPES(TYPE, NAME, ...) \
+  AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_FLOATING_TYPES(__VA_ARGS__))
+#define DISPATCH_CASE_HALF_TYPES(...)                 \
+  AT_DISPATCH_CASE(at::ScalarType::Half, __VA_ARGS__) \
+  AT_DISPATCH_CASE(at::ScalarType::BFloat16, __VA_ARGS__)
+#define DISPATCH_HALF_TYPES(TYPE, NAME, ...) \
+  AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_HALF_TYPES(__VA_ARGS__))
+#endif
