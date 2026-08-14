@@ -809,8 +809,28 @@ def invoke_fused_moe_kernel(
 def topk_softmax(topk_weights: torch.Tensor, topk_ids: torch.Tensor,
                  token_expert_indicies: torch.Tensor,
                  gating_output: float) -> None:
-    ixf_F.vllm_moe_topk_softmax(topk_weights, topk_ids,
-                                  token_expert_indicies, gating_output)
+    # BI-V100 ixformer 3.2.3 lacks vllm_moe_topk_softmax.
+    # Dispatch chain: corex .so → PyTorch fallback (never crash).
+    if hasattr(ixf_F, 'vllm_moe_topk_softmax'):
+        ixf_F.vllm_moe_topk_softmax(topk_weights, topk_ids,
+                                      token_expert_indicies, gating_output)
+        return
+    try:
+        from vllm import corex_moe_topk_softmax as _cmts
+        topk = topk_weights.shape[-1]
+        w, ids = _cmts.moe_topk_softmax(gating_output, topk, True)
+        topk_weights.copy_(w)
+        topk_ids.copy_(ids)
+        return
+    except (ImportError, Exception):
+        pass
+    # Pure PyTorch fallback
+    topk = topk_weights.shape[-1]
+    scores = torch.softmax(gating_output.float(), dim=-1)
+    tw, ti = torch.topk(scores, topk, dim=-1)
+    tw = tw / tw.sum(dim=-1, keepdim=True)
+    topk_weights.copy_(tw)
+    topk_ids.copy_(ti.to(topk_ids.dtype))
 
 
 if supports_moe_ops and hasattr(torch.ops._moe_C, "marlin_gemm_moe"):

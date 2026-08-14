@@ -59,7 +59,7 @@ class CustomChatCompletionMessageParam(TypedDict, total=False):
 
 class OpenAIBaseModel(BaseModel):
     # OpenAI API does not allow extra fields
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
 
 class ErrorResponse(OpenAIBaseModel):

@@ -246,6 +246,52 @@ if source != installed:
     raise SystemExit("runtime api_server overlay identity mismatch")
 PY
 
+# --- protocol.py identity check: ensure max_completion_tokens is accepted ---
+python3 - ./protocol.py \
+        "${VLLM_ROOT}/entrypoints/openai/protocol.py" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_bytes()
+installed = Path(sys.argv[2]).read_bytes()
+if source != installed:
+    raise SystemExit("runtime protocol overlay identity mismatch")
+# Verify max_completion_tokens field is declared (not just extra=allow)
+if b"max_completion_tokens" not in installed:
+    raise SystemExit("protocol.py missing max_completion_tokens field")
+PY
+
+build_stage "building missing CoreX extensions on-site"
+# corex_moe_index_combine: has .cu + build script but no prebuilt .so
+# Uses CUB block_scan from CCCL upstream — must compile with CoreX clang
+if [[ ! -f "${VLLM_ROOT}/corex_moe_index_combine.so" ]]; then
+    COREX_ROOT=${COREX_ROOT:-/usr/local/corex}
+    # Try multiple CoreX paths (3.2.3 may be at different locations)
+    for corex_candidate in \
+        /usr/local/corex-3.2.3 \
+        /usr/local/corex \
+        /opt/corex; do
+        if [[ -x "${corex_candidate}/bin/clang++" ]]; then
+            COREX_ROOT="${corex_candidate}"
+            break
+        fi
+    done
+    if [[ -x "${COREX_ROOT}/bin/clang++" ]]; then
+        build_stage "compiling corex_moe_index_combine.so (CUB block_scan)"
+        bash ./build_corex_moe_index_combine.sh "${VLLM_ROOT}" || {
+            echo "[WARN] corex_moe_index_combine build failed — kernel disabled"
+        }
+    else
+        echo "[WARN] CoreX compiler not found — corex_moe_index_combine disabled"
+    fi
+fi
+
 build_stage "compiling submission Python sources"
 find . -path './wheels' -prune -o -name '*.py' -print0 | xargs -0 python3 -m py_compile
+
+build_stage "verifying dlopen chain"
+python3 ./verify_dlopen_chain.py --vllm-root "${VLLM_ROOT}" || {
+    echo "[WARN] dlopen chain verification found issues (non-fatal)"
+}
+
 build_stage "patch script completed"
