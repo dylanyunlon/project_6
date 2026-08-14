@@ -277,7 +277,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("g"),
         py::arg("beta"),
         py::arg("chunk_size") = 64,
-        py::arg("initial_state") = c10::nullopt,
+        py::arg("initial_state") = c10::optional<torch::Tensor>(),
         py::arg("output_final_state") = false,
         py::arg("use_qk_l2norm_in_kernel") = false);
   m.def("torch_recurrent_gated_delta_rule", &torch_recurrent_gated_delta_rule,
@@ -287,7 +287,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("value"),
         py::arg("g"),
         py::arg("beta"),
-        py::arg("initial_state") = c10::nullopt,
+        py::arg("initial_state") = c10::optional<torch::Tensor>(),
         py::arg("output_final_state") = false,
         py::arg("use_qk_l2norm_in_kernel") = false);
 }
