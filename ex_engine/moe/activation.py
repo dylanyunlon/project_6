@@ -122,32 +122,17 @@ def apply_moe_activation(
 
     # Activations with gated multiplication (gate × activation(up))
     if activation == MoEActivation.SILU:
-        # BI-V100: torch.ops._C.silu_and_mul not available
-        # Use corex_attn_head_rms_norm pattern: try C++ first, fallback to PyTorch
-        d = output.size(-1)
-        gate = input[..., :d]
-        up = input[..., d:]
-        output.copy_(F.silu(gate) * up)
+        torch.ops._C.silu_and_mul(output, input)
     elif activation == MoEActivation.GELU:
-        d = output.size(-1)
-        gate = input[..., :d]
-        up = input[..., d:]
-        output.copy_(F.gelu(gate) * up)
+        torch.ops._C.gelu_and_mul(output, input)
     elif activation == MoEActivation.GELU_TANH:
-        d = output.size(-1)
-        gate = input[..., :d]
-        up = input[..., d:]
-        output.copy_(F.gelu(gate, approximate="tanh") * up)
+        torch.ops._C.gelu_tanh_and_mul(output, input)
     elif activation == MoEActivation.SWIGLUOAI:
-        d = output.size(-1)
-        gate = input[..., :d]
-        up = input[..., d:]
-        output.copy_(F.silu(gate) * up)
+        torch.ops._C.swigluoai_and_mul(output, input)
     elif activation == MoEActivation.SWIGLUSTEP:
-        d = output.size(-1)
-        gate = input[..., :d]
-        up = input[..., d:]
-        output.copy_(F.silu(gate) * up)
+        from vllm.model_executor.layers.activation import swiglustep_and_mul_triton
+
+        swiglustep_and_mul_triton(output, input)
 
     # Activations without gated multiplication
     elif activation == MoEActivation.SILU_NO_MUL:
