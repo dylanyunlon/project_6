@@ -28,8 +28,16 @@ TORCH_DIR=$(python3 -c "import torch; print(torch.utils.cmake_prefix_path)" 2>/d
 TORCH_INCLUDE=$(python3 -c "import torch; print(torch.utils.cpp_extension.include_paths()[0])" 2>/dev/null || echo "/usr/local/corex/lib/python3/dist-packages/torch/include")
 TORCH_LIB=$(python3 -c "import torch; print(torch.utils.cpp_extension.library_paths()[0])" 2>/dev/null || echo "/usr/local/corex/lib/python3/dist-packages/torch/lib")
 PYTHON_INCLUDE=$(python3 -c "from sysconfig import get_path; print(get_path('include'))")
+CUDA_INCLUDE=$(python3 -c "import torch; print(torch.utils.cpp_extension.include_paths()[1])" 2>/dev/null || echo "/usr/local/corex/include")
+if [ ! -f "$CUDA_INCLUDE/cuda_runtime.h" ]; then
+    CUDA_INCLUDE="/usr/local/corex/include"
+fi
+if [ ! -f "$CUDA_INCLUDE/cuda_runtime.h" ]; then
+    CUDA_INCLUDE="$(dirname $(which nvcc 2>/dev/null || echo /usr/local/cuda/bin/nvcc))/../include"
+fi
 
 echo "[build] CUTLASS_INCLUDE=$CUTLASS_INCLUDE"
+echo "[build] CUDA_INCLUDE=$CUDA_INCLUDE"
 echo "[build] TORCH_INCLUDE=$TORCH_INCLUDE"
 echo "[build] TORCH_LIB=$TORCH_LIB"
 
@@ -56,6 +64,7 @@ g++ -c "$BIND_CPP" \
     -I "$TORCH_INCLUDE" \
     -I "$TORCH_INCLUDE/torch/csrc/api/include" \
     -I "$PYTHON_INCLUDE" \
+    -I "$CUDA_INCLUDE" \
     -I "$CUTLASS_INCLUDE" \
     -std=c++17 -O2 -fPIC \
     -D_GLIBCXX_USE_CXX11_ABI=0 \
