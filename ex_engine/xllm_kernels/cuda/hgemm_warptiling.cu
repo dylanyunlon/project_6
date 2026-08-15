@@ -179,14 +179,17 @@ void launch_hgemm_warptiling(
     __half* C,
     cudaStream_t stream)
 {
-    // Config for BI-V100 (warp_size=64, 128KB smem, 16 SMs):
+    // Config B — best on BI-V100 (beats cublas 0.7x on 256x4096@4096x11008):
+    // probe_k10_configs.sh confirmed: 7.6ms vs cublas 10.5ms
     // 128 threads = 2 warps of 64
-    // probe confirmed: NUM_WARPS=2, WMITER=2, threads_per_warp=64 ✓
+    // WMITER = (64*64)/(64*8*4*2) = 4096/4096 = 1
+    // WSUBM = 64/1 = 64, WSUBN = 64/2 = 32
+    // threads_per_warp = (64/8)*(32/4) = 8*8 = 64 ✓
     constexpr int NUM_THREADS = 128;
     constexpr int BM = 128, BN = 128, BK = 16;
-    constexpr int WM = 64, WN = 128;
-    constexpr int WNITER = 4;
-    constexpr int TM = 4, TN = 4;
+    constexpr int WM = 64, WN = 64;
+    constexpr int WNITER = 2;
+    constexpr int TM = 8, TN = 4;
 
     dim3 grid(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
     dim3 block(NUM_THREADS);
