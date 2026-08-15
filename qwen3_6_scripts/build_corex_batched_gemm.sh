@@ -18,16 +18,9 @@ if [ ! -d "$TORCH_ROOT" ]; then
     TORCH_ROOT=$(python3 -c "import torch; import os; print(os.path.dirname(torch.__file__))" 2>/dev/null || echo "/usr/local/corex/lib/python3/dist-packages/torch")
 fi
 
-CUTLASS_INCLUDE="$COREX_ROOT/samples/cutlass/include"
-if [ ! -d "$CUTLASS_INCLUDE/cutlass" ]; then
-    CUTLASS_INCLUDE="$COREX_ROOT/include/cutlass"
-fi
-if [ ! -d "$CUTLASS_INCLUDE/cutlass" ] && [ -d "$CUTLASS_INCLUDE" ]; then
-    # Maybe cutlass.h is directly under this path
-    true
-fi
-# Last resort: find it
-if [ ! -f "$CUTLASS_INCLUDE/cutlass/cutlass.h" ] && [ ! -f "$CUTLASS_INCLUDE/cutlass.h" ]; then
+CUTLASS_INCLUDE="$COREX_ROOT/lib64/python3/dist-packages/tensorflow/include/third_party/gpus/cuda/include"
+if [ ! -f "$CUTLASS_INCLUDE/cutlass/cutlass.h" ]; then
+    # Fallback: search
     CUTLASS_INCLUDE=$(find "$COREX_ROOT" -path "*/cutlass/cutlass.h" -printf '%h\n' 2>/dev/null | head -1 | sed 's|/cutlass$||')
     if [ -z "$CUTLASS_INCLUDE" ]; then
         echo "[build] ERROR: cannot find cutlass/cutlass.h under $COREX_ROOT"
