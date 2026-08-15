@@ -65,11 +65,11 @@ def naive_batched_moe_forward(
         #
         # For decode, each expert sees exactly 1 token.
         # expert ids are in topk_ids[0] (shape: top_k,)
-        eids = topk_ids[0]        # (top_k,)
-        ws = topk_weights[0]      # (top_k,)
+        eids = topk_ids[0].tolist()   # (top_k,) → CPU list, ONE sync
+        ws = topk_weights[0]          # (top_k,) stays on GPU
 
         for i in range(top_k):
-            eid = eids[i].item()
+            eid = eids[i]
 
             # FC1: (1, H) @ (H, 2*I) → (1, 2*I)
             # w13[eid] is (2*I, H), .transpose(0, 1) is (H, 2*I) — VIEW, zero copy
