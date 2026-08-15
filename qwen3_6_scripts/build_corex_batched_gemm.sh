@@ -20,7 +20,19 @@ fi
 
 CUTLASS_INCLUDE="$COREX_ROOT/samples/cutlass/include"
 if [ ! -d "$CUTLASS_INCLUDE/cutlass" ]; then
-    CUTLASS_INCLUDE="$COREX_ROOT/include"
+    CUTLASS_INCLUDE="$COREX_ROOT/include/cutlass"
+fi
+if [ ! -d "$CUTLASS_INCLUDE/cutlass" ] && [ -d "$CUTLASS_INCLUDE" ]; then
+    # Maybe cutlass.h is directly under this path
+    true
+fi
+# Last resort: find it
+if [ ! -f "$CUTLASS_INCLUDE/cutlass/cutlass.h" ] && [ ! -f "$CUTLASS_INCLUDE/cutlass.h" ]; then
+    CUTLASS_INCLUDE=$(find "$COREX_ROOT" -path "*/cutlass/cutlass.h" -printf '%h\n' 2>/dev/null | head -1 | sed 's|/cutlass$||')
+    if [ -z "$CUTLASS_INCLUDE" ]; then
+        echo "[build] ERROR: cannot find cutlass/cutlass.h under $COREX_ROOT"
+        exit 1
+    fi
 fi
 
 # Output path
