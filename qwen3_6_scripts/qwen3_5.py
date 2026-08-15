@@ -245,6 +245,24 @@ if _USE_IX_FUSED_MOE:
 else:
     logger.info("ix_fused_moe unavailable — using point-optimized Python MoE")
 
+# naive_batched_moe_forward: ported from ds_vllm NaiveBatchedExperts
+# Uses view transpose + @ operator (cublas transB), no physical transpose
+try:
+    from ex_engine.moe.naive_batched_experts import naive_batched_moe_forward
+    _HAS_NAIVE_BATCHED_MOE = True
+except ImportError:
+    try:
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+        from ex_engine.moe.naive_batched_experts import naive_batched_moe_forward
+        _HAS_NAIVE_BATCHED_MOE = True
+    except ImportError:
+        _HAS_NAIVE_BATCHED_MOE = False
+        naive_batched_moe_forward = None
+_USE_NAIVE_BATCHED_MOE = (
+    _HAS_NAIVE_BATCHED_MOE
+    and env_bool("BI100_MOE_NAIVE_BATCHED", True))
+
 
 # ---------------------------------------------------------------------------
 # Qwen3.6 vision tower and vLLM 0.6 multimodal input integration
@@ -1685,6 +1703,38 @@ class Qwen3_5MoeSparseBlock(nn.Module):
                 w13, w2,
                 self.top_k, w13.shape[0],
                 True)  # renormalize
+
+        # ---------------------------------------------------------------
+        # Tier 0.5: NaiveBatchedExperts from ds_vllm
+        # Per-expert loop with view transpose + @ (cublas transB)
+        # No physical transpose, no weight gather copy
+        # Source: ds_vllm/vllm/.../experts/fused_batched_moe.py
+        # ---------------------------------------------------------------
+        if _USE_NAIVE_BATCHED_MOE:
+            w13 = self.experts.w13_weight  # (E, 2*I, H)
+            w2 = self.experts.w2_weight    # (E, H, I)
+
+            # topk routing (reuse existing corex/xllm/pytorch topk)
+            if _USE_XLLM_MOE:
+                topk_weights, topk_ids = _xllm_moe.moe_fused_topk(
+                    router_logits, self.top_k, True, None, "softmax")
+                topk_ids = topk_ids.to(torch.int64)
+                topk_weights = topk_weights.to(hidden_states.dtype)
+            elif _USE_COREX_MOE_TOPK_SOFTMAX:
+                topk_weights, topk_ids = _corex_moe_topk_softmax.moe_topk_softmax(
+                    router_logits.float(), self.top_k, True)
+                topk_ids = topk_ids.to(torch.int64)
+                topk_weights = topk_weights.to(hidden_states.dtype)
+            else:
+                topk_logits, topk_ids = torch.topk(
+                    router_logits.float(), self.top_k, dim=-1)
+                topk_weights = torch.softmax(topk_logits, dim=-1)
+                topk_weights = topk_weights.to(hidden_states.dtype)
+
+            return naive_batched_moe_forward(
+                hidden_states, w13, w2,
+                topk_ids, topk_weights,
+                act_fn=self.act_fn)
 
         # ---------------------------------------------------------------
         # Tier 1: Point-optimized Python loop (individual corex .so)
