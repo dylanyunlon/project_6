@@ -6,7 +6,7 @@ import torch
 import time
 import importlib.util
 
-spec = importlib.util.spec_from_file_location('m',
+spec = importlib.util.spec_from_file_location('corex_batched_gemm',
     'qwen3_6_scripts/prebuilt/corex-3.2.3-ivcore10/corex_batched_gemm.so')
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
