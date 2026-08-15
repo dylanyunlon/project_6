@@ -3,13 +3,8 @@
 
 python3 << 'PY'
 import torch
+import torch.nn.functional as F
 import time
-import importlib.util
-
-spec = importlib.util.spec_from_file_location('corex_batched_gemm',
-    'qwen3_6_scripts/prebuilt/corex-3.2.3-ivcore10/corex_batched_gemm.so')
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
 
 K = 8
 H = 4096
@@ -30,33 +25,21 @@ def time_fn(fn, name, iters=50):
     print(f"  {name}: {ms:.3f} ms")
     return ms
 
-print("=== Step-by-step breakdown ===")
+print("=== Individual operation timings ===")
 
-# Step 0: expand+contiguous
-time_fn(lambda: x.expand(K, 1, H).contiguous(), "expand+contiguous (1,H)->(K,1,H)")
+# Single F.linear (one expert FC1)
+time_fn(lambda: F.linear(x, w13[0]), "F.linear FC1 1 expert (1,H)x(2I,H)")
 
-# Step 1: batched GEMM FC1 only
-x_exp = x.expand(K, 1, H).contiguous()
-time_fn(lambda: mod.batched_gemm_fp16(x_exp, w13), "batched_gemm FC1 (K,1,H)x(K,2I,H)")
+# Single F.linear (one expert FC2)
+gu = F.linear(x, w13[0])
+g, u = gu.chunk(2, dim=-1)
+a = F.silu(g) * u
+time_fn(lambda: F.linear(a, w2[0]), "F.linear FC2 1 expert (1,I)x(H,I)")
 
-# Step 2: silu * mul
-gate_up = mod.batched_gemm_fp16(x_exp, w13).squeeze(1)
-chunks = gate_up.chunk(2, dim=1)
-time_fn(lambda: torch.sigmoid(chunks[0]) * chunks[0] * chunks[1], "silu*mul (K,I)")
+# silu * mul
+time_fn(lambda: F.silu(gu[:,:I]) * gu[:,I:], "silu*mul (1, I)")
 
-# Step 3: batched GEMM FC2 only
-act = (torch.sigmoid(chunks[0]) * chunks[0] * chunks[1]).unsqueeze(1)
-time_fn(lambda: mod.batched_gemm_fp16(act, w2), "batched_gemm FC2 (K,1,I)x(K,H,I)")
-
-# Step 4: weighted reduction
-eo = mod.batched_gemm_fp16(act, w2).squeeze(1)
-time_fn(lambda: (eo * ws.unsqueeze(1)).sum(0, True), "weighted_sum")
-
-# Full fused
-time_fn(lambda: mod.moe_decode_fused(x, w13, w2, ws), "moe_decode_fused (full)")
-
-# Comparison: 8x F.linear loop
-import torch.nn.functional as F
+# 8x F.linear loop (baseline)
 def flinear_loop():
     outs = []
     for i in range(K):
@@ -65,5 +48,51 @@ def flinear_loop():
         a = F.silu(g) * u
         outs.append(F.linear(a, w2[i]))
     return sum(outs[i] * ws[i] for i in range(K))
-time_fn(flinear_loop, "F.linear loop (baseline)")
+time_fn(flinear_loop, "F.linear loop 8 experts (FULL)")
+
+# torch.mm loop (no F.linear overhead)
+def mm_loop():
+    outs = []
+    for i in range(K):
+        gu = torch.mm(x, w13[i].t())
+        g, u = gu.chunk(2, dim=-1)
+        a = F.silu(g) * u
+        outs.append(torch.mm(a, w2[i].t()))
+    return sum(outs[i] * ws[i] for i in range(K))
+time_fn(mm_loop, "torch.mm loop 8 experts (FULL)")
+
+# Batched via cublasHgemmStridedBatched (pre-gathered weights)
+# First gather weights contiguously
+print("\n=== Batched approaches ===")
+
+# Measure gather cost
+time_fn(lambda: w13.reshape(K, 2*I*H), "w13 reshape (view, should be free)")
+
+# cublasHgemmStridedBatched via torch.bmm
+x_exp = x.expand(K, 1, H).contiguous()
+w13_t = w13.transpose(1, 2).contiguous()  # (K, H, 2I)
+time_fn(lambda: w13.transpose(1, 2).contiguous(), "w13 transpose+contiguous (K,2I,H)->(K,H,2I)")
+time_fn(lambda: torch.bmm(x_exp, w13_t), "torch.bmm FC1 (K,1,H)x(K,H,2I)")
+
+# What if weights are pre-transposed?
+print("\n=== Pre-transposed weights (no runtime copy) ===")
+w13_pre = w13.transpose(1, 2).contiguous()  # (K, H, 2I) — do this once at model load
+w2_pre = w2.transpose(1, 2).contiguous()    # (K, I, H)
+time_fn(lambda: torch.bmm(x_exp, w13_pre), "torch.bmm FC1 pre-transposed")
+
+gu = torch.bmm(x_exp, w13_pre).squeeze(1)
+g, u = gu.chunk(2, dim=-1)
+act = F.silu(g) * u
+act_3d = act.unsqueeze(1)
+time_fn(lambda: torch.bmm(act_3d, w2_pre), "torch.bmm FC2 pre-transposed")
+
+def bmm_fused_pretransposed():
+    gu = torch.bmm(x_exp, w13_pre).squeeze(1)
+    g, u = gu.chunk(2, dim=-1)
+    a = F.silu(g) * u
+    eo = torch.bmm(a.unsqueeze(1), w2_pre).squeeze(1)
+    return (eo * ws.unsqueeze(1)).sum(0, True)
+time_fn(bmm_fused_pretransposed, "bmm full MoE (pre-transposed)")
+
+print("\n=== Summary ===")
 PY
