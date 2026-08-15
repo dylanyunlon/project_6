@@ -98,6 +98,56 @@ echo "============================================================"
 build_so "xllm_fused_qknorm_rope" \
     "ex_engine/xllm_kernels/cuda/fused_qknorm_rope.cu ex_engine/xllm_kernels/cuda/bindings/xllm_fused_qknorm_rope_bind.cpp"
 
+# 2. xllm_norm — RMSNorm + Fused Add RMSNorm
+#    Source: upstream xllm norm.cu
+#    Hot path: called 2× per decoder layer = 72× per forward pass
+echo ""
+echo "============================================================"
+echo "  2. xllm_norm.so"
+echo "============================================================"
+build_so "xllm_norm" \
+    "ex_engine/xllm_kernels/cuda/norm.cu ex_engine/xllm_kernels/cuda/bindings/xllm_norm_bind.cpp"
+
+# 3. xllm_rope — Rotary Position Embedding
+#    Source: upstream xllm rope.cu
+#    Hot path: called 1× per attention layer = 36× per forward pass
+echo ""
+echo "============================================================"
+echo "  3. xllm_rope.so"
+echo "============================================================"
+build_so "xllm_rope" \
+    "ex_engine/xllm_kernels/cuda/rope.cu ex_engine/xllm_kernels/cuda/bindings/xllm_rope_bind.cpp"
+
+# 4. xllm_activation — SiLU-and-Mul fused activation
+#    Source: upstream xllm activation.cu
+#    Hot path: called 1× per MLP = 36× per forward pass
+echo ""
+echo "============================================================"
+echo "  4. xllm_activation.so"
+echo "============================================================"
+build_so "xllm_activation" \
+    "ex_engine/xllm_kernels/cuda/activation.cu ex_engine/xllm_kernels/cuda/bindings/xllm_activation_bind.cpp"
+
+# 5. xllm_cache — Reshape + block copy for KV cache
+#    Source: upstream xllm reshape_paged_cache.cu + block_copy.cu
+#    Hot path: called every prefill + decode step
+echo ""
+echo "============================================================"
+echo "  5. xllm_cache.so"
+echo "============================================================"
+build_so "xllm_cache" \
+    "ex_engine/xllm_kernels/cuda/reshape_paged_cache.cu ex_engine/xllm_kernels/cuda/block_copy.cu ex_engine/xllm_kernels/cuda/bindings/xllm_cache_bind.cpp"
+
+# 6. xllm_moe — MoE topk + index + combine + fused pipeline
+#    Source: upstream xllm moe_fused_topk.cu + moe_compute_index.cu + moe_combine.cu + fused_moe.cpp
+#    THE critical .so: replaces Python for-loop over 64 experts
+echo ""
+echo "============================================================"
+echo "  6. xllm_moe.so"
+echo "============================================================"
+build_so "xllm_moe" \
+    "ex_engine/xllm_kernels/cuda/moe/moe_fused_topk.cu ex_engine/xllm_kernels/cuda/moe/moe_compute_index.cu ex_engine/xllm_kernels/cuda/moe/moe_combine.cu ex_engine/xllm_kernels/cuda/moe/fused_moe.cpp ex_engine/xllm_kernels/cuda/bindings/xllm_moe_bind.cpp"
+
 echo ""
 echo "============================================================"
 echo "  Build complete. Output:"
