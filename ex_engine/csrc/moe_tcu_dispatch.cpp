@@ -49,7 +49,7 @@ torch::Tensor moe_decode(
         auto gate_up = torch::mm(hidden, gate_up_weights[eid].t());
 
         // SiLU and mul
-        auto gate = torch::silu(gate_up.slice(1, 0, inter));
+        auto gate_slice = gate_up.slice(1, 0, inter); auto gate = gate_slice * torch::sigmoid(gate_slice);
         auto up = gate_up.slice(1, inter, inter2);
         auto act = gate * up;  // (1, I)
 
@@ -117,7 +117,7 @@ torch::Tensor moe_prefill(
         auto gate_up = torch::mm(tokens, gate_up_weights[eid].t());
 
         // SiLU and mul
-        auto gate = torch::silu(gate_up.slice(1, 0, inter));
+        auto gate_slice = gate_up.slice(1, 0, inter); auto gate = gate_slice * torch::sigmoid(gate_slice);
         auto up = gate_up.slice(1, inter, inter2);
         auto act = gate * up;  // (count, I)
 
