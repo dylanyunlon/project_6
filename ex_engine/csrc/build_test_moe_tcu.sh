@@ -66,7 +66,7 @@ for k in range(top_k):
     eid = expert_ids[k].item()
     w = expert_weights[k].item()
     gate_up = F.linear(hidden, w13[eid])
-    gate = torch.silu(gate_up[:, :I])
+    gate = F.silu(gate_up[:, :I])
     up = gate_up[:, I:]
     act = gate * up
     expert_out = F.linear(act, w2[eid])
@@ -131,7 +131,7 @@ for _ in range(3):
         eid = expert_ids[k].item()
         w = expert_weights[k].item()
         gate_up = F.linear(hidden, w13[eid])
-        gate = torch.silu(gate_up[:, :I])
+        gate = F.silu(gate_up[:, :I])
         up = gate_up[:, I:]
         act = gate * up
         out_py += w * F.linear(act, w2[eid])
@@ -144,7 +144,7 @@ for _ in range(100):
         eid = expert_ids[k].item()
         w = expert_weights[k].item()
         gate_up = F.linear(hidden, w13[eid])
-        gate = torch.silu(gate_up[:, :I])
+        gate = F.silu(gate_up[:, :I])
         up = gate_up[:, I:]
         act = gate * up
         out_py += w * F.linear(act, w2[eid])
