@@ -1,39 +1,63 @@
 #!/bin/bash
-# cat_cutlass_cu10.sh — Cat the critical Cu10 CUTLASS files
+# cat_cutlass_cu10.sh — Cat the critical Cu10 CUTLASS files into cat_files/
 
 SAMPLES="/usr/local/corex-samples-3.2.3_x86_64/samples/cutlass"
-TF_INC="/usr/local/corex-3.2.3/lib64/python3/dist-packages/tensorflow/include/third_party/gpus/cuda/include"
+OUTDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/cat_files"
+mkdir -p "$OUTDIR"
 
-echo "=== 1. iluvatar_mma.hpp — the TCU intrinsics ==="
-cat /usr/local/corex/include/crt/iluvatar_mma.hpp
+echo "Output dir: $OUTDIR"
+
+cp /usr/local/corex/include/crt/iluvatar_mma.hpp "$OUTDIR/iluvatar_mma.hpp"
+echo "✓ iluvatar_mma.hpp"
+
+cp "${SAMPLES}/include/cutlass/arch/mma_cu10.h" "$OUTDIR/mma_cu10.h"
+echo "✓ mma_cu10.h"
+
+cp "${SAMPLES}/include/cutlass/gemm/threadblock/default_mma_core_cu10.h" "$OUTDIR/default_mma_core_cu10.h"
+echo "✓ default_mma_core_cu10.h"
+
+cp "${SAMPLES}/examples/05_batched_gemm/batched_gemm.cu" "$OUTDIR/batched_gemm.cu"
+echo "✓ batched_gemm.cu"
+
+cp "${SAMPLES}/include/cutlass/gemm/device/gemm_universal.h" "$OUTDIR/gemm_universal.h"
+echo "✓ gemm_universal.h"
+
+cp "${SAMPLES}/include/cutlass/gemm/device/gemm_batched.h" "$OUTDIR/gemm_batched.h"
+echo "✓ gemm_batched.h"
+
+cp "${SAMPLES}/include/cutlass/gemm/warp/mma_tensor_op.h" "$OUTDIR/mma_tensor_op.h"
+echo "✓ mma_tensor_op.h"
+
+cp "${SAMPLES}/include/cutlass/gemm/warp/mma_tensor_op_policy.h" "$OUTDIR/mma_tensor_op_policy.h"
+echo "✓ mma_tensor_op_policy.h"
+
+cp "${SAMPLES}/include/cutlass/gemm/warp/mma_tensor_op_tile_iterator.h" "$OUTDIR/mma_tensor_op_tile_iterator.h"
+echo "✓ mma_tensor_op_tile_iterator.h"
+
+cp "${SAMPLES}/include/cutlass/gemm/warp/default_mma_tensor_op.h" "$OUTDIR/default_mma_tensor_op.h"
+echo "✓ default_mma_tensor_op.h"
+
+cp "${SAMPLES}/include/cutlass/gemm/threadblock/default_mma_core.h" "$OUTDIR/default_mma_core.h"
+echo "✓ default_mma_core.h"
+
+cp "${SAMPLES}/include/cutlass/gemm/device/default_gemm_configuration.h" "$OUTDIR/default_gemm_configuration.h"
+echo "✓ default_gemm_configuration.h"
+
+cp "${SAMPLES}/include/cutlass/gemm/kernel/default_gemm.h" "$OUTDIR/default_gemm.h"
+echo "✓ default_gemm.h"
+
+cp "${SAMPLES}/include/cutlass/gemm/kernel/default_gemm_universal.h" "$OUTDIR/default_gemm_universal.h"
+echo "✓ default_gemm_universal.h"
+
+# Also grab the ixinfer.h
+cp /usr/local/corex/include/ixinfer.h "$OUTDIR/ixinfer.h" 2>/dev/null && echo "✓ ixinfer.h"
+
+# Full tree
+find "${SAMPLES}" -type f | sort > "$OUTDIR/cutlass_samples_tree.txt"
+echo "✓ cutlass_samples_tree.txt"
+
 echo ""
-
-echo "=== 2. mma_cu10.h — CUTLASS arch Cu10 MMA ==="
-cat "${SAMPLES}/include/cutlass/arch/mma_cu10.h"
+echo "=== Files saved ==="
+ls -lh "$OUTDIR/"
 echo ""
-
-echo "=== 3. default_mma_core_cu10.h — threadblock MMA core for Cu10 ==="
-cat "${SAMPLES}/include/cutlass/gemm/threadblock/default_mma_core_cu10.h"
-echo ""
-
-echo "=== 4. batched_gemm.cu — the example we'll modify for grouped GEMM ==="
-cat "${SAMPLES}/examples/05_batched_gemm/batched_gemm.cu"
-echo ""
-
-echo "=== 5. cutlass samples tree (full, no depth limit) ==="
-find "${SAMPLES}" -type f | sort
-echo ""
-
-echo "=== 6. gemm_universal.h (device level) ==="
-cat "${SAMPLES}/include/cutlass/gemm/device/gemm_universal.h" | head -100
-echo "... ($(wc -l < "${SAMPLES}/include/cutlass/gemm/device/gemm_universal.h") total lines)"
-echo ""
-
-echo "=== 7. gemm_batched.h (device level) ==="
-cat "${SAMPLES}/include/cutlass/gemm/device/gemm_batched.h" | head -100
-echo "... ($(wc -l < "${SAMPLES}/include/cutlass/gemm/device/gemm_batched.h") total lines)"
-echo ""
-
-echo "=== 8. mma_tensor_op.h (warp level) ==="
-cat "${SAMPLES}/include/cutlass/gemm/warp/mma_tensor_op.h" | head -100
-echo "... ($(wc -l < "${SAMPLES}/include/cutlass/gemm/warp/mma_tensor_op.h") total lines)"
+echo "=== Commit these with: git add cat_files/ && git commit && git push ==="
