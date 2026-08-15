@@ -1,0 +1,297 @@
+=== base qwen3_5.py line count ===
+2628 /usr/local/corex/lib/python3/dist-packages/vllm/model_executor/models/qwen3_5.py
+
+=== _pure_pytorch_experts 完整函数 ===
+    def _pure_pytorch_experts(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pure-PyTorch MoE (ixformer has no MoE kernels on BI-V100).
+
+        w13_weight: (num_experts, 2*inter_per_partition, hidden)  [TP-sharded]
+        w2_weight:  (num_experts, hidden,  inter_per_partition)   [TP-sharded]
+        Output is partial (pre-all-reduce), same contract as FusedMoE
+        with reduce_results=False.
+        """
+        # Fused topk+softmax: single CUB kernel vs 2 PyTorch ops.
+        # Source: xllm/core/kernels/cuda/moe/moe_topk_softmax_kernels.cuh
+        if _USE_COREX_MOE_TOPK_SOFTMAX:
+            topk_weights, topk_ids = _corex_moe_topk_softmax.moe_topk_softmax(
+                router_logits.float(), self.top_k, True)
+            topk_ids = topk_ids.to(torch.int64)
+            topk_weights = topk_weights.to(hidden_states.dtype)
+        else:
+            topk_logits, topk_ids = torch.topk(
+                router_logits.float(), self.top_k, dim=-1)     # (T, top_k)
+            topk_weights = torch.softmax(topk_logits, dim=-1)
+            topk_weights = topk_weights.to(hidden_states.dtype)
+
+        w13 = self.experts.w13_weight  # (E, 2*I, H)
+        w2  = self.experts.w2_weight   # (E, H, I)
+
+        T = hidden_states.shape[0]
+        if T == 1:
+            # Fast path: single token (decode).
+            # Batched GEMM: replace top_k separate F.linear calls with 2 fused ops.
+            # gate_up: 1 large GEMM  (1,H) × (K*2*I,H)^T → (1, K*2*I)
+            # down:    1 bmm         (K,H,I) @ (K,I,1)    → (K,H)
+            # Total: 3 kernel launches vs previous 16 (top_k*2).
+            eids    = topk_ids[0]                              # (K,)
+            ws      = topk_weights[0].to(hidden_states.dtype)  # (K,)
+            use_corex_direct = (
+                _USE_COREX_MOE_DIRECT_ROUTED
+                and hidden_states.dtype == torch.float16
+                and w13.dtype == torch.float16
+                and w2.dtype == torch.float16
+                and ws.dtype == torch.float16
+                and hidden_states.is_cuda and w13.is_cuda and w2.is_cuda
+                and eids.is_cuda and ws.is_cuda
+                and hidden_states.is_contiguous()
+                and w13.is_contiguous() and w2.is_contiguous()
+                and eids.is_contiguous() and ws.is_contiguous()
+                and hidden_states.shape == (1, 2048)
+                and w13.shape == (256, 256, 2048)
+                and w2.shape == (256, 2048, 128)
+                and eids.shape == (8,) and ws.shape == (8,))
+            if use_corex_direct:
+                gate_up = _corex_moe_direct_routed.w13(
+                    hidden_states, w13, eids)
+                act = self.act_fn(gate_up)
+                return _corex_moe_direct_routed.w2_reduce(
+                    act, w2, eids, ws)
+
+            use_corex_gather = (
+                _USE_COREX_MOE_WEIGHT_GATHER
+                and hidden_states.dtype == torch.float16
+                and w13.dtype == torch.float16
+                and w2.dtype == torch.float16
+                and w13.is_cuda and w2.is_cuda and eids.is_cuda
+                and w13.is_contiguous() and w2.is_contiguous()
+                and eids.is_contiguous()
+                and w13.dim() == 3 and w2.dim() == 3
+                and eids.dim() == 1 and eids.numel() == 8
+                and w13.shape[0] == w2.shape[0]
+                and w13.shape[2] == w2.shape[1]
+                and w13.shape[1] == 2 * w2.shape[2]
+                and w13.shape[1] * w13.shape[2] % 8 == 0
+                and w2.shape[1] * w2.shape[2] % 8 == 0)
+            if use_corex_gather:
+                w13_sel, w2_sel = _corex_moe_weight_gather.gather(
+                    w13, w2, eids)
+            else:
+                w13_sel = w13[eids]                            # (K, 2*I, H)
+                w2_sel = w2[eids]                              # (K, H, I)
+
+            H = hidden_states.shape[-1]
+
+            gate_up = F.linear(
+                hidden_states,
+                w13_sel.reshape(-1, H),                        # (K*2*I, H) — contiguous after indexing
+            )                                                  # (1, K*2*I)
+            gate_up = gate_up.view(self.top_k, -1)             # (K, 2*I)
+            if _USE_FUSED_MOE_ACTIVATION:
+                act = self.act_fn(gate_up)                      # (K, I)
+            else:
+                gate, up = gate_up.chunk(2, dim=-1)
+                act = F.silu(gate) * up
+
+            # bmm: (K,H,I) @ (K,I,1) → (K,H,1) → (K,H)
+            expert_out = torch.bmm(w2_sel, act.unsqueeze(-1)).squeeze(-1)  # (K, H)
+
+            if (_USE_COREX_MOE_EXACT_REDUCE
+                    and expert_out.dtype == torch.float16
+                    and ws.dtype == torch.float16
+                    and expert_out.shape[0] == 8):
+                out = _corex_moe_exact_reduce.serial_float(expert_out, ws)
+            else:
+                out = (expert_out * ws.unsqueeze(-1)).sum(
+                    0, keepdim=True).to(hidden_states.dtype)   # (1, H)
+        else:
+            # General path (prefill / multi-seq): group assignments once. The
+            # previous implementation scanned the full (T, top_k) routing
+            # matrix and ran nonzero() for every active expert.
+            out = torch.zeros_like(hidden_states)
+            flat_eids = topk_ids.reshape(-1)
+            order = torch.argsort(flat_eids, stable=True)
+            sorted_tok_ids = torch.arange(
+                T, device=topk_ids.device).repeat_interleave(self.top_k)[order]
+            sorted_weights = topk_weights.reshape(-1)[order]
+            expert_counts = torch.bincount(
+                flat_eids, minlength=w13.shape[0]).tolist()
+
+            start = 0
+            for eid, count in enumerate(expert_counts):
+                end = start + count
+                if count == 0:
+                    start = end
+                    continue
+                tok_ids = sorted_tok_ids[start:end]
+                tokens = hidden_states[tok_ids]                # (n, H)
+                gate_up = F.linear(tokens, w13[eid])           # (n, 2*I)
+                gate, up = gate_up.chunk(2, dim=-1)
+                act = F.silu(gate) * up                        # (n, I)
+                expert_out = F.linear(act, w2[eid])            # (n, H)
+                weights = sorted_weights[start:end].unsqueeze(-1)
+                out.index_add_(0, tok_ids, (expert_out * weights).to(out.dtype))
+                start = end
+
+        return out  # partial, all-reduce done in forward()
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+
+=== forward 中调用 _pure_pytorch_experts 的上下文 ===
+122-    from vllm import corex_attn_head_rms_norm as _corex_attn_head_rms_norm
+123-except ImportError:
+124-    _corex_attn_head_rms_norm = None
+125-
+126-try:
+127:    from vllm import corex_moe_exact_reduce as _corex_moe_exact_reduce
+128-except ImportError:
+129:    _corex_moe_exact_reduce = None
+130-
+131-try:
+132:    from vllm import corex_moe_weight_gather as _corex_moe_weight_gather
+133-except ImportError:
+134:    _corex_moe_weight_gather = None
+135-
+136-try:
+137:    from vllm import corex_moe_direct_routed as _corex_moe_direct_routed
+138-except ImportError:
+139:    _corex_moe_direct_routed = None
+140-
+141-try:
+142:    from vllm import corex_moe_topk_softmax as _corex_moe_topk_softmax
+143-except ImportError:
+144:    _corex_moe_topk_softmax = None
+145-
+146-from vllm.model_executor.models.interfaces import (HasInnerState, SupportsLoRA,
+147-                                                   SupportsMultiModal)
+148-
+149-logger = init_logger(__name__)
+--
+174-    and env_bool("BI100_GDN_COREX_PACKED_DECODE", False))
+175-_USE_COREX_ATTN_HEAD_RMS_NORM = (
+176-    _corex_attn_head_rms_norm is not None
+177-    and env_bool("BI100_ATTN_COREX_HEAD_RMS_NORM", True))
+178-_USE_COREX_MOE_EXACT_REDUCE = (
+179:    _corex_moe_exact_reduce is not None
+180-    and env_bool("BI100_MOE_COREX_EXACT_REDUCE", True))
+181-_USE_COREX_MOE_WEIGHT_GATHER = (
+182:    _corex_moe_weight_gather is not None
+183-    and env_bool("BI100_MOE_COREX_WEIGHT_GATHER", True))
+184-_USE_COREX_MOE_DIRECT_ROUTED = (
+185:    _corex_moe_direct_routed is not None
+186-    and env_bool("BI100_MOE_COREX_DIRECT_ROUTED", False))
+187-_USE_COREX_MOE_TOPK_SOFTMAX = (
+188:    _corex_moe_topk_softmax is not None
+189-    and env_bool("BI100_MOE_COREX_TOPK_SOFTMAX", True))
+190-_USE_FUSED_MOE_ACTIVATION = env_bool("BI100_MOE_FUSED_ACTIVATION", True)
+191-
+192-
+193-# ---------------------------------------------------------------------------
+--
+1550-            bias=False, quant_config=quant_config)
+1551-        self.router_shared_gate.weight.weight_loader = \
+1552-            self._router_shared_gate_weight_loader
+1553-
+1554-        # FusedMoE: only used for weight storage + weight_loader.
+1555:        # Forward is bypassed — see _pure_pytorch_experts().
+1556-        self.experts = FusedMoE(
+1557-            num_experts=text_cfg.num_experts,
+1558-            top_k=text_cfg.num_experts_per_tok,
+1559-            hidden_size=hidden_size,
+1560-            intermediate_size=text_cfg.moe_intermediate_size,
+--
+1593-            raise ValueError(
+1594-                "unexpected router/shared gate weight shape: "
+1595-                f"expected {expected}, got {tuple(loaded_weight.shape)}")
+1596-        param.data.narrow(0, offset, rows).copy_(loaded_weight)
+1597-
+1598:    def _pure_pytorch_experts(
+1599-        self,
+1600-        hidden_states: torch.Tensor,
+1601-        router_logits: torch.Tensor,
+1602-    ) -> torch.Tensor:
+1603-        """Pure-PyTorch MoE (ixformer has no MoE kernels on BI-V100).
+--
+1608-        with reduce_results=False.
+1609-        """
+1610-        # Fused topk+softmax: single CUB kernel vs 2 PyTorch ops.
+1611-        # Source: xllm/core/kernels/cuda/moe/moe_topk_softmax_kernels.cuh
+1612-        if _USE_COREX_MOE_TOPK_SOFTMAX:
+1613:            topk_weights, topk_ids = _corex_moe_topk_softmax.moe_topk_softmax(
+1614-                router_logits.float(), self.top_k, True)
+1615-            topk_ids = topk_ids.to(torch.int64)
+1616-            topk_weights = topk_weights.to(hidden_states.dtype)
+1617-        else:
+1618-            topk_logits, topk_ids = torch.topk(
+--
+1646-                and hidden_states.shape == (1, 2048)
+1647-                and w13.shape == (256, 256, 2048)
+1648-                and w2.shape == (256, 2048, 128)
+1649-                and eids.shape == (8,) and ws.shape == (8,))
+1650-            if use_corex_direct:
+1651:                gate_up = _corex_moe_direct_routed.w13(
+1652-                    hidden_states, w13, eids)
+1653-                act = self.act_fn(gate_up)
+1654:                return _corex_moe_direct_routed.w2_reduce(
+1655-                    act, w2, eids, ws)
+1656-
+1657-            use_corex_gather = (
+1658-                _USE_COREX_MOE_WEIGHT_GATHER
+1659-                and hidden_states.dtype == torch.float16
+
+=== corex_moe_direct_routed.w13 签名 ===
+/usr/local/corex/lib64/python3/dist-packages/torch/cuda/__init__.py:51: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+INFO 08-15 14:38:09 importing.py:10] Triton not installed; certain GPU-related functions will not be available.
+2026-08-15 14:38:10.835442: I tensorflow/core/util/port.cc:110] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2026-08-15 14:38:10.887465: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: SSE3 SSE4.1 SSE4.2 AVX AVX2 AVX512F AVX512_VNNI AVX512_BF16 AVX_VNNI AMX_TILE AMX_INT8 AMX_BF16 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+WARNING:tensorflow:Deprecation warnings have been disabled. Set TF_ENABLE_DEPRECATION_WARNINGS=1 to re-enable them.
+w13: <class 'builtin_function_or_method'>
+w2_reduce: <class 'builtin_function_or_method'>
+
+=== corex_moe_topk_softmax.moe_topk_softmax 签名 ===
+/usr/local/corex/lib64/python3/dist-packages/torch/cuda/__init__.py:51: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+INFO 08-15 14:38:20 importing.py:10] Triton not installed; certain GPU-related functions will not be available.
+2026-08-15 14:38:22.233616: I tensorflow/core/util/port.cc:110] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2026-08-15 14:38:22.284693: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: SSE3 SSE4.1 SSE4.2 AVX AVX2 AVX512F AVX512_VNNI AVX512_BF16 AVX_VNNI AMX_TILE AMX_INT8 AMX_BF16 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+WARNING:tensorflow:Deprecation warnings have been disabled. Set TF_ENABLE_DEPRECATION_WARNINGS=1 to re-enable them.
+moe_topk_softmax: <class 'builtin_function_or_method'>
+
+=== corex_moe_exact_reduce 签名 ===
+/usr/local/corex/lib64/python3/dist-packages/torch/cuda/__init__.py:51: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+INFO 08-15 14:38:31 importing.py:10] Triton not installed; certain GPU-related functions will not be available.
+2026-08-15 14:38:33.436893: I tensorflow/core/util/port.cc:110] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2026-08-15 14:38:33.488922: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: SSE3 SSE4.1 SSE4.2 AVX AVX2 AVX512F AVX512_VNNI AVX512_BF16 AVX_VNNI AMX_TILE AMX_INT8 AMX_BF16 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+WARNING:tensorflow:Deprecation warnings have been disabled. Set TF_ENABLE_DEPRECATION_WARNINGS=1 to re-enable them.
+serial_float: <class 'builtin_function_or_method'>
+serial_half: <class 'builtin_function_or_method'>
+tree_float: <class 'builtin_function_or_method'>
+
+=== corex_moe_weight_gather 签名 ===
+/usr/local/corex/lib64/python3/dist-packages/torch/cuda/__init__.py:51: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+INFO 08-15 14:38:42 importing.py:10] Triton not installed; certain GPU-related functions will not be available.
+2026-08-15 14:38:44.640768: I tensorflow/core/util/port.cc:110] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2026-08-15 14:38:44.692741: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: SSE3 SSE4.1 SSE4.2 AVX AVX2 AVX512F AVX512_VNNI AVX512_BF16 AVX_VNNI AMX_TILE AMX_INT8 AMX_BF16 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+WARNING:tensorflow:Deprecation warnings have been disabled. Set TF_ENABLE_DEPRECATION_WARNINGS=1 to re-enable them.
+gather: <class 'builtin_function_or_method'>
+
+=== corex_moe_index_combine 签名 ===
+/usr/local/corex/lib64/python3/dist-packages/torch/cuda/__init__.py:51: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+INFO 08-15 14:38:54 importing.py:10] Triton not installed; certain GPU-related functions will not be available.
+2026-08-15 14:38:56.150733: I tensorflow/core/util/port.cc:110] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2026-08-15 14:38:56.203274: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: SSE3 SSE4.1 SSE4.2 AVX AVX2 AVX512F AVX512_VNNI AVX512_BF16 AVX_VNNI AMX_TILE AMX_INT8 AMX_BF16 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+WARNING:tensorflow:Deprecation warnings have been disabled. Set TF_ENABLE_DEPRECATION_WARNINGS=1 to re-enable them.
+moe_combine_result: <class 'builtin_function_or_method'>
+moe_compute_index: <class 'builtin_function_or_method'>
