@@ -139,6 +139,11 @@ except ImportError:
     _corex_moe_direct_routed = None
 
 try:
+    from vllm import corex_batched_gemm as _corex_batched_gemm
+except ImportError:
+    _corex_batched_gemm = None
+
+try:
     from vllm import corex_moe_topk_softmax as _corex_moe_topk_softmax
 except ImportError:
     _corex_moe_topk_softmax = None
@@ -204,6 +209,9 @@ _USE_COREX_MOE_WEIGHT_GATHER = (
 _USE_COREX_MOE_DIRECT_ROUTED = (
     _corex_moe_direct_routed is not None
     and env_bool("BI100_MOE_COREX_DIRECT_ROUTED", False))
+_USE_COREX_BATCHED_GEMM = (
+    _corex_batched_gemm is not None
+    and env_bool("BI100_MOE_BATCHED_GEMM", True))
 _USE_COREX_MOE_TOPK_SOFTMAX = (
     _corex_moe_topk_softmax is not None
     and env_bool("BI100_MOE_COREX_TOPK_SOFTMAX", True))
@@ -1728,6 +1736,15 @@ class Qwen3_5MoeSparseBlock(nn.Module):
                 act = self.act_fn(gate_up)
                 return _corex_moe_direct_routed.w2_reduce(
                     act, w2, eids, ws)
+
+            # Tier 1.5: CUTLASS batched GEMM (verified 2.462ms, issue #68)
+            # 1 launch for 8 experts vs 8 launches for F.linear loop
+            if (_USE_COREX_BATCHED_GEMM
+                    and hidden_states.dtype == torch.float16
+                    and w13.dtype == torch.float16
+                    and w2.dtype == torch.float16):
+                return _corex_batched_gemm.moe_decode_fused(
+                    hidden_states, w13[eids], w2[eids], ws)
 
             use_corex_gather = (
                 _USE_COREX_MOE_WEIGHT_GATHER
