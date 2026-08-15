@@ -1634,6 +1634,10 @@ class Qwen3_5MoeSparseBlock(nn.Module):
             quant_config=quant_config)
         self.act_fn = SiluAndMul()
 
+        # Pre-transposed weight cache for bmm decode path
+        self._w13_t = None
+        self._w2_t = None
+
     def _router_shared_gate_weight_loader(
         self,
         param: torch.Tensor,
@@ -1770,19 +1774,28 @@ class Qwen3_5MoeSparseBlock(nn.Module):
 
             H = hidden_states.shape[-1]
 
-            gate_up = F.linear(
-                hidden_states,
-                w13_sel.reshape(-1, H),                        # (K*2*I, H) — contiguous after indexing
-            )                                                  # (1, K*2*I)
-            gate_up = gate_up.view(self.top_k, -1)             # (K, 2*I)
+            # --- Pre-transpose weights for bmm (cached after first call) ---
+            if not hasattr(self, '_w13_t') or self._w13_t is None:
+                # (E, 2*I, H) → (E, H, 2*I) — one-time cost at first decode
+                self._w13_t = self.experts.w13_weight.transpose(1, 2).contiguous()
+                self._w2_t = self.experts.w2_weight.transpose(1, 2).contiguous()
+                # (E, H, I) → (E, I, H)
+
+            w13_t_sel = self._w13_t[eids]   # (K, H, 2*I)
+            w2_t_sel = self._w2_t[eids]     # (K, I, H)
+
+            # FC1: bmm (K,1,H) @ (K,H,2I) → (K,1,2I)
+            x_expand = hidden_states.unsqueeze(0).expand(self.top_k, -1, -1)  # (K, 1, H)
+            gate_up = torch.bmm(x_expand, w13_t_sel).squeeze(1)  # (K, 2*I)
+
             if _USE_FUSED_MOE_ACTIVATION:
                 act = self.act_fn(gate_up)                      # (K, I)
             else:
                 gate, up = gate_up.chunk(2, dim=-1)
                 act = F.silu(gate) * up
 
-            # bmm: (K,H,I) @ (K,I,1) → (K,H,1) → (K,H)
-            expert_out = torch.bmm(w2_sel, act.unsqueeze(-1)).squeeze(-1)  # (K, H)
+            # FC2: bmm (K,1,I) @ (K,I,H) → (K,1,H)
+            expert_out = torch.bmm(act.unsqueeze(1), w2_t_sel).squeeze(1)  # (K, H)
 
             if (_USE_COREX_MOE_EXACT_REDUCE
                     and expert_out.dtype == torch.float16
