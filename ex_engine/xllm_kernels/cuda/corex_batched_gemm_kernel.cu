@@ -1,30 +1,22 @@
 /*
- * corex_batched_gemm_kernel.cu — CUTLASS half-precision batched GEMM
+ * corex_batched_gemm_kernel.cu — FP16 Cu10 TensorOp batched GEMM
  *
- * Uses cutlass::gemm::device::GemmBatched with Cu10 TensorOp (ivcore10).
- * Verified: 2.462ms for 8×(1×4096 @ 4096×11008) on BI-V100.
+ * Uses cutlass::gemm::device::GemmBatched with:
+ *   - OpClassTensorOp (TCU, not SIMT)
+ *   - arch::Cu10 (BI-V100)
+ *   - float accumulation (FP32, not FP16)
  *
- * Source: cat_files/batched_gemm.cu adapted from float to half.
- *         cat_files/gemm_batched.h (Iluvatar CoreX CUTLASS fork)
+ * Source: ex_engine/xllm_kernels/cuda/moe_cutlass_batched.cu (verified 2.462ms)
  */
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
 #include "cutlass/cutlass.h"
+#include "cutlass/numeric_types.h"
 #include "cutlass/layout/matrix.h"
 #include "cutlass/gemm/device/gemm_batched.h"
-#include "cutlass/numeric_types.h"
 
-/*
- * Half-precision batched strided GEMM via CUTLASS.
- *
- * C[b] = A[b] × B[b]   for b = 0..batch_count-1
- *
- * All matrices column-major.
- * The caller (corex_batched_gemm_bind.cpp) handles row-major ↔ col-major
- * transposition by swapping A/B and M/N.
- */
 cudaError_t cutlass_batched_hgemm(
     int m, int n, int k,
     __half const *A, int lda, long long int batch_stride_A,
@@ -32,34 +24,39 @@ cudaError_t cutlass_batched_hgemm(
     __half *C, int ldc, long long int batch_stride_C,
     int batch_count)
 {
-    using ElementA = cutlass::half_t;
-    using ElementB = cutlass::half_t;
-    using ElementC = cutlass::half_t;
-    using ElementAccumulator = cutlass::half_t;
-
     using Gemm = cutlass::gemm::device::GemmBatched<
-        ElementA, cutlass::layout::ColumnMajor,   // A
-        ElementB, cutlass::layout::ColumnMajor,   // B
-        ElementC, cutlass::layout::ColumnMajor,   // C
-        ElementAccumulator                         // accumulator
+        cutlass::half_t,                    // ElementA
+        cutlass::layout::RowMajor,          // LayoutA
+        cutlass::half_t,                    // ElementB
+        cutlass::layout::RowMajor,          // LayoutB
+        cutlass::half_t,                    // ElementC
+        cutlass::layout::RowMajor,          // LayoutC
+        float,                              // ElementAccumulator — FP32!
+        cutlass::arch::OpClassTensorOp,     // OperatorClass — TCU!
+        cutlass::arch::Cu10                 // ArchTag — BI-V100!
+        // Defaults from DefaultGemmConfiguration<OpClassTensorOp, Cu10, half, half, half, float>:
+        //   ThreadblockShape = <128, 128, 32>
+        //   WarpShape = <32, 32, 32>
+        //   InstructionShape = <16, 16, 16>
+        //   Stages = 2
     >;
 
-    ElementAccumulator alpha_val(1.0f);
-    ElementAccumulator beta_val(0.0f);
+    float alpha = 1.0f;
+    float beta = 0.0f;
 
     Gemm gemm_op;
 
     cutlass::Status status = gemm_op({
         {m, n, k},
-        {reinterpret_cast<ElementA const *>(A), lda},
+        {reinterpret_cast<cutlass::half_t const *>(A), lda},
         batch_stride_A,
-        {reinterpret_cast<ElementB const *>(B), ldb},
+        {reinterpret_cast<cutlass::half_t const *>(B), ldb},
         batch_stride_B,
-        {reinterpret_cast<ElementC const *>(C), ldc},
+        {reinterpret_cast<cutlass::half_t const *>(C), ldc},
         batch_stride_C,
-        {reinterpret_cast<ElementC *>(C), ldc},
+        {reinterpret_cast<cutlass::half_t *>(C), ldc},
         batch_stride_C,
-        {alpha_val, beta_val},
+        {alpha, beta},
         batch_count
     });
 
