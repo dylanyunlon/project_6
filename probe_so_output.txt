@@ -1,0 +1,100 @@
+=== 1. .so文件实际位置和文件名 ===
+-rwxr-xr-x 1 root root 210936 Aug 13 01:33 /usr/local/corex/lib/python3/dist-packages/vllm/corex_moe_direct_routed.so
+-rwxr-xr-x 1 root root 192360 Aug 13 01:33 /usr/local/corex/lib/python3/dist-packages/vllm/corex_moe_exact_reduce.so
+-rwxr-xr-x 1 root root 216688 Aug 14 01:46 /usr/local/corex/lib/python3/dist-packages/vllm/corex_moe_index_combine.so
+-rwxr-xr-x 1 root root 696256 Aug 13 01:33 /usr/local/corex/lib/python3/dist-packages/vllm/corex_moe_topk_softmax.so
+-rwxr-xr-x 1 root root 197320 Aug 13 01:33 /usr/local/corex/lib/python3/dist-packages/vllm/corex_moe_weight_gather.so
+-rwxr-xr-x 1 root root  277120 Aug 11 09:31 /usr/local/corex/lib/python3/dist-packages/vllm/ix_unified_bridge.cpython-310-x86_64-linux-gnu.so
+-rwxr-xr-x 1 root root 1506880 Aug 12 01:29 /usr/local/corex/lib/python3/dist-packages/vllm/ix_unified_bridge.so
+
+=== 2. Python import路径 ===
+/usr/local/corex/lib64/python3/dist-packages/torch/cuda/__init__.py:51: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+INFO 08-15 14:48:59 importing.py:10] Triton not installed; certain GPU-related functions will not be available.
+2026-08-15 14:49:01.632894: I tensorflow/core/util/port.cc:110] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2026-08-15 14:49:01.686627: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: SSE3 SSE4.1 SSE4.2 AVX AVX2 AVX512F AVX512_VNNI AVX512_BF16 AVX_VNNI AMX_TILE AMX_INT8 AMX_BF16 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+WARNING:tensorflow:Deprecation warnings have been disabled. Set TF_ENABLE_DEPRECATION_WARNINGS=1 to re-enable them.
+vllm.__file__: /home/dylan/0814/project_6/vllm/__init__.py
+vllm dir: /home/dylan/0814/project_6/vllm
+  corex_attn_head_rms_norm.so
+  corex_block_major_kv_transfer.so
+  corex_fused_paged_prefill.so
+  corex_gdn_beta_decay.so
+  corex_gdn_causal_conv.so
+  corex_gdn_chunk_recurrent.so
+  corex_gdn_gated_norm.so
+  corex_gdn_packed_decode.so
+  corex_gdn_qk_map.so
+  corex_moe_direct_routed.so
+  corex_moe_exact_reduce.so
+  corex_moe_index_combine.so
+  corex_moe_topk_softmax.so
+  corex_moe_weight_gather.so
+  corex_paged_kv_gather.so
+  ix_full_bridge.so
+
+=== 3. 逐个import corex_moe测试 ===
+/usr/local/corex/lib64/python3/dist-packages/torch/cuda/__init__.py:51: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+INFO 08-15 14:49:11 importing.py:10] Triton not installed; certain GPU-related functions will not be available.
+2026-08-15 14:49:13.043593: I tensorflow/core/util/port.cc:110] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2026-08-15 14:49:13.095797: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: SSE3 SSE4.1 SSE4.2 AVX AVX2 AVX512F AVX512_VNNI AVX512_BF16 AVX_VNNI AMX_TILE AMX_INT8 AMX_BF16 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+WARNING:tensorflow:Deprecation warnings have been disabled. Set TF_ENABLE_DEPRECATION_WARNINGS=1 to re-enable them.
+  ✓ from vllm import corex_moe_topk_softmax → ['moe_topk_softmax']
+  ✓ from vllm import corex_moe_direct_routed → ['w13', 'w2_reduce']
+  ✓ from vllm import corex_moe_weight_gather → ['gather']
+  ✓ from vllm import corex_moe_exact_reduce → ['serial_float', 'serial_half', 'tree_float']
+  ✓ from vllm import corex_moe_index_combine → ['moe_combine_result', 'moe_compute_index']
+  ✓ from vllm import corex_attn_head_rms_norm → ['apply_inverse', 'prepare']
+  ✓ from vllm import corex_fused_paged_prefill → ['forward']
+  ✓ from vllm import corex_paged_kv_gather → ['gather']
+  ✓ from vllm import corex_gdn_chunk_recurrent → ['torch_chunk_gated_delta_rule', 'torch_recurrent_gated_delta_rule']
+  ✓ from vllm import corex_gdn_causal_conv → ['causal_conv_update']
+  ✓ from vllm import corex_gdn_beta_decay → ['beta_decay']
+  ✓ from vllm import corex_gdn_gated_norm → ['apply_inverse']
+  ✓ from vllm import corex_gdn_qk_map → ['qk_map']
+  ✓ from vllm import corex_gdn_packed_decode → ['packed_decode']
+  ✓ from vllm import corex_block_major_kv_transfer → ['check_error', 'cpu_gather', 'cpu_scatter', 'pack', 'scatter']
+
+=== 4. ix_unified_bridge import测试 ===
+/usr/local/corex/lib64/python3/dist-packages/torch/cuda/__init__.py:51: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+INFO 08-15 14:49:22 importing.py:10] Triton not installed; certain GPU-related functions will not be available.
+2026-08-15 14:49:24.345485: I tensorflow/core/util/port.cc:110] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2026-08-15 14:49:24.397567: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: SSE3 SSE4.1 SSE4.2 AVX AVX2 AVX512F AVX512_VNNI AVX512_BF16 AVX_VNNI AMX_TILE AMX_INT8 AMX_BF16 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+WARNING:tensorflow:Deprecation warnings have been disabled. Set TF_ENABLE_DEPRECATION_WARNINGS=1 to re-enable them.
+  ✗ ix_unified_bridge: cannot import name 'ix_unified_bridge' from 'vllm' (/home/dylan/0814/project_6/vllm/__init__.py)
+
+=== 5. 我们的qwen3_5.py里各flag的实际值 ===
+/usr/local/corex/lib/python3/dist-packages/torch/cuda/__init__.py:51: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+INFO 08-15 14:49:33 importing.py:10] Triton not installed; certain GPU-related functions will not be available.
+2026-08-15 14:49:35.533303: I tensorflow/core/util/port.cc:110] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2026-08-15 14:49:35.585311: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: SSE3 SSE4.1 SSE4.2 AVX AVX2 AVX512F AVX512_VNNI AVX512_BF16 AVX_VNNI AMX_TILE AMX_INT8 AMX_BF16 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+WARNING:tensorflow:Deprecation warnings have been disabled. Set TF_ENABLE_DEPRECATION_WARNINGS=1 to re-enable them.
+  ✗ _USE_COREX_BATCHED_GEMM = False
+  ✗ _USE_COREX_MOE_DIRECT_ROUTED = False
+  ✓ _USE_COREX_MOE_EXACT_REDUCE = True
+  ✓ _USE_COREX_MOE_INDEX_COMBINE = True
+  ✓ _USE_COREX_MOE_TOPK_SOFTMAX = True
+  ✓ _USE_COREX_MOE_WEIGHT_GATHER = True
+  ✗ _USE_IX_FUSED_MOE = False
+  ✗ _USE_NAIVE_BATCHED_MOE = False
+
+=== 6. 模型实际shape（判断corex_direct_routed能否匹配）===
+Qwen3.5-27B MoE config (from config.json):
+  num_experts = 128 (per TP shard: 128/4=32? or 128?)
+  top_k = 8
+  hidden_size = 3584 (per TP shard: 3584/4=896? or 3584?)
+  moe_intermediate_size = 18944 (per TP shard: 18944/4=4736)
+
+Expected weight shapes (TP=4):
+  w13: (128, 2*4736, 3584) = (128, 9472, 3584)  -- NOT (256, 256, 2048)
+  w2:  (128, 3584, 4736)                         -- NOT (256, 2048, 128)
+
+corex_moe_direct_routed hardcoded for different model!
+We need corex_moe_weight_gather + F.linear path instead.
