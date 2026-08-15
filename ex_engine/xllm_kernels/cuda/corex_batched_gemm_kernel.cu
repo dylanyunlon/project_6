@@ -35,17 +35,24 @@ cudaError_t cutlass_batched_hgemm(
     using ElementA = cutlass::half_t;
     using ElementB = cutlass::half_t;
     using ElementC = cutlass::half_t;
-    using ElementAccumulator = cutlass::half_t;
+    using ElementAccumulator = float;
 
     using Gemm = cutlass::gemm::device::GemmBatched<
         ElementA, cutlass::layout::ColumnMajor,   // A
         ElementB, cutlass::layout::ColumnMajor,   // B
         ElementC, cutlass::layout::ColumnMajor,   // C
-        ElementAccumulator                         // accumulator
+        ElementAccumulator,                        // accumulator = FP32
+        cutlass::arch::OpClassTensorOp,            // use TCU (not SIMT)
+        cutlass::arch::Cu10                        // BI-V100 arch
+        // Defaults from DefaultGemmConfiguration:
+        //   ThreadblockShape = <128, 128, 32>
+        //   WarpShape = <32, 32, 32>
+        //   InstructionShape = <16, 16, 16>
+        //   Stages = 2
     >;
 
-    ElementAccumulator alpha_val(1.0f);
-    ElementAccumulator beta_val(0.0f);
+    float alpha_val = 1.0f;
+    float beta_val = 0.0f;
 
     Gemm gemm_op;
 
