@@ -199,6 +199,65 @@ if [ -d "$PREBUILT_DIR" ]; then
     done
 fi
 
+# --- Deploy ix_bridge Python integration layer --------------------------------
+build_stage "deploying ix_bridge operator replacements"
+EX_ENGINE_DIR="$(cd "$(dirname "$0")/../ex_engine" 2>/dev/null && pwd || echo "")"
+if [ -z "$EX_ENGINE_DIR" ] || [ ! -d "$EX_ENGINE_DIR" ]; then
+    EX_ENGINE_DIR="$(cd "$(dirname "$0")" && pwd)/../ex_engine"
+fi
+
+if [ -d "$EX_ENGINE_DIR/python" ]; then
+    # Create ex_engine package inside vllm
+    mkdir -p "${VLLM_ROOT}/ex_engine/csrc"
+    echo '"""ex_engine — Algorithm factor replacement for BI-V100."""' > "${VLLM_ROOT}/ex_engine/__init__.py"
+
+    # Deploy Python modules
+    cp "$EX_ENGINE_DIR/python/ix_ops.py" "${VLLM_ROOT}/ex_engine/ix_ops.py"
+    cp "$EX_ENGINE_DIR/python/patch_vllm_ops.py" "${VLLM_ROOT}/ex_engine/patch_vllm_ops.py"
+    echo "[patch_ops] deployed ix_ops.py + patch_vllm_ops.py → ${VLLM_ROOT}/ex_engine/"
+
+    # Deploy bridge C++ source for JIT fallback
+    for cpp in "$EX_ENGINE_DIR"/csrc/ix_full_bridge*.cpp "$EX_ENGINE_DIR"/csrc/ix_moe_bridge.cpp; do
+        [ -f "$cpp" ] && cp "$cpp" "${VLLM_ROOT}/ex_engine/csrc/" && \
+            echo "[patch_ops] deployed $(basename $cpp) for JIT fallback"
+    done
+
+    # Create startup hook that patches vllm ops at import time
+    cat > "${VLLM_ROOT}/ix_startup_patch.py" << 'STARTUP_EOF'
+"""Apply ix_ops patches at vllm startup."""
+import logging
+_logger = logging.getLogger("ix_startup_patch")
+def apply():
+    try:
+        from vllm.ex_engine.patch_vllm_ops import apply_all_patches
+        n = apply_all_patches()
+        if n > 0:
+            _logger.info("ix_startup_patch: %d patches applied", n)
+        return n
+    except Exception as e:
+        _logger.warning("ix_startup_patch failed: %s", e)
+        return 0
+_n_patches = apply()
+STARTUP_EOF
+    echo "[patch_ops] deployed ix_startup_patch.py"
+
+    # Hook into vllm __init__.py to auto-apply patches on import
+    VLLM_INIT="${VLLM_ROOT}/__init__.py"
+    if [ -f "$VLLM_INIT" ]; then
+        if ! grep -q "ix_startup_patch" "$VLLM_INIT" 2>/dev/null; then
+            echo "" >> "$VLLM_INIT"
+            echo "# Auto-apply ix_bridge operator patches" >> "$VLLM_INIT"
+            echo "try:" >> "$VLLM_INIT"
+            echo "    from vllm import ix_startup_patch" >> "$VLLM_INIT"
+            echo "except Exception:" >> "$VLLM_INIT"
+            echo "    pass" >> "$VLLM_INIT"
+            echo "[patch_ops] hooked ix_startup_patch into vllm/__init__.py"
+        fi
+    fi
+else
+    echo "[patch_ops] WARN: ex_engine/python not found, skip ix_bridge deployment"
+fi
+
 # --- sequence.py: fix completion_tokens inflation under chunked prefill ------
 # Bug: get_output_token_ids_to_return(delta=True) with num_new_tokens=0
 # returns _cached_all_token_ids[-0:] == [0:] (the ENTIRE prompt+output list).
