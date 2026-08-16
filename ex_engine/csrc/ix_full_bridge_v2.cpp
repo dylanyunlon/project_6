@@ -326,15 +326,21 @@ torch::Tensor ix_moe_expand_input(torch::Tensor input,
 torch::Tensor ix_group_gemm(torch::Tensor inputs, torch::Tensor weights,
                             torch::Tensor tokens_per_experts,
                             int64_t output_n) {
+    // Match upstream xllm/core/kernels/ilu/group_gemm.cpp exactly:
+    // moe_w16a16_group_gemm(output, input, weight, tokens_per_experts,
+    //                       dst_to_src=nullopt, bias=nullopt,
+    //                       format="TN", persistent=0,
+    //                       output_n=tokens_per_experts.sum())
     int64_t total_tokens = inputs.size(0);
     auto output = inputs.new_empty({total_tokens, output_n});
+    int64_t gemm_output_n = tokens_per_experts.sum().item<int64_t>();
     ixformer::infer::moe_w16a16_group_gemm(
         output, inputs, weights, tokens_per_experts,
         /*dst_to_src=*/c10::nullopt,
         /*bias=*/c10::nullopt,
-        /*format=*/"default",
+        /*format=*/"TN",
         /*persistent=*/0,
-        output_n);
+        gemm_output_n);
     return output;
 }
 
@@ -382,16 +388,20 @@ torch::Tensor ix_fused_moe_forward(
     auto expanded = ix_moe_expand_input(hidden_states, src_dst, dst_src, topk);
 
     // Step 4: group_gemm (w13: gate_up projection)
+    // w13 shape: [num_experts, 2*intermediate, hidden] — pass as-is (3D)
+    // output_n = tokens_per_experts.sum() per upstream convention
     int64_t intermediate_2x = w13.size(1);
-    auto gate_up = ix_group_gemm(expanded, w13.view({-1, w13.size(2)}),
+    int64_t output_n_w13 = expert_sizes_gpu.sum().item<int64_t>();
+    auto gate_up = ix_group_gemm(expanded, w13,
                                  expert_sizes_gpu, intermediate_2x);
 
     // Step 5: silu_and_mul
     auto activated = ix_silu_and_mul(gate_up);
 
     // Step 6: group_gemm (w2: down projection)
+    // w2 shape: [num_experts, hidden, intermediate] — pass as-is (3D)
     int64_t hidden_size = w2.size(1);
-    auto down = ix_group_gemm(activated, w2.view({-1, w2.size(2)}),
+    auto down = ix_group_gemm(activated, w2,
                               expert_sizes_gpu, hidden_size);
 
     // Step 7: moe_combine_result
