@@ -332,6 +332,23 @@ if b"max_completion_tokens" not in installed:
     raise SystemExit("protocol.py missing max_completion_tokens field")
 PY
 
+build_stage "building MoE bridge (ix_moe_bridge.so)"
+if [[ -f "./ex_engine_src/build_moe_bridge.sh" ]]; then
+    bash ./ex_engine_src/build_moe_bridge.sh "${VLLM_ROOT}" 2>&1 || {
+        echo "[WARN] MoE bridge build failed — will use Python fallback"
+    }
+fi
+
+build_stage "deploying MoE dispatch modules"
+EX_DIR="${VLLM_ROOT}/ex_engine/python"
+mkdir -p "${EX_DIR}"
+for pyfile in moe_dispatch.py patch_moe_hot_path.py; do
+    if [[ -f "./ex_engine_src/python/${pyfile}" ]]; then
+        cp "./ex_engine_src/python/${pyfile}" "${EX_DIR}/${pyfile}"
+        echo "  ✓ ${pyfile}"
+    fi
+done
+
 build_stage "compiling submission Python sources"
 find . -path './wheels' -prune -o -name '*.py' -print0 | xargs -0 python3 -m py_compile
 

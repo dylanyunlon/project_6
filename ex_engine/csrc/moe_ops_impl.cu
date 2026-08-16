@@ -69,14 +69,17 @@ cuinferStatus_t cuinferCustomGemm(
 // Adapted from moe_topk_softmax_v3.cu (already working, 64-expert specialized)
 // ============================================================================
 
-static constexpr int MOE_EXPERTS = 64;
-static constexpr int MOE_BLOCK = 64;
+// Qwen3.5-27B: 128 routed experts
+// Block size = 128 threads (1 thread per expert for ≤128 experts)
+static constexpr int MOE_MAX_EXPERTS = 128;
+static constexpr int MOE_BLOCK = 128;
 
+// All reductions use blockDim.x (dynamic block size, power-of-2)
 __device__ float smem_reduce_max(float val, float* smem) {
     int tid = threadIdx.x;
     smem[tid] = val;
     __syncthreads();
-    for (int s = MOE_BLOCK / 2; s > 0; s >>= 1) {
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) smem[tid] = fmaxf(smem[tid], smem[tid + s]);
         __syncthreads();
     }
@@ -87,7 +90,7 @@ __device__ float smem_reduce_sum(float val, float* smem) {
     int tid = threadIdx.x;
     smem[tid] = val;
     __syncthreads();
-    for (int s = MOE_BLOCK / 2; s > 0; s >>= 1) {
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) smem[tid] += smem[tid + s];
         __syncthreads();
     }
@@ -99,7 +102,7 @@ __device__ void smem_argmax(float val, int idx, float* s_val, int* s_idx) {
     s_val[tid] = val;
     s_idx[tid] = idx;
     __syncthreads();
-    for (int s = MOE_BLOCK / 2; s > 0; s >>= 1) {
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s && s_val[tid + s] > s_val[tid]) {
             s_val[tid] = s_val[tid + s];
             s_idx[tid] = s_idx[tid + s];
@@ -113,20 +116,23 @@ __global__ void topk_softmax_kernel(
     float* __restrict__ topk_weights,
     int32_t* __restrict__ topk_indices,
     int32_t* __restrict__ token_expert_indices,
-    int num_tokens, int topk, bool renormalize
+    int num_tokens, int num_experts, int topk, bool renormalize
 ) {
     int row = blockIdx.x;
     if (row >= num_tokens) return;
     int tid = threadIdx.x;
 
-    __shared__ float smem[MOE_BLOCK];
-    __shared__ int smem_idx[MOE_BLOCK];
+    extern __shared__ char shared_buf[];
+    float* smem = (float*)shared_buf;
+    int* smem_idx = (int*)(smem + blockDim.x);
 
-    float val = (tid < MOE_EXPERTS) ? input[row * MOE_EXPERTS + tid] : -1e30f;
+    // num_experts passed via gridDim.y (encoded), or read from shared
+    // We use a separate parameter for clarity
+    float val = (tid < num_experts) ? input[row * num_experts + tid] : -1e30f;
 
     // Softmax
     float row_max = smem_reduce_max(val, smem);
-    val = (tid < MOE_EXPERTS) ? expf(val - row_max) : 0.0f;
+    val = (tid < num_experts) ? expf(val - row_max) : 0.0f;
     float row_sum = smem_reduce_sum(val, smem);
     val *= (1.0f / row_sum);
 
@@ -286,17 +292,24 @@ void topk_softmax(
     bool renormalize
 ) {
     int num_tokens = gating_output.size(0);
+    int num_experts = gating_output.size(1);
     int topk = topk_weights.size(1);
     auto stream = c10::cuda::getCurrentCUDAStream();
 
     auto input_f32 = gating_output.to(torch::kFloat32).contiguous();
 
-    topk_softmax_kernel<<<num_tokens, MOE_BLOCK, 0, stream>>>(
+    // Block size must be >= num_experts, round up to next power of 2
+    int block_size = 1;
+    while (block_size < num_experts) block_size <<= 1;
+    TORCH_CHECK(block_size <= 1024, "Too many experts for topk kernel: ", num_experts);
+
+    size_t smem_bytes = block_size * (sizeof(float) + sizeof(int));
+    topk_softmax_kernel<<<num_tokens, block_size, smem_bytes, stream>>>(
         input_f32.data_ptr<float>(),
         topk_weights.data_ptr<float>(),
         topk_indices.data_ptr<int32_t>(),
         token_expert_indices.data_ptr<int32_t>(),
-        num_tokens, topk, renormalize);
+        num_tokens, num_experts, topk, renormalize);
 }
 
 void moe_compute_token_index_api(
