@@ -1,0 +1,6 @@
+000000000008ed90 T PyInit__C
+000000000009af00 T _ZSt15get_new_handlerv
+000000000009ad80 T _ZdlPvSt11align_val_t
+000000000009ad90 T _ZnwmSt11align_val_t
+000000000009af70 T _fini
+0000000000019000 T _init
