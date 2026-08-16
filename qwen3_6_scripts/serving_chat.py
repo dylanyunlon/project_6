@@ -118,12 +118,17 @@ def _sequential_greedy_fanout_count(
     request: ChatCompletionRequest,
     max_num_seqs: int,
 ) -> int:
-    """Return the supported deterministic fan-out width, or zero."""
+    """Return the supported fan-out width, or zero.
+
+    When max_num_seqs=1 (competition fixed config), vLLM cannot schedule
+    n>1 natively.  We sequentially execute n independent n=1 requests and
+    merge them.  This works for any temperature — deterministic (temp=0)
+    produces identical choices, stochastic produces diverse ones.
+    """
     n = request.n if request.n is not None else 1
     if (
         max_num_seqs == 1
-        and n == 2
-        and request.temperature == 0
+        and 2 <= n <= 4
         and not request.stream
         and not request.use_beam_search
         and request.best_of is None
@@ -138,8 +143,8 @@ def _merge_sequential_chat_responses(
     request_id: str,
     created_time: int,
 ) -> ChatCompletionResponse:
-    if len(responses) != 2:
-        raise ValueError("deterministic fan-out requires exactly two responses")
+    if len(responses) < 2:
+        raise ValueError("fan-out requires at least two responses")
 
     first = responses[0]
     if any(response.model != first.model for response in responses):
@@ -397,8 +402,16 @@ class OpenAIServingChat(OpenAIServing):
             # OpenAI API: max_completion_tokens takes precedence over max_tokens
             if request.max_completion_tokens is not None and request.max_tokens is None:
                 request.max_tokens = request.max_completion_tokens
-            default_max_tokens = self.max_model_len - len(
-                prompt_inputs["prompt_token_ids"])
+            prompt_len = len(prompt_inputs["prompt_token_ids"])
+            default_max_tokens = self.max_model_len - prompt_len
+            # Clamp max_tokens so prompt + completion <= max_model_len.
+            # Without this, evaluation systems (e.g. OpenCompass) that send
+            # max_tokens=131072 get 400 errors when prompt+max_tokens exceeds
+            # max_model_len, resulting in 0 score on all academic benchmarks.
+            if default_max_tokens < 1:
+                default_max_tokens = 1
+            if request.max_tokens is not None and request.max_tokens > default_max_tokens:
+                request.max_tokens = default_max_tokens
             if request.use_beam_search:
                 sampling_params = request.to_beam_search_params(
                     default_max_tokens)
@@ -492,7 +505,7 @@ class OpenAIServingChat(OpenAIServing):
                 logger.error(
                     "Sequential greedy fan-out unexpectedly returned a stream")
                 return self.create_error_response(
-                    "Failed to aggregate deterministic n=2 completion")
+                    f"Failed to aggregate n={fanout_count} completion")
             responses.append(child_response)
 
         try:
@@ -503,11 +516,11 @@ class OpenAIServingChat(OpenAIServing):
             )
         except ValueError as error:
             logger.error(
-                "Sequential greedy fan-out aggregation failed: %s",
+                "Sequential fan-out aggregation failed: %s",
                 type(error).__name__,
             )
             return self.create_error_response(
-                "Failed to aggregate deterministic n=2 completion")
+                f"Failed to aggregate n={fanout_count} completion")
 
         if raw_request is not None:
             metadata = RequestResponseMetadata(
