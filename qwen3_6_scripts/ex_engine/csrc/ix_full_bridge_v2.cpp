@@ -84,54 +84,10 @@ void vllm_single_query_cached_kv_attention(
 }  // namespace ixformer_torch_ext
 
 // ============================================================================
-// Forward declarations — ixformer::infer namespace from moe_ops_impl.cu
-// These 5 MoE functions are compiled from our own CUDA code, NOT from .so
+// MoE functions are NOT available in this POC image's ixformer .so files.
+// MoE path uses separate prebuilt .so (corex_moe_*.so, gemm_grouped.so)
+// dispatched via ix_fused_moe.py at runtime.
 // ============================================================================
-namespace ixformer { namespace infer {
-
-void topk_softmax(torch::Tensor& topk_weights,
-                  torch::Tensor& topk_indices,
-                  torch::Tensor& token_expert_indices,
-                  torch::Tensor& gating_output,
-                  bool renormalize);
-
-void moe_compute_token_index_api(
-    torch::Tensor& topk_ids,
-    torch::Tensor& src_dst,
-    torch::Tensor& dst_src,
-    torch::Tensor& expert_sizes_gpu,
-    const std::optional<torch::Tensor>& expert_mask,
-    const std::optional<torch::Tensor>& expert_sizes_cpu,
-    const std::optional<torch::Tensor>& expand_tokens_gpu,
-    int64_t start_expert_id,
-    int64_t end_expert_id,
-    int64_t num_experts);
-
-void moe_expand_input(torch::Tensor outputs,
-                      torch::Tensor inputs,
-                      torch::Tensor dst_to_src,
-                      const std::optional<torch::Tensor>& src_to_dst,
-                      int64_t dst_tokens,
-                      int64_t expand_factor);
-
-void moe_w16a16_group_gemm(torch::Tensor output,
-                           torch::Tensor inputs,
-                           torch::Tensor weights,
-                           torch::Tensor tokens_per_experts,
-                           const std::optional<torch::Tensor>& dst_to_src,
-                           const std::optional<torch::Tensor>& bias,
-                           std::string format,
-                           int64_t persistent,
-                           int64_t output_n);
-
-void moe_output_reduce_sum(torch::Tensor outputs,
-                           torch::Tensor inputs,
-                           const std::optional<torch::Tensor>& mul_weight,
-                           const std::optional<torch::Tensor>& mask,
-                           const std::optional<torch::Tensor>& extra_residual,
-                           double scaling_factor);
-
-}}  // namespace ixformer::infer
 
 
 // ============================================================================
@@ -211,138 +167,6 @@ void ix_paged_attention(
         /*is_neox=*/true, alibi_slopes);
 }
 
-
-// ============================================================================
-// MoE wrappers — call moe_ops_impl.cu implementations
-// ============================================================================
-
-// --- topk_softmax ---
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-ix_topk_softmax(torch::Tensor gating_output, int64_t topk, bool renormalize) {
-    int64_t num_tokens = gating_output.size(0);
-    auto topk_weights = torch::empty({num_tokens, topk},
-        torch::dtype(torch::kFloat32).device(gating_output.device()));
-    auto topk_ids = torch::empty({num_tokens, topk},
-        torch::dtype(torch::kInt32).device(gating_output.device()));
-    auto token_expert_indices = torch::empty({num_tokens, topk},
-        torch::dtype(torch::kInt32).device(gating_output.device()));
-
-    auto gating_f32 = gating_output.to(torch::kFloat32);
-    ixformer::infer::topk_softmax(
-        topk_weights, topk_ids, token_expert_indices, gating_f32, renormalize);
-
-    return std::make_tuple(topk_weights, topk_ids, token_expert_indices);
-}
-
-// --- moe_gen_idx ---
-std::vector<torch::Tensor>
-ix_moe_gen_idx(torch::Tensor expert_id, int64_t expert_num) {
-    auto src_dst = expert_id.new_empty({expert_id.numel()});
-    auto dst_src = torch::empty_like(src_dst);
-    auto expert_sizes_gpu = expert_id.new_empty({expert_num});
-
-    ixformer::infer::moe_compute_token_index_api(
-        expert_id, src_dst, dst_src, expert_sizes_gpu,
-        /*expert_mask=*/std::nullopt,
-        /*expert_sizes_cpu=*/std::nullopt,
-        /*expand_tokens_gpu=*/std::nullopt,
-        /*start_expert_id=*/0,
-        /*end_expert_id=*/expert_num,
-        /*num_experts=*/expert_num);
-
-    auto expert_sizes_cumsum = expert_sizes_gpu.cumsum(-1);
-    return {src_dst, dst_src, expert_sizes_gpu, expert_sizes_cumsum};
-}
-
-// --- moe_expand_input ---
-torch::Tensor ix_moe_expand_input(torch::Tensor input,
-                                  torch::Tensor gather_index,
-                                  torch::Tensor combine_idx,
-                                  int64_t topk) {
-    int64_t dst_tokens = input.size(0) * topk;
-    auto output = input.new_empty({dst_tokens, input.size(1)});
-    ixformer::infer::moe_expand_input(
-        output, input, combine_idx, gather_index, dst_tokens, topk);
-    return output;
-}
-
-// --- group_gemm ---
-torch::Tensor ix_group_gemm(torch::Tensor inputs, torch::Tensor weights,
-                            torch::Tensor tokens_per_experts,
-                            int64_t output_n) {
-    int64_t total_tokens = inputs.size(0);
-    auto output = inputs.new_empty({total_tokens, output_n});
-    int64_t gemm_output_n = tokens_per_experts.sum().item<int64_t>();
-    ixformer::infer::moe_w16a16_group_gemm(
-        output, inputs, weights, tokens_per_experts,
-        /*dst_to_src=*/std::nullopt,
-        /*bias=*/std::nullopt,
-        /*format=*/"TN",
-        /*persistent=*/0,
-        gemm_output_n);
-    return output;
-}
-
-// --- moe_combine_result ---
-torch::Tensor ix_moe_combine_result(torch::Tensor input, torch::Tensor weight) {
-    auto input_3d = input.view({-1, weight.size(1), input.size(1)});
-    auto output = input.new_empty({input_3d.size(0), input_3d.size(2)});
-    ixformer::infer::moe_output_reduce_sum(
-        output, input_3d, weight,
-        /*mask=*/std::nullopt,
-        /*extra_residual=*/std::nullopt,
-        /*scaling_factor=*/1.0);
-    return output;
-}
-
-// --- fused_moe_forward (7-step pipeline) ---
-torch::Tensor ix_fused_moe_forward(
-    torch::Tensor hidden_states,
-    torch::Tensor router_logits,
-    torch::Tensor w13,
-    torch::Tensor w2,
-    int64_t topk,
-    int64_t num_experts,
-    bool renormalize) {
-
-    // Step 1: topk_softmax
-    auto [topk_weights, topk_ids, token_expert_indices] =
-        ix_topk_softmax(router_logits, topk, renormalize);
-
-    if (renormalize) {
-        auto sum = topk_weights.sum(-1, /*keepdim=*/true);
-        topk_weights = topk_weights / sum;
-    }
-
-    // Step 2: moe_gen_idx
-    auto idx_results = ix_moe_gen_idx(topk_ids.view({-1}), num_experts);
-    auto& src_dst = idx_results[0];
-    auto& dst_src = idx_results[1];
-    auto& expert_sizes_gpu = idx_results[2];
-
-    // Step 3: moe_expand_input
-    auto expanded = ix_moe_expand_input(hidden_states, src_dst, dst_src, topk);
-
-    // Step 4: group_gemm (w13: gate_up projection)
-    int64_t intermediate_2x = w13.size(1);
-    auto gate_up = ix_group_gemm(expanded, w13,
-                                 expert_sizes_gpu, intermediate_2x);
-
-    // Step 5: silu_and_mul
-    auto activated = ix_silu_and_mul(gate_up);
-
-    // Step 6: group_gemm (w2: down projection)
-    int64_t hidden_size = w2.size(1);
-    auto down = ix_group_gemm(activated, w2,
-                              expert_sizes_gpu, hidden_size);
-
-    // Step 7: moe_combine_result
-    auto output = ix_moe_combine_result(down, topk_weights);
-
-    return output;
-}
-
-
 // ============================================================================
 // Module registration
 // ============================================================================
@@ -373,19 +197,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("paged_attention", &ix_paged_attention,
           "Paged attention decode via ixformer_torch_ext");
 
-    // MoE (individual steps — from moe_ops_impl.cu)
-    m.def("topk_softmax", &ix_topk_softmax,
-          "MoE topk+softmax routing");
-    m.def("moe_gen_idx", &ix_moe_gen_idx,
-          "MoE compute token index");
-    m.def("moe_expand_input", &ix_moe_expand_input,
-          "MoE expand input for expert dispatch");
-    m.def("group_gemm", &ix_group_gemm,
-          "MoE grouped GEMM via cuinferCustomGemm");
-    m.def("moe_combine_result", &ix_moe_combine_result,
-          "MoE output reduce sum");
-
-    // MoE (fused 7-step pipeline)
-    m.def("fused_moe_forward", &ix_fused_moe_forward,
-          "Complete fused MoE forward (7-step pipeline)");
+    // MoE ops are NOT in this bridge — they use separate prebuilt .so files:
+    //   corex_moe_topk_softmax.so, corex_moe_index_combine.so,
+    //   gemm_grouped.so, corex_moe_exact_reduce.so, etc.
+    // Dispatched via ix_fused_moe.py at runtime.
 }
