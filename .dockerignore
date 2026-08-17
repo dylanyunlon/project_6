@@ -6,7 +6,11 @@ upstream_ref/
 vllm/
 ixformer_sdk/
 muh/
-ex_engine/
+ex_engine/fla_kernels/
+ex_engine/moe/
+ex_engine/xllm_layers/npu_torch/
+ex_engine/xllm_layers/mlu/
+ex_engine/xllm_models/
 *.zip
 dockerrizhi.txt
 subrizhi.txt
