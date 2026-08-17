@@ -246,18 +246,15 @@ INIT_EOF
 """Apply ix_ops patches at vllm startup."""
 import logging
 _logger = logging.getLogger("ix_startup_patch")
+_applied = False
 def apply():
-    import sys, os
-    # Skip in subprocess inspection (no GPU context → dlopen .so crashes)
-    try:
-        import torch
-        if not torch.cuda.is_available():
-            return 0
-    except Exception:
+    global _applied
+    if _applied:
         return 0
+    _applied = True
+    import sys, os
     # Ensure ex_engine is importable
-    for p in ["/workspace/qwen3_6_scripts",
-              "/workspace"]:
+    for p in ["/workspace/qwen3_6_scripts", "/workspace"]:
         rp = os.path.realpath(p)
         if os.path.isdir(rp) and rp not in sys.path:
             sys.path.insert(0, rp)
@@ -279,7 +276,8 @@ def apply():
     except Exception as e:
         _logger.warning("ix_startup_patch: hot-path patches failed: %s", e)
     return n
-_n_patches = apply()
+# DO NOT call apply() at import time — registry subprocess would crash.
+# apply() is called from qwen3_5.py model init instead.
 STARTUP_EOF
     echo "[patch_ops] deployed ix_startup_patch.py"
 

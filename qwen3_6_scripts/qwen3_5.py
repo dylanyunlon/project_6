@@ -2201,6 +2201,12 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
         multimodal_config: Optional[MultiModalConfig] = None,
         prefix: str = "",
     ) -> None:
+        # Apply ix_bridge operator patches on first model init (safe: GPU is ready)
+        try:
+            from vllm import ix_startup_patch
+            ix_startup_patch.apply()
+        except Exception:
+            pass
         _bi100_model_trace("Qwen3_5ForCausalLM initialization begin")
         super().__init__()
         self.config = config
