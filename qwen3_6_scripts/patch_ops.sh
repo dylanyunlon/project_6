@@ -201,9 +201,11 @@ fi
 
 # --- Deploy ix_bridge Python integration layer --------------------------------
 build_stage "deploying ix_bridge operator replacements"
-EX_ENGINE_DIR="$(cd "$(dirname "$0")/../ex_engine" 2>/dev/null && pwd || echo "")"
+EX_ENGINE_DIR="$(cd "$(dirname "$0")/ex_engine" 2>/dev/null && pwd || echo "")"
 if [ -z "$EX_ENGINE_DIR" ] || [ ! -d "$EX_ENGINE_DIR/python" ]; then
-    # Dockerfile puts ex_engine at /workspace/ex_engine
+    EX_ENGINE_DIR="$(cd "$(dirname "$0")/../ex_engine" 2>/dev/null && pwd || echo "")"
+fi
+if [ -z "$EX_ENGINE_DIR" ] || [ ! -d "$EX_ENGINE_DIR/python" ]; then
     EX_ENGINE_DIR="/workspace/ex_engine"
 fi
 

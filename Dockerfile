@@ -4,8 +4,6 @@ WORKDIR /workspace/
 # Copy all our engine patches
 COPY ./qwen3_6_scripts /workspace/qwen3_6_scripts
 COPY ./computility-run.yaml /workspace/computility-run.yaml
-# Copy entire ex_engine — python dispatch, csrc, build scripts, headers
-COPY ./ex_engine /workspace/ex_engine
 # Make patch script executable and run it
 RUN chmod +x /workspace/qwen3_6_scripts/patch_ops.sh && \
     bash /workspace/qwen3_6_scripts/patch_ops.sh 2>&1 | tee /workspace/patch_ops.log ; \
