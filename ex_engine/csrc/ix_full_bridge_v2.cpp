@@ -36,8 +36,9 @@ namespace ixformer_torch_ext {
 void silu_and_mul_forward(at::Tensor& input, at::Tensor& output);
 
 // rms_norm_forward(at::Tensor&, at::Tensor&, at::Tensor&, double)
-void rms_norm_forward(at::Tensor& output, at::Tensor& input,
-                      at::Tensor& weight, double eps);
+// Real ixformer signature order: (input, weight, output, eps)
+void rms_norm_forward(at::Tensor& input, at::Tensor& weight,
+                      at::Tensor& output, double eps);
 
 // fused_add_rms_norm_forward(at::Tensor&, at::Tensor&, at::Tensor&, double, double)
 void fused_add_rms_norm_forward(at::Tensor& input, at::Tensor& residual,
@@ -148,7 +149,9 @@ torch::Tensor ix_silu_and_mul(torch::Tensor input) {
 // --- rms_norm ---
 void ix_rms_norm(torch::Tensor output, torch::Tensor input,
                  torch::Tensor weight, double eps) {
-    ixformer_torch_ext::rms_norm_forward(output, input, weight, eps);
+    // pybind receives (output, input, weight, eps)
+    // ixformer expects (input, weight, output, eps)
+    ixformer_torch_ext::rms_norm_forward(input, weight, output, eps);
 }
 
 // --- fused_add_rms_norm ---
