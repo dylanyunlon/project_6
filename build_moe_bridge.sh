@@ -18,26 +18,17 @@ echo "[moe_bridge] Building ix_moe_bridge.so"
 echo "[moe_bridge] Script dir: ${SCRIPT_DIR}"
 
 # --- Locate sources ---
-# Support both layouts:
-#   1. SCRIPT_DIR=/workspace/ex_engine → csrc/ is direct child
-#   2. SCRIPT_DIR=/workspace/qwen3_6_scripts/ex_engine_src → csrc/ is direct child
-MOE_CU=""
-BRIDGE_CPP=""
-for base in "${SCRIPT_DIR}" "${SCRIPT_DIR}/ex_engine"; do
-    [[ -f "${base}/csrc/moe_ops_impl.cu" ]] && MOE_CU="${base}/csrc/moe_ops_impl.cu"
-    [[ -f "${base}/csrc/ix_full_bridge_v2.cpp" ]] && BRIDGE_CPP="${base}/csrc/ix_full_bridge_v2.cpp"
-done
+MOE_CU="${SCRIPT_DIR}/ex_engine/csrc/moe_ops_impl.cu"
+BRIDGE_CPP="${SCRIPT_DIR}/ex_engine/csrc/ix_full_bridge_v2.cpp"
 
-if [[ -z "$MOE_CU" ]]; then
-    echo "[moe_bridge] ERROR: moe_ops_impl.cu not found under ${SCRIPT_DIR}" >&2
+if [[ ! -f "$MOE_CU" ]]; then
+    echo "[moe_bridge] ERROR: $MOE_CU not found" >&2
     exit 1
 fi
-if [[ -z "$BRIDGE_CPP" ]]; then
-    echo "[moe_bridge] ERROR: ix_full_bridge_v2.cpp not found under ${SCRIPT_DIR}" >&2
+if [[ ! -f "$BRIDGE_CPP" ]]; then
+    echo "[moe_bridge] ERROR: $BRIDGE_CPP not found" >&2
     exit 1
 fi
-echo "[moe_bridge] MOE_CU: ${MOE_CU}"
-echo "[moe_bridge] BRIDGE_CPP: ${BRIDGE_CPP}"
 
 # --- Locate libraries ---
 COREX_ROOT="${COREX_ROOT:-/usr/local/corex}"
@@ -75,28 +66,14 @@ echo "[moe_bridge] ixformer .so count: ${#IX_SO_FILES[@]}"
 # --- Build via torch.utils.cpp_extension ---
 mkdir -p "${SCRIPT_DIR}/prebuilt"
 
-export SCRIPT_DIR VLLM_ROOT
 python3 << 'PYEOF'
 import os, sys, glob, shutil
 
 script_dir = os.environ.get("SCRIPT_DIR", ".")
 vllm_root = os.environ.get("VLLM_ROOT", "")
 
-# Find source files — try direct csrc/ first, then ex_engine/csrc/
-moe_cu = ""
-bridge_cpp = ""
-for base in [script_dir, os.path.join(script_dir, "ex_engine")]:
-    candidate_cu = os.path.join(base, "csrc", "moe_ops_impl.cu")
-    candidate_cpp = os.path.join(base, "csrc", "ix_full_bridge_v2.cpp")
-    if os.path.isfile(candidate_cu):
-        moe_cu = candidate_cu
-    if os.path.isfile(candidate_cpp):
-        bridge_cpp = candidate_cpp
-if not moe_cu or not bridge_cpp:
-    print(f"[moe_bridge] ERROR: sources not found under {script_dir}")
-    sys.exit(1)
-print(f"[moe_bridge] MOE_CU: {moe_cu}")
-print(f"[moe_bridge] BRIDGE_CPP: {bridge_cpp}")
+moe_cu = os.path.join(script_dir, "ex_engine", "csrc", "moe_ops_impl.cu")
+bridge_cpp = os.path.join(script_dir, "ex_engine", "csrc", "ix_full_bridge_v2.cpp")
 
 # Collect linker flags
 extra_ldflags = []
