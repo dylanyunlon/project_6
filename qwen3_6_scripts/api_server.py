@@ -903,39 +903,6 @@ def build_app(args: Namespace) -> FastAPI:
         allow_headers=args.allowed_headers,
     )
 
-    @app.middleware("http")
-    async def sanitize_chat_body(request: Request, call_next):
-        """Strip fields from chat messages that vLLM's pydantic models reject.
-
-        Some replay datasets include ``index`` on messages (used by OpenAI
-        streaming deltas but forbidden by the non-streaming request schema).
-        Stripping it here avoids a ValidatorIterator 400 before our handler
-        even runs.
-        """
-        if (request.method == "POST"
-                and request.url.path.endswith("/v1/chat/completions")):
-            content_type = request.headers.get("content-type", "")
-            if "json" in content_type or not content_type:
-                try:
-                    body = await request.json()
-                    changed = False
-                    for msg in body.get("messages", []) if isinstance(body, dict) else []:
-                        if isinstance(msg, dict) and "index" in msg:
-                            del msg["index"]
-                            changed = True
-                    if changed:
-                        import json as _json
-                        raw = _json.dumps(body).encode("utf-8")
-
-                        async def patched_body():
-                            return raw
-
-                        request._body = raw
-                        request._receive = patched_body  # noqa
-                except Exception:
-                    pass
-        return await call_next(request)
-
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(raw_request, exc):
         _bi100_log_request_validation_4xx(raw_request, exc)
