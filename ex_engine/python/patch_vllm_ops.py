@@ -84,25 +84,30 @@ def _patch_layernorm() -> int:
     _orig_forward = GemmaRMSNorm.forward
 
     def _patched_forward(self, x, residual=None):
+        # GemmaRMSNorm: output = rms_norm(x) * (1 + weight)
+        # ixformer rms_norm: output = rms_norm(x) * weight
+        # Pass (1 + weight) to ixformer to match GemmaRMSNorm semantics.
+        w = self.weight
+        if w.dim() != 1 or w.shape[0] != x.shape[-1]:
+            return _orig_forward(self, x, residual)
+        w_adjusted = 1.0 + w
         if residual is not None:
-            # fused_add_rms_norm: norm(x + residual) → (normed, new_residual)
             if ix_ops.has_fused_add_rms_norm():
                 out = torch.empty_like(x)
                 residual_out = torch.empty_like(x)
                 ix_ops.fused_add_rms_norm(
-                    x, residual, self.weight, out, residual_out,
+                    x, residual, w_adjusted, out, residual_out,
                     self.variance_epsilon)
                 return out, residual_out
             else:
-                # Two-step fallback using just rms_norm
                 new_residual = x + residual
                 out = torch.empty_like(x)
-                ix_ops.rms_norm(out, new_residual, self.weight,
+                ix_ops.rms_norm(out, new_residual, w_adjusted,
                                 self.variance_epsilon)
                 return out, new_residual
         else:
             out = torch.empty_like(x)
-            ix_ops.rms_norm(out, x, self.weight, self.variance_epsilon)
+            ix_ops.rms_norm(out, x, w_adjusted, self.variance_epsilon)
             return out
 
     GemmaRMSNorm.forward = _patched_forward
