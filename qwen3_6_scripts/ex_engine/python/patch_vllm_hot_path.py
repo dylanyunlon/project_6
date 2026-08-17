@@ -164,7 +164,8 @@ def apply(strict=True):
             import vllm._custom_ops as ops
 
             def patched_reshape_and_cache(key, value, key_cache, value_cache,
-                                          slot_mapping, kv_cache_dtype, kv_scale):
+                                          slot_mapping, kv_cache_dtype,
+                                          k_scale, v_scale):
                 xllm_ops.reshape_and_cache(key, value, key_cache, value_cache,
                                            slot_mapping)
 
