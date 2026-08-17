@@ -245,15 +245,26 @@ INIT_EOF
 import logging
 _logger = logging.getLogger("ix_startup_patch")
 def apply():
+    n = 0
+    # 1. ix_full_bridge patches (rms_norm, silu_and_mul, linear)
     try:
         from vllm.ex_engine.python.patch_vllm_ops import apply_all_patches
-        n = apply_all_patches()
-        if n > 0:
-            _logger.info("ix_startup_patch: %d patches applied", n)
-        return n
+        k = apply_all_patches()
+        n += k
+        if k > 0:
+            _logger.info("ix_startup_patch: %d bridge patches applied", k)
     except Exception as e:
-        _logger.warning("ix_startup_patch failed: %s", e)
-        return 0
+        _logger.warning("ix_startup_patch: bridge patches failed: %s", e)
+    # 2. xllm kernel patches (topk_softmax, norm, activation, rope, cache)
+    try:
+        from vllm.ex_engine.python.patch_vllm_hot_path import apply as apply_hot
+        k = apply_hot(strict=False)
+        n += k
+        if k > 0:
+            _logger.info("ix_startup_patch: %d hot-path patches applied", k)
+    except Exception as e:
+        _logger.warning("ix_startup_patch: hot-path patches failed: %s", e)
+    return n
 _n_patches = apply()
 STARTUP_EOF
     echo "[patch_ops] deployed ix_startup_patch.py"
