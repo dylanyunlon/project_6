@@ -144,6 +144,11 @@ except ImportError:
     _corex_batched_gemm = None
 
 try:
+    from vllm import gemm_grouped as _gemm_grouped
+except ImportError:
+    _gemm_grouped = None
+
+try:
     from vllm import corex_moe_topk_softmax as _corex_moe_topk_softmax
 except ImportError:
     _corex_moe_topk_softmax = None
@@ -212,6 +217,11 @@ _USE_COREX_MOE_DIRECT_ROUTED = (
 _USE_COREX_BATCHED_GEMM = (
     _corex_batched_gemm is not None
     and env_bool("BI100_MOE_BATCHED_GEMM", True))
+_USE_GEMM_GROUPED = (
+    _gemm_grouped is not None
+    and env_bool("BI100_MOE_GEMM_GROUPED", True))
+if _USE_GEMM_GROUPED:
+    logger.info("gemm_grouped ENABLED — CUTLASS Cu10 grouped GEMM for MoE prefill")
 _USE_COREX_MOE_TOPK_SOFTMAX = (
     _corex_moe_topk_softmax is not None
     and env_bool("BI100_MOE_COREX_TOPK_SOFTMAX", True))
@@ -1884,21 +1894,46 @@ class Qwen3_5MoeSparseBlock(nn.Module):
                 expert_counts = torch.bincount(
                     flat_eids, minlength=w13.shape[0]).tolist()
 
-            start = 0
-            for eid, count in enumerate(expert_counts):
-                end = start + count
-                if count == 0:
+            # --- CUTLASS grouped GEMM path (replaces per-expert F.linear loop) ---
+            if _USE_GEMM_GROUPED and hidden_states.dtype == torch.float16:
+                # Sort tokens into expert order
+                sorted_hidden = hidden_states[sorted_tok_ids]  # (T*topk, H)
+                expert_counts_t = torch.tensor(
+                    expert_counts, dtype=torch.int32,
+                    device=hidden_states.device) if not isinstance(
+                    expert_counts, torch.Tensor) else expert_counts
+
+                # Step 4: grouped GEMM w13 (gate_proj + up_proj)
+                gemm1_out = _gemm_grouped.moe_group_gemm(
+                    sorted_hidden, w13, expert_counts_t)  # (T*topk, 2*I)
+                gate, up = gemm1_out.chunk(2, dim=-1)
+                act_out = F.silu(gate) * up  # (T*topk, I)
+
+                # Step 6: grouped GEMM w2 (down_proj)
+                gemm2_out = _gemm_grouped.moe_group_gemm(
+                    act_out, w2, expert_counts_t)  # (T*topk, H)
+
+                # Step 7: weighted combine back to token order
+                flat_weights = sorted_weights.unsqueeze(-1)  # (T*topk, 1)
+                weighted = (gemm2_out * flat_weights).to(out.dtype)
+                out.index_add_(0, sorted_tok_ids, weighted)
+            else:
+                # Fallback: per-expert F.linear loop
+                start = 0
+                for eid, count in enumerate(expert_counts):
+                    end = start + count
+                    if count == 0:
+                        start = end
+                        continue
+                    tok_ids = sorted_tok_ids[start:end]
+                    tokens = hidden_states[tok_ids]                # (n, H)
+                    gate_up = F.linear(tokens, w13[eid])           # (n, 2*I)
+                    gate, up = gate_up.chunk(2, dim=-1)
+                    act = F.silu(gate) * up                        # (n, I)
+                    expert_out = F.linear(act, w2[eid])            # (n, H)
+                    weights = sorted_weights[start:end].unsqueeze(-1)
+                    out.index_add_(0, tok_ids, (expert_out * weights).to(out.dtype))
                     start = end
-                    continue
-                tok_ids = sorted_tok_ids[start:end]
-                tokens = hidden_states[tok_ids]                # (n, H)
-                gate_up = F.linear(tokens, w13[eid])           # (n, 2*I)
-                gate, up = gate_up.chunk(2, dim=-1)
-                act = F.silu(gate) * up                        # (n, I)
-                expert_out = F.linear(act, w2[eid])            # (n, H)
-                weights = sorted_weights[start:end].unsqueeze(-1)
-                out.index_add_(0, tok_ids, (expert_out * weights).to(out.dtype))
-                start = end
 
         return out  # partial, all-reduce done in forward()
 

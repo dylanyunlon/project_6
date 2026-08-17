@@ -208,14 +208,30 @@ if [ -z "$EX_ENGINE_DIR" ] || [ ! -d "$EX_ENGINE_DIR/python" ]; then
 fi
 
 if [ -d "$EX_ENGINE_DIR/python" ]; then
-    # Create ex_engine package inside vllm
+    # Create ex_engine package inside vllm with correct Python package structure
+    mkdir -p "${VLLM_ROOT}/ex_engine/python"
     mkdir -p "${VLLM_ROOT}/ex_engine/csrc"
-    echo '"""ex_engine — Algorithm factor replacement for BI-V100."""' > "${VLLM_ROOT}/ex_engine/__init__.py"
 
-    # Deploy Python modules
-    cp "$EX_ENGINE_DIR/python/ix_ops.py" "${VLLM_ROOT}/ex_engine/ix_ops.py"
-    cp "$EX_ENGINE_DIR/python/patch_vllm_ops.py" "${VLLM_ROOT}/ex_engine/patch_vllm_ops.py"
-    echo "[patch_ops] deployed ix_ops.py + patch_vllm_ops.py → ${VLLM_ROOT}/ex_engine/"
+    # __init__.py with re-exports so both import styles work:
+    #   from ex_engine.python import ix_ops_dispatch  (direct)
+    #   from vllm.ex_engine import ix_ops_dispatch    (via re-export)
+    cat > "${VLLM_ROOT}/ex_engine/__init__.py" << 'INIT_EOF'
+"""ex_engine — Algorithm factor replacement for BI-V100."""
+# Re-export python subpackage members at top level for backward compat
+# Allows: from vllm.ex_engine import ix_ops_dispatch
+try:
+    from ex_engine.python.ix_ops_dispatch import *
+    from ex_engine.python import ix_ops_dispatch
+    from ex_engine.python import ix_ops
+    from ex_engine.python import patch_vllm_ops
+except ImportError:
+    pass
+INIT_EOF
+    echo '"""ex_engine.python — dispatch and bridge modules."""' > "${VLLM_ROOT}/ex_engine/python/__init__.py"
+
+    # Deploy ALL Python modules
+    cp "$EX_ENGINE_DIR/python/"*.py "${VLLM_ROOT}/ex_engine/python/"
+    echo "[patch_ops] deployed $(ls -1 "${VLLM_ROOT}/ex_engine/python/"*.py | wc -l) modules → ${VLLM_ROOT}/ex_engine/python/"
 
     # Deploy bridge C++ source for JIT fallback
     for cpp in "$EX_ENGINE_DIR"/csrc/ix_full_bridge*.cpp "$EX_ENGINE_DIR"/csrc/ix_moe_bridge.cpp; do
@@ -230,7 +246,7 @@ import logging
 _logger = logging.getLogger("ix_startup_patch")
 def apply():
     try:
-        from vllm.ex_engine.patch_vllm_ops import apply_all_patches
+        from vllm.ex_engine.python.patch_vllm_ops import apply_all_patches
         n = apply_all_patches()
         if n > 0:
             _logger.info("ix_startup_patch: %d patches applied", n)
@@ -391,6 +407,16 @@ if [[ -f "${EX_ENGINE_DIR}/csrc/ix_moe_bridge.cpp" ]]; then
     SCRIPT_DIR="${EX_ENGINE_DIR}" bash "${EX_ENGINE_DIR}/build_moe_bridge.sh" "${VLLM_ROOT}" 2>&1 || {
         echo "[WARN] MoE bridge build failed — will use Python fallback"
     }
+    # Deploy .so to all paths ix_fused_moe.py searches
+    for src in "${VLLM_ROOT}/ex_engine/ix_moe_bridge.so" \
+               "${EX_ENGINE_DIR}/prebuilt/ix_moe_bridge.so"; do
+        if [[ -f "$src" ]]; then
+            cp "$src" "${VLLM_ROOT}/ix_moe_bridge.so" 2>/dev/null || true
+            cp "$src" "${VLLM_ROOT}/model_executor/models/ix_moe_bridge.so" 2>/dev/null || true
+            echo "[patch_ops] deployed ix_moe_bridge.so to vllm search paths"
+            break
+        fi
+    done
 fi
 
 build_stage "deploying all ex_engine Python modules"

@@ -75,14 +75,28 @@ echo "[moe_bridge] ixformer .so count: ${#IX_SO_FILES[@]}"
 # --- Build via torch.utils.cpp_extension ---
 mkdir -p "${SCRIPT_DIR}/prebuilt"
 
+export SCRIPT_DIR VLLM_ROOT
 python3 << 'PYEOF'
 import os, sys, glob, shutil
 
 script_dir = os.environ.get("SCRIPT_DIR", ".")
 vllm_root = os.environ.get("VLLM_ROOT", "")
 
-moe_cu = os.path.join(script_dir, "ex_engine", "csrc", "moe_ops_impl.cu")
-bridge_cpp = os.path.join(script_dir, "ex_engine", "csrc", "ix_full_bridge_v2.cpp")
+# Find source files — try direct csrc/ first, then ex_engine/csrc/
+moe_cu = ""
+bridge_cpp = ""
+for base in [script_dir, os.path.join(script_dir, "ex_engine")]:
+    candidate_cu = os.path.join(base, "csrc", "moe_ops_impl.cu")
+    candidate_cpp = os.path.join(base, "csrc", "ix_full_bridge_v2.cpp")
+    if os.path.isfile(candidate_cu):
+        moe_cu = candidate_cu
+    if os.path.isfile(candidate_cpp):
+        bridge_cpp = candidate_cpp
+if not moe_cu or not bridge_cpp:
+    print(f"[moe_bridge] ERROR: sources not found under {script_dir}")
+    sys.exit(1)
+print(f"[moe_bridge] MOE_CU: {moe_cu}")
+print(f"[moe_bridge] BRIDGE_CPP: {bridge_cpp}")
 
 # Collect linker flags
 extra_ldflags = []
