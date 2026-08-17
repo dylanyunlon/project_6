@@ -248,16 +248,20 @@ import logging
 _logger = logging.getLogger("ix_startup_patch")
 def apply():
     import sys, os
-    # Ensure ex_engine is importable from both locations
-    for p in ["/workspace/qwen3_6_scripts/ex_engine/..",
-              "/workspace/qwen3_6_scripts",
-              "/workspace/ex_engine/..",
+    # Skip in subprocess inspection (no GPU context → dlopen .so crashes)
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return 0
+    except Exception:
+        return 0
+    # Ensure ex_engine is importable
+    for p in ["/workspace/qwen3_6_scripts",
               "/workspace"]:
         rp = os.path.realpath(p)
         if os.path.isdir(rp) and rp not in sys.path:
             sys.path.insert(0, rp)
     n = 0
-    # 1. ix_full_bridge patches (rms_norm, silu_and_mul, linear)
     try:
         from ex_engine.python.patch_vllm_ops import apply_all_patches
         k = apply_all_patches()
@@ -266,7 +270,6 @@ def apply():
             _logger.info("ix_startup_patch: %d bridge patches applied", k)
     except Exception as e:
         _logger.warning("ix_startup_patch: bridge patches failed: %s", e)
-    # 2. xllm kernel patches (topk_softmax, norm, activation, rope, cache)
     try:
         from ex_engine.python.patch_vllm_hot_path import apply as apply_hot
         k = apply_hot(strict=False)
