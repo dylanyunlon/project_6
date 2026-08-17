@@ -202,8 +202,9 @@ fi
 # --- Deploy ix_bridge Python integration layer --------------------------------
 build_stage "deploying ix_bridge operator replacements"
 EX_ENGINE_DIR="$(cd "$(dirname "$0")/../ex_engine" 2>/dev/null && pwd || echo "")"
-if [ -z "$EX_ENGINE_DIR" ] || [ ! -d "$EX_ENGINE_DIR" ]; then
-    EX_ENGINE_DIR="$(cd "$(dirname "$0")" && pwd)/../ex_engine"
+if [ -z "$EX_ENGINE_DIR" ] || [ ! -d "$EX_ENGINE_DIR/python" ]; then
+    # Dockerfile puts ex_engine at /workspace/ex_engine
+    EX_ENGINE_DIR="/workspace/ex_engine"
 fi
 
 if [ -d "$EX_ENGINE_DIR/python" ]; then
@@ -332,22 +333,73 @@ if b"max_completion_tokens" not in installed:
     raise SystemExit("protocol.py missing max_completion_tokens field")
 PY
 
+build_stage "building CUTLASS grouped GEMM (gemm_grouped.so)"
+if [[ -f "${EX_ENGINE_DIR}/build_gemm_grouped.sh" ]]; then
+    bash "${EX_ENGINE_DIR}/build_gemm_grouped.sh" 2>&1 || {
+        echo "[WARN] gemm_grouped build failed — will use torch.mm fallback"
+    }
+    # Deploy compiled .so if it exists
+    for so in "${EX_ENGINE_DIR}"/gemm_grouped.so "${EX_ENGINE_DIR}"/csrc/gemm_grouped.so; do
+        if [[ -f "$so" ]]; then
+            cp "$so" "${VLLM_ROOT}/gemm_grouped.so"
+            echo "[patch_ops] deployed gemm_grouped.so → ${VLLM_ROOT}/"
+            break
+        fi
+    done
+fi
+
+build_stage "building CUTLASS batched GEMM (corex_batched_gemm.so)"
+if [[ -f "${EX_ENGINE_DIR}/xllm_kernels/cuda/corex_batched_gemm_kernel.cu" ]]; then
+    python3 << PYEOF
+import os, sys, shutil
+try:
+    from torch.utils.cpp_extension import load
+    ex = "${EX_ENGINE_DIR}"
+    cutlass_inc = ""
+    for d in ["/usr/local/corex-samples-3.2.3_x86_64/samples/cutlass/include",
+              "/usr/local/corex/include/cutlass", "/usr/include/cutlass"]:
+        if os.path.isdir(d):
+            cutlass_inc = d
+            break
+    if not cutlass_inc:
+        print("[batched_gemm] No cutlass headers — skip"); sys.exit(0)
+    mod = load(
+        name="corex_batched_gemm",
+        sources=[
+            os.path.join(ex, "xllm_kernels/cuda/corex_batched_gemm_kernel.cu"),
+            os.path.join(ex, "xllm_kernels/cuda/bindings/corex_batched_gemm_bind.cpp"),
+        ],
+        extra_include_paths=[cutlass_inc],
+        extra_cflags=["-O2", "-std=c++17"],
+        extra_cuda_cflags=["-O2", f"-I{cutlass_inc}"],
+        extra_ldflags=["/usr/local/corex/lib64/libcuinfer.so", "-Wl,-rpath,/usr/local/corex/lib64"],
+        verbose=False,
+    )
+    print("[batched_gemm] ✓ Compiled")
+    import importlib
+    spec = importlib.util.find_spec("corex_batched_gemm")
+    if spec and spec.origin:
+        shutil.copy2(spec.origin, "${VLLM_ROOT}/corex_batched_gemm.so")
+        print("[batched_gemm] ✓ Deployed to ${VLLM_ROOT}/")
+except Exception as e:
+    print(f"[batched_gemm] WARN: {e}")
+PYEOF
+fi
+
 build_stage "building MoE bridge (ix_moe_bridge.so)"
-if [[ -f "./ex_engine_src/build_moe_bridge.sh" ]]; then
-    bash ./ex_engine_src/build_moe_bridge.sh "${VLLM_ROOT}" 2>&1 || {
+if [[ -f "${EX_ENGINE_DIR}/csrc/ix_moe_bridge.cpp" ]]; then
+    SCRIPT_DIR="${EX_ENGINE_DIR}" bash "${EX_ENGINE_DIR}/build_moe_bridge.sh" "${VLLM_ROOT}" 2>&1 || {
         echo "[WARN] MoE bridge build failed — will use Python fallback"
     }
 fi
 
-build_stage "deploying MoE dispatch modules"
-EX_DIR="${VLLM_ROOT}/ex_engine/python"
-mkdir -p "${EX_DIR}"
-for pyfile in moe_dispatch.py patch_moe_hot_path.py; do
-    if [[ -f "./ex_engine_src/python/${pyfile}" ]]; then
-        cp "./ex_engine_src/python/${pyfile}" "${EX_DIR}/${pyfile}"
-        echo "  ✓ ${pyfile}"
-    fi
-done
+build_stage "deploying all ex_engine Python modules"
+EX_PY_DIR="${VLLM_ROOT}/ex_engine/python"
+mkdir -p "${EX_PY_DIR}"
+if [[ -d "${EX_ENGINE_DIR}/python" ]]; then
+    cp "${EX_ENGINE_DIR}/python/"*.py "${EX_PY_DIR}/" 2>/dev/null
+    echo "[patch_ops] deployed $(ls -1 "${EX_PY_DIR}"/*.py 2>/dev/null | wc -l) Python modules → ${EX_PY_DIR}/"
+fi
 
 build_stage "compiling submission Python sources"
 find . -path './wheels' -prune -o -name '*.py' -print0 | xargs -0 python3 -m py_compile
