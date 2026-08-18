@@ -35,15 +35,25 @@ command:
 env:
     - name: VLLM_ENGINE_ITERATION_TIMEOUT_S
       value: 3600
+    # --- MoE kernel selection ---
     - name: BI100_MOE_COREX_DIRECT_ROUTED
-      value: 1
+      value: '1'
+    - name: BI100_MOE_COREX_TOPK_SOFTMAX
+      value: '1'
+    # --- GDN kernel selection ---
     - name: BI100_GDN_COREX_PACKED_DECODE
-      value: 1
+      value: '1'
+    - name: BI100_GDN_COMBINED_QK_NORM
+      value: '1'
+    # --- Hybrid KV/GDN cache ---
     - name: BI100_HYBRID_KV_ACCOUNTING
       value: full_attention
     - name: BI100_GDN_CACHE_POLICY
       value: admission64
     - name: BI100_GDN_RESTORE_MODE
       value: hybrid64
-    - name: BI100_MOE_COREX_TOPK_SOFTMAX
+    # --- Profiling (event mode: no sync overhead) ---
+    - name: BI100_PROFILE
       value: '1'
+    - name: BI100_PROFILE_MODE
+      value: event

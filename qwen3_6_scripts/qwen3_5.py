@@ -1704,8 +1704,13 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         # Tier 0: Full fused MoE via ix_moe_bridge (xllm 7-step pipeline)
         # topk → gen_idx → expand → group_gemm → silu → group_gemm → combine
         # Source: xllm/core/layers/ilu/fused_moe.cpp
+        # NOTE: Only use for prefill (T>1). For decode (T=1), group_gemm
+        # does 8× M=1 GEMMs that are completely memory-bound (<5% GPU util).
+        # The Tier 1 T=1 path below uses corex_moe_direct_routed or
+        # corex_batched_gemm.moe_decode_fused, which are purpose-built
+        # fused kernels for single-token MoE dispatch.
         # ---------------------------------------------------------------
-        if _USE_IX_FUSED_MOE:
+        if _USE_IX_FUSED_MOE and hidden_states.shape[0] > 1:
             w13 = self.experts.w13_weight  # (E, 2*I, H)
             w2 = self.experts.w2_weight    # (E, H, I)
             return _ix_fused_moe.fused_moe_forward(
@@ -1720,7 +1725,7 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         # No physical transpose, no weight gather copy
         # Source: ds_vllm/vllm/.../experts/fused_batched_moe.py
         # ---------------------------------------------------------------
-        if _USE_NAIVE_BATCHED_MOE:
+        if _USE_NAIVE_BATCHED_MOE and hidden_states.shape[0] > 1:
             w13 = self.experts.w13_weight  # (E, 2*I, H)
             w2 = self.experts.w2_weight    # (E, H, I)
 
