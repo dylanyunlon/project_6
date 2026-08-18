@@ -1,24 +1,14 @@
 """
 xllm_ops.py — NO-FALLBACK xllm kernel loader for vllm hot path
 
-Architecture (matching xllm/core/kernels/ilu/ dispatch):
-    xllm C++:   kernels/ilu/*.cpp  →  ixformer::infer::*  (dlopen ixformer .so)
-    Our Python:  xllm_ops.py       →  xllm_*.so           (dlopen our compiled .so)
-                                   →  ix_full_bridge.so   (dlopen ixformer bridge)
-
-Source mapping (upstream → us):
-    xllm/core/kernels/ilu/norm.cpp        → xllm_norm.so
-    xllm/core/kernels/ilu/rope.cpp        → xllm_rope.so
-    xllm/core/kernels/ilu/activation.cpp  → xllm_activation.so
-    xllm/core/kernels/ilu/attention.cpp   → ix_full_bridge.so (paged_attention, flash_attn)
-    xllm/core/kernels/ilu/fused_moe.cpp   → xllm_moe.so + ix_full_bridge.so
-    xllm/core/kernels/ilu/matmul.cpp      → ix_full_bridge.so (ixformer_linear)
-    xllm/core/layers/ilu/fused_moe.cpp    → corex_moe.py (Python orchestrator)
-    xllm/core/layers/ilu/attention.cpp    → corex_fa2.py (Python orchestrator)
+Function name mapping (verified via `nm -D` + `strings` on real BI-V100):
+    xllm_cache.so:      reshape_paged_cache   (NOT reshape_and_cache)
+    xllm_norm.so:       rms_norm, fused_add_rms_norm  (NOT residual_rms_norm)
+    xllm_moe.so:        moe_fused_topk        (NOT topk_softmax)
+    xllm_moe.so:        moe_compute_index     (NOT moe_compute_token_index)
+    ix_moe_bridge.so:   ix_paged_attention, ix_linear  (NOT in ix_full_bridge.so)
 
 NO FALLBACK: If a .so fails to load, we raise immediately.
-The comp 168 log shows that fallback = pure PyTorch = 683 score.
-We need 8000. Every kernel MUST go through hardware-accelerated path.
 """
 
 import os
@@ -105,14 +95,14 @@ def _get(name: str) -> Any:
 # Public API — matches xllm/core/kernels/ilu/ function signatures
 # =========================================================================
 
-# --- Norm (xllm/core/kernels/ilu/norm.cpp) ---
+# --- Norm (xllm_norm.so: rms_norm, fused_add_rms_norm) ---
 def rms_norm(input, weight, epsilon):
     """RMSNorm. Maps to ixformer::infer::rms_norm."""
     return _get("xllm_norm").rms_norm(input, weight, epsilon)
 
 def residual_rms_norm(input, residual, weight, epsilon):
-    """Fused residual + RMSNorm. Maps to ixformer::infer::residual_rms_norm."""
-    return _get("xllm_norm").residual_rms_norm(input, residual, weight, epsilon)
+    """Fused residual + RMSNorm. .so export: fused_add_rms_norm."""
+    return _get("xllm_norm").fused_add_rms_norm(input, residual, weight, epsilon)
 
 # --- RoPE (xllm/core/kernels/ilu/rope.cpp) ---
 def rotary_embedding(positions, query, key, cos_sin_cache, is_neox=True):
@@ -129,56 +119,54 @@ def gelu_and_mul(input, output=None):
     """Fused GeLU activation."""
     return _get("xllm_activation").gelu_and_mul(input, output)
 
-# --- Cache (xllm/core/kernels/ilu/attention.cpp reshape part) ---
+# --- Cache (xllm_cache.so: reshape_paged_cache) ---
 def reshape_and_cache(key, value, key_cache, value_cache, slot_mapping):
-    """Write KV to paged cache. Maps to ixformer::infer::xllm_reshape_and_cache."""
-    return _get("xllm_cache").reshape_and_cache(key, value, key_cache,
-                                                 value_cache, slot_mapping)
+    """Write KV to paged cache. .so export: reshape_paged_cache."""
+    return _get("xllm_cache").reshape_paged_cache(key, value, key_cache,
+                                                   value_cache, slot_mapping)
 
-# --- Attention (xllm/core/kernels/ilu/attention.cpp) ---
+# --- Attention (ix_moe_bridge.so: ix_paged_attention) ---
 def paged_attention(out, query, key_cache, value_cache,
                     num_kv_heads, scale, block_tables, context_lens,
                     block_size, max_context_len, alibi_slopes=None):
-    """Paged attention decode. Maps to ixformer::infer::xllm_paged_attention."""
-    bridge = _get("ix_full_bridge")
+    """Paged attention decode. .so export: ix_paged_attention in ix_moe_bridge.so."""
+    bridge = _get("ix_moe_bridge")
     return bridge.ix_paged_attention(
         out, query, key_cache, value_cache,
-        num_kv_heads, scale, block_tables, context_lens,
-        block_size, max_context_len, alibi_slopes
+        scale, block_tables, context_lens,
+        block_size, max_context_len, max_context_len, alibi_slopes
     )
 
 def flash_attn_prefill(query, key_cache, value_cache, out,
                        block_tables, cu_seq_q, cu_seq_k,
                        max_seq_q, max_seq_k, scale,
                        is_causal=True):
-    """Flash attention prefill. Maps to ixformer::infer::ixinfer_flash_attn_unpad."""
-    bridge = _get("ix_full_bridge")
-    return bridge.ix_flash_attn_prefill(
+    """Flash attention prefill. .so export: fused_paged_prefill_forward."""
+    return _get("corex_fused_paged_prefill").fused_paged_prefill_forward(
         query, key_cache, value_cache, out,
-        block_tables, cu_seq_q, cu_seq_k,
-        max_seq_q, max_seq_k, is_causal, scale
+        block_tables, cu_seq_q, max_seq_q, scale
     )
 
-# --- MoE (xllm/core/kernels/ilu/fused_moe.cpp) ---
+# --- MoE (xllm_moe.so: moe_fused_topk, moe_compute_index) ---
 def topk_softmax(topk_weights, topk_ids, token_expert_ids, gating_output, topk):
-    """MoE topk + softmax. Maps to ixformer::infer::topk_softmax."""
-    return _get("xllm_moe").topk_softmax(
+    """MoE topk + softmax. .so export: moe_fused_topk."""
+    return _get("xllm_moe").moe_fused_topk(
         topk_weights, topk_ids, token_expert_ids, gating_output, topk
     )
 
 def moe_compute_token_index(sorted_token_ids, expert_ids, num_tokens_post_padded,
                             token_expert_ids, num_experts, block_size):
-    """MoE token routing. Maps to ixformer::infer::moe_compute_token_index_api."""
-    return _get("xllm_moe").moe_compute_token_index(
+    """MoE token routing. .so export: moe_compute_index."""
+    return _get("xllm_moe").moe_compute_index(
         sorted_token_ids, expert_ids, num_tokens_post_padded,
         token_expert_ids, num_experts, block_size
     )
 
-# --- Linear (xllm/core/kernels/ilu/matmul.cpp) ---
+# --- Linear (ix_moe_bridge.so: ix_linear) ---
 def ixformer_linear(input, weight, act_type=0, bias=None, out=None):
-    """GEMM via ixformer. Maps to ixformer::infer::ixformer_linear."""
-    bridge = _get("ix_full_bridge")
-    return bridge.ix_linear(input, weight, act_type, bias, out)
+    """GEMM via ixformer. .so export: ix_linear in ix_moe_bridge.so."""
+    bridge = _get("ix_moe_bridge")
+    return bridge.ix_linear(input, weight, bias)
 
 # --- Fused QK-Norm + RoPE ---
 def fused_qknorm_rope(query, key, cos_sin_cache, positions,
@@ -200,16 +188,18 @@ def check_all(strict=True):
                 If False, return dict of {name: loaded_bool}.
     """
     required = [
-        "ix_full_bridge",     # attention + linear + MoE bridge
-        "xllm_norm",          # rms_norm, residual_rms_norm
-        "xllm_rope",          # rotary_embedding
-        "xllm_activation",    # silu_and_mul
-        "xllm_cache",         # reshape_and_cache
-        "xllm_moe",           # topk_softmax, moe_compute_token_index
+        "ix_moe_bridge",      # attention (ix_paged_attention) + linear (ix_linear)
+        "xllm_norm",          # rms_norm, fused_add_rms_norm
+        "xllm_cache",         # reshape_paged_cache
+        "xllm_moe",           # moe_fused_topk, moe_compute_index
     ]
 
     optional = [
-        "xllm_fused_qknorm_rope",  # nice-to-have: fused QK-norm + RoPE
+        "ix_full_bridge",          # legacy bridge (not used in hot path)
+        "xllm_rope",               # rotary_embedding
+        "xllm_activation",         # silu_and_mul
+        "xllm_fused_qknorm_rope",  # fused QK-norm + RoPE
+        "corex_fused_paged_prefill",  # flash attention prefill
     ]
 
     results = {}
