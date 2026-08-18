@@ -149,8 +149,9 @@ cp ./bi100_profile.py "${VLLM_ROOT}/bi100_profile.py"
 cp ./block_major_kv_cache.py "${VLLM_ROOT}/block_major_kv_cache.py"
 cp ./gdn_prefix.py "${VLLM_ROOT}/gdn_prefix.py"
 
-build_stage "installing CoreX paged-KV swap compatibility"
+build_stage "installing CoreX paged-KV swap/copy compatibility"
 python3 ./patch_corex_swap_blocks.py
+python3 ./patch_corex_copy_blocks.py
 python3 ./patch_block_major_cache_engine.py
 python3 ./patch_worker_cache_transfer_order.py
 
@@ -459,6 +460,3 @@ python3 ./verify_dlopen_chain.py --vllm-root "${VLLM_ROOT}" || {
 }
 
 build_stage "patch script completed"
-
-
-
