@@ -8,6 +8,13 @@ Function name mapping (verified via `nm -D` + `strings` on real BI-V100):
     xllm_moe.so:        moe_compute_index     (NOT moe_compute_token_index)
     ix_moe_bridge.so:   ix_paged_attention, ix_linear  (NOT in ix_full_bridge.so)
 
+C++ argument order verified against *_bind.cpp pybind11 source:
+    xllm_norm_bind.cpp:       rms_norm(output, input, weight, eps)
+    xllm_activation_bind.cpp: silu_and_mul(out, input)
+    xllm_cache_bind.cpp:      reshape_paged_cache(slot_ids, keys, values, kc, vc)
+    ix_full_bridge_v2.cpp:    ix_paged_attention(out, q, kc, vc, head_mapping, scale, ...)
+    xllm_moe_bind.cpp:        moe_fused_topk(gating, topk) → returns (w, ids)
+
 NO FALLBACK: If a .so fails to load, we raise immediately.
 """
 
@@ -15,6 +22,8 @@ import os
 import sys
 import importlib.util
 import logging
+
+import torch
 from typing import Optional, Dict, Any
 
 logger = logging.getLogger("ex_engine.xllm_ops")
@@ -92,49 +101,78 @@ def _get(name: str) -> Any:
 
 
 # =========================================================================
-# Public API — matches xllm/core/kernels/ilu/ function signatures
+# Public API — C++ signatures verified against *_bind.cpp pybind source
 # =========================================================================
 
-# --- Norm (xllm_norm.so: rms_norm, fused_add_rms_norm) ---
+# --- Norm (xllm_norm.so) ---
+# C++ rms_norm(output, input, weight, eps) — output FIRST
 def rms_norm(input, weight, epsilon):
-    """RMSNorm. Maps to ixformer::infer::rms_norm."""
-    return _get("xllm_norm").rms_norm(input, weight, epsilon)
+    """RMSNorm. C++ takes (output, input, weight, eps)."""
+    output = torch.empty_like(input)
+    _get("xllm_norm").rms_norm(output, input, weight, epsilon)
+    return output
 
+# C++ fused_add_rms_norm(input&, residual&, weight&, epsilon) — in-place
 def residual_rms_norm(input, residual, weight, epsilon):
-    """Fused residual + RMSNorm. .so export: fused_add_rms_norm."""
-    return _get("xllm_norm").fused_add_rms_norm(input, residual, weight, epsilon)
+    """Fused residual + RMSNorm. Modifies input and residual in-place."""
+    _get("xllm_norm").fused_add_rms_norm(input, residual, weight, epsilon)
+    return input, residual
 
-# --- RoPE (xllm/core/kernels/ilu/rope.cpp) ---
+# --- RoPE (xllm_rope.so) ---
+# C++ rotary_embedding(positions, query, key, cos_sin_cache, is_neox)
 def rotary_embedding(positions, query, key, cos_sin_cache, is_neox=True):
-    """Fused rotary embedding. Maps to ixformer::infer::xllm_rotary_embedding."""
+    """Fused rotary embedding. Signature matches C++ directly."""
     return _get("xllm_rope").rotary_embedding(positions, query, key,
                                                cos_sin_cache, is_neox)
 
-# --- Activation (xllm/core/kernels/ilu/activation.cpp) ---
+# --- Activation (xllm_activation.so) ---
+# C++ silu_and_mul(out, input) — out FIRST
 def silu_and_mul(input, output=None):
-    """Fused SiLU activation. Maps to ixformer::infer::silu_and_mul."""
-    return _get("xllm_activation").silu_and_mul(input, output)
+    """Fused SiLU activation. C++ takes (out, input)."""
+    if output is None:
+        d = input.shape[-1] // 2
+        output = torch.empty(*input.shape[:-1], d, dtype=input.dtype,
+                             device=input.device)
+    _get("xllm_activation").silu_and_mul(output, input)
+    return output
 
+# C++ gelu_and_mul(out, input) — out FIRST
 def gelu_and_mul(input, output=None):
-    """Fused GeLU activation."""
-    return _get("xllm_activation").gelu_and_mul(input, output)
+    """Fused GeLU activation. C++ takes (out, input)."""
+    if output is None:
+        d = input.shape[-1] // 2
+        output = torch.empty(*input.shape[:-1], d, dtype=input.dtype,
+                             device=input.device)
+    _get("xllm_activation").gelu_and_mul(output, input)
+    return output
 
-# --- Cache (xllm_cache.so: reshape_paged_cache) ---
+# --- Cache (xllm_cache.so) ---
+# C++ reshape_paged_cache(slot_ids, keys, values, key_cache, value_cache)
+#   — slot_ids FIRST (not last!)
 def reshape_and_cache(key, value, key_cache, value_cache, slot_mapping):
-    """Write KV to paged cache. .so export: reshape_paged_cache."""
+    """Write KV to paged cache. C++ takes slot_ids as FIRST arg."""
     return _get("xllm_cache").reshape_paged_cache(slot_mapping, key, value,
                                                    key_cache, value_cache)
 
-# --- Attention (ix_moe_bridge.so: ix_paged_attention) ---
+# --- Attention (ix_moe_bridge.so) ---
+# C++ ix_paged_attention(output, query, key_cache, value_cache,
+#                        head_mapping, scale, block_tables, context_lens,
+#                        block_size, max_context_len, num_kv_heads,
+#                        alibi_slopes)
 def paged_attention(out, query, key_cache, value_cache,
                     num_kv_heads, scale, block_tables, context_lens,
                     block_size, max_context_len, alibi_slopes=None):
-    """Paged attention decode. .so export: ix_paged_attention in ix_moe_bridge.so."""
+    """Paged attention decode. C++ needs head_mapping tensor at position 5."""
     bridge = _get("ix_moe_bridge")
+    num_q_heads = query.shape[1]
+    head_mapping = torch.arange(num_q_heads, dtype=torch.int32,
+                                device=query.device)
+    if num_kv_heads != num_q_heads:
+        head_mapping = head_mapping // (num_q_heads // num_kv_heads)
     return bridge.paged_attention(
         out, query, key_cache, value_cache,
-        scale, block_tables, context_lens,
-        block_size, max_context_len, max_context_len, alibi_slopes
+        head_mapping, scale, block_tables, context_lens,
+        block_size, max_context_len, num_kv_heads, alibi_slopes
     )
 
 def flash_attn_prefill(query, key_cache, value_cache, out,
@@ -147,20 +185,29 @@ def flash_attn_prefill(query, key_cache, value_cache, out,
         block_tables, cu_seq_q, max_seq_q, scale
     )
 
-# --- MoE (xllm_moe.so: moe_fused_topk, moe_compute_index) ---
+# --- MoE (xllm_moe.so) ---
+# C++ moe_fused_topk(gating_output, topk, renormalize=true,
+#                     correction_bias=None, scoring_func="softmax")
+#   → returns (topk_weights, topk_ids)  (C++ allocates internally)
 def topk_softmax(topk_weights, topk_ids, token_expert_ids, gating_output, topk):
-    """MoE topk + softmax. .so export: moe_fused_topk."""
-    return _get("xllm_moe").moe_fused_topk(
-        topk_weights, topk_ids, token_expert_ids, gating_output, topk
-    )
+    """MoE topk+softmax. C++ returns new tensors; we copy into pre-allocated."""
+    weights, ids = _get("xllm_moe").moe_fused_topk(gating_output, topk)
+    topk_weights.copy_(weights)
+    topk_ids.copy_(ids)
+    return topk_weights, topk_ids, token_expert_ids
 
+# C++ moe_compute_index(expert_id, num_experts)
+#   → returns (sorted_token_ids, expert_ids, num_tokens_post_padded)
 def moe_compute_token_index(sorted_token_ids, expert_ids, num_tokens_post_padded,
                             token_expert_ids, num_experts, block_size):
-    """MoE token routing. .so export: moe_compute_index."""
-    return _get("xllm_moe").moe_compute_index(
-        sorted_token_ids, expert_ids, num_tokens_post_padded,
-        token_expert_ids, num_experts, block_size
+    """MoE token routing. C++ takes only (expert_id, num_experts)."""
+    s_ids, e_ids, n_post = _get("xllm_moe").moe_compute_index(
+        token_expert_ids, num_experts
     )
+    sorted_token_ids.copy_(s_ids[:sorted_token_ids.numel()].reshape_as(sorted_token_ids))
+    expert_ids.copy_(e_ids[:expert_ids.numel()].reshape_as(expert_ids))
+    num_tokens_post_padded.copy_(n_post[:num_tokens_post_padded.numel()].reshape_as(num_tokens_post_padded))
+    return sorted_token_ids, expert_ids, num_tokens_post_padded
 
 # --- Linear (ix_moe_bridge.so: ix_linear) ---
 def ixformer_linear(input, weight, act_type=0, bias=None, out=None):

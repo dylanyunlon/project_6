@@ -94,9 +94,13 @@ def apply(strict=True):
             import vllm._custom_ops as ops
 
             def patched_rms_norm(output, input, weight, epsilon):
-                xllm_ops.rms_norm(input, weight, epsilon)
+                # vllm: ops.rms_norm(output, input, weight, eps)
+                # xllm_norm.so: rms_norm(output, input, weight, eps) — same
+                xllm_ops._get("xllm_norm").rms_norm(output, input, weight, epsilon)
 
             def patched_fused_add_rms_norm(input, residual, weight, epsilon):
+                # vllm: ops.fused_add_rms_norm(input, residual, weight, eps)
+                # xllm_norm.so: same signature, in-place
                 xllm_ops.residual_rms_norm(input, residual, weight, epsilon)
 
             if hasattr(ops, 'rms_norm'):
@@ -122,7 +126,9 @@ def apply(strict=True):
             import vllm._custom_ops as ops
 
             def patched_silu_and_mul(output, input):
-                xllm_ops.silu_and_mul(input, output)
+                # vllm: ops.silu_and_mul(output, input)
+                # xllm_activation.so: silu_and_mul(out, input) — same order
+                xllm_ops._get("xllm_activation").silu_and_mul(output, input)
 
             if hasattr(ops, 'silu_and_mul'):
                 ops.silu_and_mul = patched_silu_and_mul
