@@ -83,11 +83,20 @@ def _patch_layernorm() -> int:
 
     _orig_forward = GemmaRMSNorm.forward
 
+    _debug_count = [0]
+
     def _patched_forward(self, x, residual=None):
         # GemmaRMSNorm: output = rms_norm(x) * (1 + weight)
         # ixformer rms_norm: output = rms_norm(x) * weight
         # Pass (1 + weight) to ixformer to match GemmaRMSNorm semantics.
         w = self.weight
+        if _debug_count[0] < 20:
+            _debug_count[0] += 1
+            logger.info("DEBUG rms_norm #%d: w.shape=%s w.dim=%d x.shape=%s x.dim=%d "
+                         "class=%s residual=%s",
+                         _debug_count[0], list(w.shape), w.dim(), list(x.shape), x.dim(),
+                         type(self).__name__,
+                         list(residual.shape) if residual is not None else None)
         if w.dim() != 1 or w.shape[0] != x.shape[-1]:
             return _orig_forward(self, x, residual)
         w_adjusted = 1.0 + w
