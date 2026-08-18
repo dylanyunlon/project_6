@@ -122,8 +122,8 @@ def gelu_and_mul(input, output=None):
 # --- Cache (xllm_cache.so: reshape_paged_cache) ---
 def reshape_and_cache(key, value, key_cache, value_cache, slot_mapping):
     """Write KV to paged cache. .so export: reshape_paged_cache."""
-    return _get("xllm_cache").reshape_paged_cache(key, value, key_cache,
-                                                   value_cache, slot_mapping)
+    return _get("xllm_cache").reshape_paged_cache(slot_mapping, key, value,
+                                                   key_cache, value_cache)
 
 # --- Attention (ix_moe_bridge.so: ix_paged_attention) ---
 def paged_attention(out, query, key_cache, value_cache,
