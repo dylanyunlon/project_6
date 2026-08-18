@@ -92,28 +92,26 @@ def _patch_layernorm() -> int:
         w = self.weight
         if _debug_count[0] < 20:
             _debug_count[0] += 1
-            logger.info("DEBUG rms_norm #%d: w.shape=%s w.dim=%d x.shape=%s x.dim=%d "
-                         "class=%s residual=%s",
-                         _debug_count[0], list(w.shape), w.dim(), list(x.shape), x.dim(),
+            logger.info("DEBUG rms_norm #%d: w.shape=%s w.dim=%d w.dtype=%s "
+                         "x.shape=%s x.dim=%d x.dtype=%s class=%s residual=%s",
+                         _debug_count[0], list(w.shape), w.dim(), w.dtype,
+                         list(x.shape), x.dim(), x.dtype,
                          type(self).__name__,
                          list(residual.shape) if residual is not None else None)
         if w.dim() != 1 or w.shape[0] != x.shape[-1]:
             return _orig_forward(self, x, residual)
-        w_adjusted = 1.0 + w
+        # 1.0 + w promotes fp16→fp32; ixformer rms_norm requires weight
+        # to be 1-D AND same dtype as input, so cast back.
+        w_adjusted = (1.0 + w).to(w.dtype)
         if residual is not None:
-            if ix_ops.has_fused_add_rms_norm():
-                out = torch.empty_like(x)
-                residual_out = torch.empty_like(x)
-                ix_ops.fused_add_rms_norm(
-                    x, residual, w_adjusted, out, residual_out,
-                    self.variance_epsilon)
-                return out, residual_out
-            else:
-                new_residual = x + residual
-                out = torch.empty_like(x)
-                ix_ops.rms_norm(out, new_residual, w_adjusted,
-                                self.variance_epsilon)
-                return out, new_residual
+            # ixformer fused_add_rms_norm is in-place and has 4-arg C++
+            # signature (input, residual, weight, eps). Safer to use
+            # the non-fused path which is explicit about outputs.
+            new_residual = x + residual
+            out = torch.empty_like(x)
+            ix_ops.rms_norm(out, new_residual, w_adjusted,
+                            self.variance_epsilon)
+            return out, new_residual
         else:
             out = torch.empty_like(x)
             ix_ops.rms_norm(out, x, w_adjusted, self.variance_epsilon)
@@ -180,17 +178,17 @@ def _patch_custom_ops() -> int:
         logger.info("PATCHED: _custom_ops.rms_norm → ix_ops")
 
     # Patch fused_add_rms_norm
-    if ix_ops.has_fused_add_rms_norm() and hasattr(ops, 'fused_add_rms_norm'):
+    if ix_ops.has_rms_norm() and hasattr(ops, 'fused_add_rms_norm'):
         def _fused_add_rms_norm(input, residual, weight, eps):
+            # C++ fused_add_rms_norm is in-place with 4-arg signature,
+            # doesn't match the 6-arg wrapper in ix_ops. Use non-fused path.
+            residual.add_(input)
             out = torch.empty_like(input)
-            residual_out = torch.empty_like(input)
-            ix_ops.fused_add_rms_norm(input, residual, weight,
-                                       out, residual_out, eps)
+            ix_ops.rms_norm(out, residual, weight, eps)
             input.copy_(out)
-            residual.copy_(residual_out)
         ops.fused_add_rms_norm = _fused_add_rms_norm
         count += 1
-        logger.info("PATCHED: _custom_ops.fused_add_rms_norm → ix_ops")
+        logger.info("PATCHED: _custom_ops.fused_add_rms_norm → ix_ops (non-fused)")
 
     # Patch rotary_embedding
     if ix_ops.has_rotary_embedding() and hasattr(ops, 'rotary_embedding'):
