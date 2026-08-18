@@ -2292,4 +2292,8 @@ class PagedAttention:
     ) -> None:
         key_caches = [kv_cache[0] for kv_cache in kv_caches]
         value_caches = [kv_cache[1] for kv_cache in kv_caches]
-        ops.copy_blocks(key_caches, value_caches, src_to_dists)
+        # BI100 CoreX 3.2.3: ixformer exposes vllm_copy_blocks, not
+        # copy_blocks.  Call the vendor symbol directly instead of going
+        # through ops.copy_blocks (which hits the missing name).
+        import ixformer.functions as _ixf
+        _ixf.vllm_copy_blocks(key_caches, value_caches, src_to_dists)
