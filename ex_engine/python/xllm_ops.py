@@ -131,7 +131,7 @@ def paged_attention(out, query, key_cache, value_cache,
                     block_size, max_context_len, alibi_slopes=None):
     """Paged attention decode. .so export: ix_paged_attention in ix_moe_bridge.so."""
     bridge = _get("ix_moe_bridge")
-    return bridge.ix_paged_attention(
+    return bridge.paged_attention(
         out, query, key_cache, value_cache,
         scale, block_tables, context_lens,
         block_size, max_context_len, max_context_len, alibi_slopes
@@ -166,7 +166,7 @@ def moe_compute_token_index(sorted_token_ids, expert_ids, num_tokens_post_padded
 def ixformer_linear(input, weight, act_type=0, bias=None, out=None):
     """GEMM via ixformer. .so export: ix_linear in ix_moe_bridge.so."""
     bridge = _get("ix_moe_bridge")
-    return bridge.ix_linear(input, weight, bias)
+    return bridge.linear(input, weight, bias)
 
 # --- Fused QK-Norm + RoPE ---
 def fused_qknorm_rope(query, key, cos_sin_cache, positions,
