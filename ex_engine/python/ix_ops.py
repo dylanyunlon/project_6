@@ -1,9 +1,9 @@
 """
-ix_ops.py — Drop-in operator replacements via ix_full_bridge.so
+ix_ops.py — Drop-in operator replacements via ix_moe_bridge.so
 
 Architecture (CCCL dispatch pattern):
     CCCL:  compute_capability → policy_selector → tuned_kernel
-    EX:    base_image_so     → ix_full_bridge   → ixformer::infer
+    EX:    base_image_so     → ix_moe_bridge   → ixformer::infer
 
 This module provides torch.nn.Module-compatible replacements for:
     1. RMSNorm         → residual_rms_norm / rms_norm   (fused kernel)
@@ -14,12 +14,12 @@ This module provides torch.nn.Module-compatible replacements for:
     6. flash_attn_prefill → ixinfer_flash_attn_unpad     (fused prefill attn)
     7. linear          → ixformer_linear / linear_ex     (GEMM)
 
-Loading: tries prebuilt ix_full_bridge.so first, then JIT-compiles
-ix_full_bridge_v2.cpp as fallback.
+Loading: tries prebuilt ix_moe_bridge.so first, then JIT-compiles
+ix_moe_bridge_v2.cpp as fallback.
 
 Source mapping:
     upstream_ref/xllm_latest/core/kernels/ilu/*.cpp  → this file (Python side)
-    ex_engine/csrc/ix_full_bridge_v2.cpp              → .so (C++ side)
+    ex_engine/csrc/ix_moe_bridge_v2.cpp              → .so (C++ side)
     ixformer::infer namespace (base image)            → actual CUDA kernels
 """
 
@@ -43,29 +43,29 @@ _available = False
 
 
 def _try_prebuilt():
-    """Load prebuilt ix_full_bridge.so."""
+    """Load prebuilt ix_moe_bridge.so."""
     search = [
         # Deployed by patch_ops.sh into vllm package
-        "/usr/local/corex/lib/python3/dist-packages/vllm/ix_full_bridge.so",
+        "/usr/local/corex/lib/python3/dist-packages/vllm/ix_moe_bridge.so",
     ]
     # Also check vllm package dir
     try:
         import vllm
         vd = os.path.dirname(vllm.__file__)
-        search.insert(0, os.path.join(vd, "ix_full_bridge.so"))
+        search.insert(0, os.path.join(vd, "ix_moe_bridge.so"))
     except ImportError:
         pass
     # Check prebuilt dir
     here = os.path.dirname(os.path.abspath(__file__))
     search.append(os.path.join(here, "..", "..", "qwen3_6_scripts", "prebuilt",
-                               "corex-3.2.3-ivcore10", "ix_full_bridge.so"))
+                               "corex-3.2.3-ivcore10", "ix_moe_bridge.so"))
 
     for path in search:
         path = os.path.normpath(path)
         if not os.path.isfile(path):
             continue
         try:
-            spec = importlib.util.spec_from_file_location("ix_full_bridge", path)
+            spec = importlib.util.spec_from_file_location("ix_moe_bridge", path)
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
             fns = [x for x in dir(mod) if not x.startswith("_")]
@@ -77,13 +77,13 @@ def _try_prebuilt():
 
 
 def _try_jit():
-    """JIT compile ix_full_bridge_v2.cpp."""
+    """JIT compile ix_moe_bridge_v2.cpp."""
     here = os.path.dirname(os.path.abspath(__file__))
     cpp_candidates = [
-        os.path.join(here, "..", "csrc", "ix_full_bridge_v2.cpp"),
-        os.path.join(here, "..", "csrc", "ix_full_bridge.cpp"),
-        "/workspace/ex_engine/csrc/ix_full_bridge_v2.cpp",
-        "/workspace/qwen3_6_scripts/ix_full_bridge_v2.cpp",
+        os.path.join(here, "..", "csrc", "ix_moe_bridge_v2.cpp"),
+        os.path.join(here, "..", "csrc", "ix_moe_bridge.cpp"),
+        "/workspace/ex_engine/csrc/ix_moe_bridge_v2.cpp",
+        "/workspace/qwen3_6_scripts/ix_moe_bridge_v2.cpp",
     ]
     cpp_file = None
     for c in cpp_candidates:
@@ -117,7 +117,7 @@ def _try_jit():
         from torch.utils.cpp_extension import load
         logger.info("ix_ops: JIT compiling %s", cpp_file)
         mod = load(
-            name="ix_full_bridge_v2",
+            name="ix_moe_bridge_v2",
             sources=[cpp_file],
             extra_cflags=["-O2", "-std=c++17"],
             extra_ldflags=extra_ldflags,
