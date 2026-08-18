@@ -1516,6 +1516,16 @@ class PagedAttention:
         blocksparse_head_sliding_step: int = 0,
     ) -> torch.Tensor:
         actual_max = int(seq_lens.max().item()) if seq_lens.numel() > 0 else max_seq_len
+        # Guard against uninitialized seq_lens entries (0x7FFF7FFF pattern)
+        # from chunked prefill + GDN capture boundary metadata race.
+        if actual_max > max_seq_len:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "[BI100 PAGED_ATTN] seq_lens contains value %d > max_seq_len %d, "
+                "clamping (likely uninitialized metadata from chunked prefill)",
+                actual_max, max_seq_len)
+            seq_lens = seq_lens.clamp(max=max_seq_len)
+            actual_max = max_seq_len
         block_size = value_cache.shape[3]
         num_seqs, num_heads, head_size = query.shape
         if key_cache.shape[1] != value_cache.shape[1]:
