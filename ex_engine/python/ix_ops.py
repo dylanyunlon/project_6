@@ -222,11 +222,16 @@ def fused_add_rms_norm(input: torch.Tensor, residual: torch.Tensor,
     """Fused residual addition + RMSNorm.
 
     Source: xllm/core/kernels/ilu/norm.cpp → infer::residual_rms_norm
-    output = rms_norm(input + residual, weight, eps)
-    residual_output = input + residual
+    The C++ function is in-place: modifies input → rms_norm(input+residual)*weight,
+    and residual → input+residual. We copy results to output/residual_output.
     """
-    _bridge.fused_add_rms_norm(input, residual, weight, output,
-                                residual_output, eps)
+    # C++ signature: fused_add_rms_norm_forward(input, residual, weight, eps, alpha)
+    # It modifies input and residual in-place.
+    inp_clone = input.clone()
+    res_clone = residual.clone()
+    _bridge.fused_add_rms_norm(inp_clone, res_clone, weight, eps)
+    output.copy_(inp_clone)
+    residual_output.copy_(res_clone)
 
 
 def rotary_embedding(positions: torch.Tensor, query: torch.Tensor,
