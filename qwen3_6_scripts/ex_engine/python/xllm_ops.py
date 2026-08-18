@@ -149,9 +149,11 @@ def gelu_and_mul(input, output=None):
 # --- Cache (xllm_cache.so) ---
 # C++ reshape_paged_cache(slot_ids, keys, values, key_cache, value_cache)
 #   — slot_ids FIRST (not last!)
+#   — slot_ids must be int32 (C++ uses data_ptr<int>), vllm passes int64
 def reshape_and_cache(key, value, key_cache, value_cache, slot_mapping):
-    """Write KV to paged cache. C++ takes slot_ids as FIRST arg."""
-    return _get("xllm_cache").reshape_paged_cache(slot_mapping, key, value,
+    """Write KV to paged cache. C++ takes slot_ids as FIRST arg, dtype=int32."""
+    slot_mapping_i32 = slot_mapping.to(torch.int32)
+    return _get("xllm_cache").reshape_paged_cache(slot_mapping_i32, key, value,
                                                    key_cache, value_cache)
 
 # --- Attention (ix_moe_bridge.so) ---
