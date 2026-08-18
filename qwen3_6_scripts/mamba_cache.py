@@ -208,7 +208,14 @@ class MambaCacheManager:
                                    finished_seq_groups_req_ids: List[str]):
         for req_id in finished_seq_groups_req_ids:
             if req_id in self.mamba_cache_indices_mapping:
-                self.mamba_cache_indices_mapping.pop(req_id)
+                seq_mapping = self.mamba_cache_indices_mapping.pop(req_id)
+                # Zero out released cache slots so new requests start from
+                # clean state.  Without this, a new prefill reuses the stale
+                # temporal_state of the previous (unrelated) request, causing
+                # the GDN delta-rule to diverge → NaN → GPU memory corruption.
+                for cache_idx in seq_mapping.values():
+                    for cache_t in self.mamba_cache:
+                        cache_t[:, cache_idx].zero_()
 
     def _first_free_index_in_mamba_cache(
             self, indices_range: Optional[List[int]] = None) -> int:
