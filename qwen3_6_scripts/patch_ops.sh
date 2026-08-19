@@ -199,6 +199,43 @@ if [ -d "$PREBUILT_DIR" ]; then
     done
 fi
 
+# --- Rebuild corex_moe_direct_routed.so for BI-V100 warp_size=64 -----------
+# The prebuilt .so was compiled with kWarpSize=32 which silently corrupts
+# results on BI-V100 (64-wide warps).  Rebuild from the fixed .cu source
+# that uses kWarpSize=64 and 6-step shuffle reductions.
+build_stage "rebuilding corex_moe_direct_routed.so (warp64)"
+COREX_ROOT="${COREX_ROOT:-/usr/local/corex-3.2.3}"
+if [ ! -d "$COREX_ROOT" ]; then
+    COREX_ROOT="/usr/local/corex"
+fi
+TORCH_ROOT="${TORCH_ROOT:-$(python3 -c 'import torch,os;print(os.path.dirname(torch.__file__))' 2>/dev/null || echo "${COREX_ROOT}/lib64/python3/dist-packages/torch")}"
+DIRECT_ROUTED_SRC="./corex_moe_direct_routed.cu"
+DIRECT_ROUTED_DST="${VLLM_ROOT}/corex_moe_direct_routed.so"
+if [ -f "$DIRECT_ROUTED_SRC" ] && [ -x "${COREX_ROOT}/bin/clang++" ]; then
+    "${COREX_ROOT}/bin/clang++" \
+        -std=c++17 -O3 -shared -fPIC \
+        --cuda-path="${COREX_ROOT}" --cuda-gpu-arch=ivcore10 \
+        --no-cuda-version-check -D_GLIBCXX_USE_CXX11_ABI=0 \
+        -DTORCH_EXTENSION_NAME=corex_moe_direct_routed \
+        -DTORCH_API_INCLUDE_EXTENSION_H \
+        -I"${TORCH_ROOT}/include" \
+        -I"${TORCH_ROOT}/include/torch/csrc/api/include" \
+        -I"${TORCH_ROOT}/include/TH" -I"${TORCH_ROOT}/include/THC" \
+        -I/usr/local/include/python3.10 \
+        "$DIRECT_ROUTED_SRC" \
+        -L"${TORCH_ROOT}/lib" -L"${COREX_ROOT}/lib64" \
+        -Wl,-rpath,"${TORCH_ROOT}/lib" -Wl,-rpath,"${COREX_ROOT}/lib64" \
+        -ltorch_python -ltorch_cuda -ltorch_cpu -ltorch \
+        -lc10_cuda -lc10 -lcudart \
+        -o "$DIRECT_ROUTED_DST" 2>&1 && \
+    echo "[patch_ops] REBUILT corex_moe_direct_routed.so (warp64) → ${DIRECT_ROUTED_DST}" || \
+    echo "[patch_ops] WARNING: corex_moe_direct_routed.so rebuild FAILED, using prebuilt"
+elif [ ! -x "${COREX_ROOT}/bin/clang++" ]; then
+    echo "[patch_ops] WARNING: CoreX clang++ not found at ${COREX_ROOT}/bin/clang++, cannot rebuild direct_routed"
+else
+    echo "[patch_ops] WARNING: ${DIRECT_ROUTED_SRC} not found, cannot rebuild direct_routed"
+fi
+
 # --- Deploy ix_bridge Python integration layer --------------------------------
 build_stage "deploying ix_bridge operator replacements"
 EX_ENGINE_DIR="$(cd "$(dirname "$0")/ex_engine" 2>/dev/null && pwd || echo "")"
@@ -459,6 +496,3 @@ python3 ./verify_dlopen_chain.py --vllm-root "${VLLM_ROOT}" || {
 }
 
 build_stage "patch script completed"
-
-
-

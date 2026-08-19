@@ -1233,11 +1233,12 @@ class GatedDeltaNet(nn.Module):
             # (num_seqs, local_conv_dim, 1)
             mixed_qkv = (mixed_qkv_all
                          .to(weight_2d.dtype)
-                         .unsqueeze(-1))
+                         .unsqueeze(-1)
+                         .contiguous())
 
             if _USE_COREX_GDN_CAUSAL_CONV:
                 mixed_qkv_conv = _corex_gdn_causal_conv.causal_conv_update(
-                    conv_state, mixed_qkv, weight_2d)
+                    conv_state.contiguous(), mixed_qkv, weight_2d)
             else:
                 mixed_qkv_conv = _torch_causal_conv1d_update(
                     mixed_qkv, conv_state, weight_2d,
@@ -1784,6 +1785,9 @@ class Qwen3_5MoeSparseBlock(nn.Module):
             # Total: 3 kernel launches vs previous 16 (top_k*2).
             eids    = topk_ids[0]                              # (K,)
             ws      = topk_weights[0].to(hidden_states.dtype)  # (K,)
+            # --- corex_moe_direct_routed: zero-copy indexed GEMM (warp64) ---
+            # Shape must match the compiled kernel constants:
+            #   kHidden=2048, kExperts=256, kIntermediate=128, kTopK=8
             use_corex_direct = (
                 _USE_COREX_MOE_DIRECT_ROUTED
                 and hidden_states.dtype == torch.float16
@@ -1799,6 +1803,14 @@ class Qwen3_5MoeSparseBlock(nn.Module):
                 and w13.shape == (256, 256, 2048)
                 and w2.shape == (256, 2048, 128)
                 and eids.shape == (8,) and ws.shape == (8,))
+            if not hasattr(self, '_direct_routed_logged'):
+                self._direct_routed_logged = True
+                logger.info(
+                    "MoE T=1 direct_routed check: flag=%s match=%s "
+                    "hs=%s w13=%s w2=%s eids=%s ws=%s",
+                    _USE_COREX_MOE_DIRECT_ROUTED, use_corex_direct,
+                    tuple(hidden_states.shape), tuple(w13.shape),
+                    tuple(w2.shape), tuple(eids.shape), tuple(ws.shape))
             if use_corex_direct:
                 gate_up = _corex_moe_direct_routed.w13(
                     hidden_states, w13, eids)
