@@ -2294,8 +2294,18 @@ class PagedAttention:
         # Use xllm_cache.block_copy kernel — single launch for all layers.
         if src_to_dists.numel() == 0:
             return
-        from ex_engine.python.xllm_ops import _get as _xllm_get
-        _xllm_block_copy = _xllm_get("xllm_cache").block_copy
+
+        import importlib.util as _ilu
+        import os as _os
+        # paged_attn.py lives at VLLM_ROOT/attention/ops/paged_attn.py
+        # xllm_cache.so lives at VLLM_ROOT/xllm_cache.so
+        _vllm_root = _os.path.dirname(_os.path.dirname(_os.path.dirname(
+            _os.path.abspath(__file__))))
+        _so = _os.path.join(_vllm_root, "xllm_cache.so")
+        _spec = _ilu.spec_from_file_location("xllm_cache", _so)
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        _xllm_block_copy = _mod.block_copy
 
         device = src_to_dists.device
         n = src_to_dists.size(0)
@@ -2319,3 +2329,4 @@ class PagedAttention:
         _xllm_block_copy(key_ptrs, val_ptrs,
                          src_indices, dst_indices, cum_sum,
                          numel_per_block, cache_dtype)
+                         
