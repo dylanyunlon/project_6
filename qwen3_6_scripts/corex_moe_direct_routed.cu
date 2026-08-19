@@ -7,9 +7,10 @@
  *
  * BI-V100 hardware adaptation (CoreX 3.2.3, SM70-compat):
  *   - WARP_SIZE = 64 (BI-V100 native)
- *   - Reduction uses shared memory (warp-agnostic, no __shfl_down_sync)
- *     __shfl_down_sync(0xffffffff, ...) only masks 32 threads on BI-V100,
- *     silently producing wrong results for 64-wide warps.
+ *   - Reduction uses volatile smem + __syncwarp().
+ *     CoreX clang++ with #pragma unroll caches smem reads in registers;
+ *     volatile forces actual smem access on every read/write.
+ *     Verified: non-volatile gives 32.0, volatile gives 128.0.
  *   - kThreads=256 → 4 warps of 64, grid adjusted accordingly
  *   - half2 vectorized loads: 2 halves per load, stride by warp width
  *
@@ -47,16 +48,20 @@ constexpr int kThreads = 256;   // 4 warps of 64
 constexpr int kWarpsPerBlock = kThreads / kWarpSize; // 4
 
 // =====================================================================
-// Shared-memory reduction (warp-agnostic, safe for warp=32 or warp=64)
+// Shared-memory reduction — volatile smem + __syncwarp()
 // =====================================================================
-// Each warp gets its own 64-float slice in shared memory.
+// CRITICAL: the pointer MUST be volatile.
+// CoreX clang++ with #pragma unroll hoists smem reads into registers,
+// causing stale values in the reduction loop.  volatile forces every
+// read/write to go through shared memory.
+// Verified on real BI-V100: without volatile → 32.0, with → 128.0.
+//
 // Total smem per block = kWarpsPerBlock * kWarpSize * sizeof(float)
 //                      = 4 * 64 * 4 = 1024 bytes
 __device__ __forceinline__ float smem_warp_sum(
-    float value, float* warp_smem, int lane) {
+    float value, volatile float* warp_smem, int lane) {
   warp_smem[lane] = value;
   __syncwarp();
-  // Tree reduction within the warp's shared memory slice
   #pragma unroll
   for (int s = kWarpSize / 2; s > 0; s >>= 1) {
     if (lane < s) {
