@@ -2314,7 +2314,7 @@ class PagedAttention:
             dtype=torch.int64, device=device)
 
         numel_per_block = kv_caches[0][0][0].numel()
-        cache_dtype = kv_caches[0][0].dtype
+        cache_dtype = kv_caches[0][0].scalar_type()
 
         _xllm_block_copy(key_ptrs, val_ptrs,
                          src_indices, dst_indices, cum_sum,
