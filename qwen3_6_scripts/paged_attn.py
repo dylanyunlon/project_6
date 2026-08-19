@@ -2290,43 +2290,7 @@ class PagedAttention:
         kv_caches: List[torch.Tensor],
         src_to_dists: torch.Tensor,
     ) -> None:
-        # BI100 CoreX 3.2.3: ixformer has no copy_blocks binding.
-        # Use xllm_cache.block_copy kernel — single launch for all layers.
-        if src_to_dists.numel() == 0:
-            return
-
-        import importlib.util as _ilu
-        import os as _os
-        # paged_attn.py lives at VLLM_ROOT/attention/ops/paged_attn.py
-        # xllm_cache.so lives at VLLM_ROOT/xllm_cache.so
-        _vllm_root = _os.path.dirname(_os.path.dirname(_os.path.dirname(
-            _os.path.abspath(__file__))))
-        _so = _os.path.join(_vllm_root, "xllm_cache.so")
-        _spec = _ilu.spec_from_file_location("xllm_cache", _so)
-        _mod = _ilu.module_from_spec(_spec)
-        _spec.loader.exec_module(_mod)
-        _xllm_block_copy = _mod.block_copy
-
-        device = src_to_dists.device
-        n = src_to_dists.size(0)
-
-        # 1:1 mapping → each pair is its own group
-        src_indices = src_to_dists[:, 0].to(torch.int32).contiguous()
-        dst_indices = src_to_dists[:, 1].to(torch.int32).contiguous()
-        cum_sum = torch.arange(1, n + 1, dtype=torch.int32, device=device)
-
-        # Build per-layer cache pointer tensors
-        key_ptrs = torch.tensor(
-            [kv[0].data_ptr() for kv in kv_caches],
-            dtype=torch.int64, device=device)
-        val_ptrs = torch.tensor(
-            [kv[1].data_ptr() for kv in kv_caches],
-            dtype=torch.int64, device=device)
-
-        numel_per_block = kv_caches[0][0][0].numel()
-        cache_dtype = kv_caches[0][0].scalar_type()
-
-        _xllm_block_copy(key_ptrs, val_ptrs,
-                         src_indices, dst_indices, cum_sum,
-                         numel_per_block, cache_dtype)
-                         
+        key_caches = [kv_cache[0] for kv_cache in kv_caches]
+        value_caches = [kv_cache[1] for kv_cache in kv_caches]
+        ops.copy_blocks(key_caches, value_caches, src_to_dists)
+        
