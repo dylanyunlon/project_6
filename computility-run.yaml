@@ -10,7 +10,7 @@ command:
     - --max-model-len
     - '131072'
     - --gpu-memory-utilization
-    - '0.90'
+    - '0.95'
     - --trust-remote-code
     - -tp
     - '4'
@@ -19,7 +19,7 @@ command:
     - --disable-log-requests
     - --disable-frontend-multiprocessing
     - --max-num-batched-tokens
-    - '8192'
+    - '4096'
     - --enable-chunked-prefill
     - --max-seq-len-to-capture
     - '32768'
