@@ -1876,6 +1876,21 @@ class PagedAttention:
                 capture_request_eligible = bool(
                     capture_request_eligible and metadata_eligible)
 
+            # Guard against uninitialized context_lens entries (0x7FFF7FFF
+            # pattern) from chunked prefill + GDN capture boundary metadata
+            # race — same issue that forward_decode guards against for
+            # seq_lens.  Clamp to max possible value (seq_len) and log once.
+            _max_ctx = int(context_lens.max().item()) if context_lens.numel() > 0 else 0
+            _max_sl = int(seq_lens_tensor.max().item()) if seq_lens_tensor.numel() > 0 else 0
+            if _max_ctx > _max_sl:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "[BI100 PAGED_ATTN] context_lens contains value %d "
+                    "> max seq_len %d, clamping (likely uninitialized "
+                    "metadata from chunked prefill + GDN boundary race)",
+                    _max_ctx, _max_sl)
+                context_lens = context_lens.clamp(max=0)
+
             for i in range(batch_size):
                 ctx_len = int(context_lens[i].item())
                 q_start = int(query_start_loc[i].item())
