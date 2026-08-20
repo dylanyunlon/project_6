@@ -1878,21 +1878,21 @@ class PagedAttention:
 
             # Guard against uninitialized context_lens entries (0x7FFF7FFF
             # pattern) from chunked prefill + GDN capture boundary metadata
-            # race — same issue that forward_decode guards against for
-            # seq_lens.  Clamp to max possible value (seq_len) and log once.
-            _max_ctx = int(context_lens.max().item()) if context_lens.numel() > 0 else 0
-            _max_sl = int(seq_lens_tensor.max().item()) if seq_lens_tensor.numel() > 0 else 0
-            if _max_ctx > _max_sl:
-                import logging as _logging
-                _logging.getLogger(__name__).warning(
-                    "[BI100 PAGED_ATTN] context_lens contains value %d "
-                    "> max seq_len %d, clamping (likely uninitialized "
-                    "metadata from chunked prefill + GDN boundary race)",
-                    _max_ctx, _max_sl)
-                context_lens = context_lens.clamp(max=0)
+            # race.  Per-entry clamp inside the loop below, using block_tables
+            # physical capacity as absolute ceiling.
+            _max_physical_ctx = block_tables.shape[1] * block_size if block_tables.numel() > 0 else 0
 
             for i in range(batch_size):
                 ctx_len = int(context_lens[i].item())
+                # Per-entry guard: if ctx_len exceeds physical KV capacity,
+                # it's an uninitialized 0x7FFF7FFF sentinel — force to 0.
+                if ctx_len < 0 or ctx_len > _max_physical_ctx:
+                    import logging as _logging
+                    _logging.getLogger(__name__).warning(
+                        "[BI100 PAGED_ATTN] context_lens[%d]=%d exceeds "
+                        "physical capacity %d, forcing to 0",
+                        i, ctx_len, _max_physical_ctx)
+                    ctx_len = 0
                 q_start = int(query_start_loc[i].item())
                 q_end   = int(query_start_loc[i + 1].item())
                 q_len   = q_end - q_start
