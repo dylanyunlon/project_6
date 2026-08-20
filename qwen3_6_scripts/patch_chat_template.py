@@ -2,11 +2,16 @@
 """
 patch_chat_template.py — Fix non-thinking mode '!!!!!' output
 
-Root cause: Qwen3.5-MoE's chat_template adds '<think>\n\n</think>\n\n'
+Root cause: Qwen3.5/3.6-MoE's chat_template adds '<think>\n\n</think>\n\n'
 when enable_thinking=false. This empty think block causes the model to
 degenerate into outputting nothing but '!'.
 
 Fix: Remove the empty think block so the model generates directly.
+
+Verified on real machine 2026-08-20:
+  - Model: /root/public-storage/models/Qwen/Qwen3.6-35B-A3B
+  - target repr: "{{- '<think>\\n\\n</think>\\n\\n' }}"
+  - match: True → patch applied successfully
 """
 import json
 import sys
@@ -27,13 +32,10 @@ def patch_tokenizer_config(model_path: str) -> bool:
         print("[patch_chat_template] No chat_template found")
         return False
 
-    # After json.load, \n in the JSON string becomes actual newline chars.
-    # The template content uses Jinja2 syntax with literal '<think>\n\n</think>\n\n'
-    # which in the Python string is: '<think>\\n\\n</think>\\n\\n'
-    # (because it's a Jinja string literal, not a Python string)
-
-    # Look for the pattern: when enable_thinking=false, outputs empty think block
-    target = "{{- '<think>\\n\\n</think>\\n\\n' }}"
+    # The Jinja template contains literal backslash-n sequences: \n
+    # After json.load these remain as two-char sequences (backslash + n),
+    # NOT real newlines. Use raw string so Python doesn't interpret them.
+    target = r"{{- '<think>\n\n</think>\n\n' }}"
     replacement = "{{- '' }}"
 
     if target in template:
