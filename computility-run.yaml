@@ -50,4 +50,3 @@ env:
       value: admission64
     - name: BI100_GDN_RESTORE_MODE
       value: hybrid64
-# rebuild

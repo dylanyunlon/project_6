@@ -487,6 +487,15 @@ if [[ -d "${EX_ENGINE_DIR}/python" ]]; then
     echo "[patch_ops] deployed $(ls -1 "${EX_PY_DIR}"/*.py 2>/dev/null | wc -l) Python modules → ${EX_PY_DIR}/"
 fi
 
+build_stage "patching chat template for non-thinking mode"
+MODEL_DIR="${MODEL_DIR:-/model}"
+if [ -f "${MODEL_DIR}/tokenizer_config.json" ]; then
+    python3 ./patch_chat_template.py "${MODEL_DIR}" || \
+        echo "[patch_ops] WARNING: chat template patch failed"
+else
+    echo "[patch_ops] WARNING: ${MODEL_DIR}/tokenizer_config.json not found"
+fi
+
 build_stage "compiling submission Python sources"
 find . -path './wheels' -prune -o -name '*.py' -print0 | xargs -0 python3 -m py_compile
 
