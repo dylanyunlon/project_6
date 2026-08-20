@@ -312,6 +312,13 @@ def apply():
             _logger.info("ix_startup_patch: %d hot-path patches applied", k)
     except Exception as e:
         _logger.warning("ix_startup_patch: hot-path patches failed: %s", e)
+    try:
+        from ex_engine.python.patch_fused_linear_allreduce import apply_patch as apply_fused_ar
+        apply_fused_ar()
+        n += 1
+        _logger.info("ix_startup_patch: fused linear_allreduce patch applied")
+    except Exception as e:
+        _logger.warning("ix_startup_patch: fused linear_allreduce patch failed: %s", e)
     return n
 # DO NOT call apply() at import time — registry subprocess would crash.
 # apply() is called from qwen3_5.py model init instead.
@@ -478,6 +485,17 @@ if [[ -f "${EX_ENGINE_DIR}/csrc/ix_moe_bridge.cpp" ]]; then
         fi
     done
 fi
+
+build_stage "deploying fused linear+allreduce bridge (ix_full_bridge_fused_ar.so)"
+for src in "${EX_ENGINE_DIR}/prebuilt/ix_full_bridge_fused_ar.so" \
+           "${SCRIPT_DIR}/prebuilt/corex-3.2.3-ivcore10/ix_full_bridge_fused_ar.so"; do
+    if [[ -f "$src" ]]; then
+        cp "$src" "${VLLM_ROOT}/ex_engine/ix_full_bridge_fused_ar.so" 2>/dev/null || true
+        cp "$src" "${VLLM_ROOT}/model_executor/models/ix_full_bridge_fused_ar.so" 2>/dev/null || true
+        echo "[patch_ops] deployed ix_full_bridge_fused_ar.so from prebuilt"
+        break
+    fi
+done
 
 build_stage "deploying all ex_engine Python modules"
 EX_PY_DIR="${VLLM_ROOT}/ex_engine/python"
