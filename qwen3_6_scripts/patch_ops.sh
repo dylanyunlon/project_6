@@ -162,6 +162,12 @@ python3 ./patch_worker_cache_transfer_order.py
 # when context length is high
 cp ./paged_attn.py "${VLLM_ROOT}/attention/ops/paged_attn.py"
 
+# --- multimodal: increase image fetch timeout and add retry ------------------
+# Container networks often cannot reach remote image URLs within the default
+# 5-second timeout.  Raise to 30s and retry 3 times.
+cp ./multimodal_utils.py "${VLLM_ROOT}/multimodal/utils.py"
+cp ./envs.py "${VLLM_ROOT}/envs.py"
+
 # --- model_runner.py: fix prefix_cache_hit stays True in chunked-prefill chunk 2+ ---
 # Bug: _compute_for_prefix_cache_hit Case 1 (prefix_cache_len <= context_len)
 # leaves prefix_cache_hit=True. Then _add_seq_group uses block_table=computed_block_nums
