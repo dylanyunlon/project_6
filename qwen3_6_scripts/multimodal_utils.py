@@ -59,8 +59,19 @@ async def async_fetch_image(image_url: str,
     By default, the image is converted into RGB format.
     """
     if image_url.startswith('http'):
-        image_raw = await global_http_connection.async_get_bytes(
-            image_url, timeout=VLLM_IMAGE_FETCH_TIMEOUT)
+        # [BI100] Retry with increasing timeout for container network issues
+        _last_exc = None
+        for _attempt in range(3):
+            try:
+                _timeout = VLLM_IMAGE_FETCH_TIMEOUT * (_attempt + 1)
+                image_raw = await global_http_connection.async_get_bytes(
+                    image_url, timeout=_timeout)
+                _last_exc = None
+                break
+            except Exception as _e:
+                _last_exc = _e
+        if _last_exc is not None:
+            raise _last_exc
         image = _load_image_from_bytes(image_raw)
 
     elif image_url.startswith('data:image'):

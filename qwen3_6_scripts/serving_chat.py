@@ -121,8 +121,7 @@ def _sequential_greedy_fanout_count(
     """Return the supported deterministic fan-out width, or zero."""
     n = request.n if request.n is not None else 1
     if (
-        max_num_seqs == 1
-        and n == 2
+        n == 2  # [BI100] allow fanout regardless of max_num_seqs
         and request.temperature == 0
         and not request.stream
         and not request.use_beam_search

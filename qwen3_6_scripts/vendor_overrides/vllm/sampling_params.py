@@ -423,9 +423,8 @@ class SamplingParams(
             raise ValueError("best_of must equal n to use output_kind=DELTA")
 
     def _verify_greedy_sampling(self) -> None:
-        if self.n > 1:
-            raise ValueError("n must be 1 when using greedy sampling, "
-                             f"got {self.n}.")
+        # [BI100] Allow n>1 with greedy: results are deterministic duplicates.
+        pass
 
     def update_from_generation_config(
             self,
