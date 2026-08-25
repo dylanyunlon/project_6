@@ -166,6 +166,40 @@ except ImportError:
     except ImportError:
         _xllm_moe = None
 
+# ix_moe_bridge: direct GEMV (4.1x faster than F.linear for decode M=1)
+# Benchmark: F.linear 133us vs br.linear 32us on BI-V100
+try:
+    from vllm import ix_moe_bridge as _ix_moe_bridge
+except ImportError:
+    try:
+        import importlib.util as _ilu
+        for _p in ["/workspace/qwen3_6_scripts/prebuilt/corex-3.2.3-ivcore10/ix_moe_bridge.so",
+                   os.path.join(os.path.dirname(__file__), "prebuilt",
+                                "corex-3.2.3-ivcore10", "ix_moe_bridge.so")]:
+            if os.path.isfile(_p):
+                _spec = _ilu.spec_from_file_location("ix_moe_bridge", _p)
+                _ix_moe_bridge = _ilu.module_from_spec(_spec)
+                _spec.loader.exec_module(_ix_moe_bridge)
+                break
+        else:
+            _ix_moe_bridge = None
+    except Exception:
+        _ix_moe_bridge = None
+_HAS_BRIDGE_LINEAR = (
+    _ix_moe_bridge is not None
+    and hasattr(_ix_moe_bridge, 'linear'))
+if _HAS_BRIDGE_LINEAR:
+    logger.info("ix_moe_bridge.linear ENABLED — 4.1x GEMV speedup for decode")
+
+
+def _fast_linear(x: torch.Tensor, weight: torch.Tensor,
+                 bias=None) -> torch.Tensor:
+    """Drop-in F.linear replacement using ix_moe_bridge GEMV.
+    4.1x faster than F.linear for M=1 decode on BI-V100."""
+    if _HAS_BRIDGE_LINEAR and x.dtype == torch.float16 and weight.dtype == torch.float16:
+        return _ix_moe_bridge.linear(x, weight, bias)
+    return F.linear(x, weight, bias)
+
 try:
     from vllm import corex_gdn_chunk_recurrent as _corex_gdn_chunk_recurrent
 except ImportError:
@@ -1855,7 +1889,7 @@ class Qwen3_5MoeSparseBlock(nn.Module):
             # FC1: single large GEMM via F.linear
             # (1, H) @ (K*2*I, H)^T → (1, K*2*I)
             # Source: base qwen3_5.py — verified on BI-V100 (sub 655 = 683)
-            gate_up = F.linear(
+            gate_up = _fast_linear(
                 hidden_states,
                 w13_sel.reshape(-1, H),                        # (K*2*I, H)
             )                                                  # (1, K*2*I)
@@ -1945,10 +1979,10 @@ class Qwen3_5MoeSparseBlock(nn.Module):
                         continue
                     tok_ids = sorted_tok_ids[start:end]
                     tokens = hidden_states[tok_ids]                # (n, H)
-                    gate_up = F.linear(tokens, w13[eid])           # (n, 2*I)
+                    gate_up = _fast_linear(tokens, w13[eid])           # (n, 2*I)
                     gate, up = gate_up.chunk(2, dim=-1)
                     act = F.silu(gate) * up                        # (n, I)
-                    expert_out = F.linear(act, w2[eid])            # (n, H)
+                    expert_out = _fast_linear(act, w2[eid])            # (n, H)
                     weights = sorted_weights[start:end].unsqueeze(-1)
                     out.index_add_(0, tok_ids, (expert_out * weights).to(out.dtype))
                     start = end
