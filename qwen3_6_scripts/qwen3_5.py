@@ -213,7 +213,7 @@ _USE_COREX_MOE_WEIGHT_GATHER = (
     and env_bool("BI100_MOE_COREX_WEIGHT_GATHER", True))
 _USE_COREX_MOE_DIRECT_ROUTED = (
     _corex_moe_direct_routed is not None
-    and env_bool("BI100_MOE_COREX_DIRECT_ROUTED", False))
+    and env_bool("BI100_MOE_COREX_DIRECT_ROUTED", True))
 _USE_COREX_BATCHED_GEMM = (
     _corex_batched_gemm is not None
     and env_bool("BI100_MOE_BATCHED_GEMM", True))
@@ -1786,37 +1786,38 @@ class Qwen3_5MoeSparseBlock(nn.Module):
             eids    = topk_ids[0]                              # (K,)
             ws      = topk_weights[0].to(hidden_states.dtype)  # (K,)
             # --- corex_moe_direct_routed: zero-copy indexed GEMM (warp64) ---
-            # Shape must match the compiled kernel constants:
-            #   kHidden=2048, kExperts=256, kIntermediate=128, kTopK=8
+            # Compiled kernel constants: kHidden=2048, kExperts=256, kTopK=8
+            # w13 must be (256, 256, 2048), w2 must be (256, 2048, 128)
+            # eids MUST be int64 (verified on real hardware)
+            # act for w2_reduce must be (8, 128) not (1, 1024)
             use_corex_direct = (
                 _USE_COREX_MOE_DIRECT_ROUTED
                 and hidden_states.dtype == torch.float16
                 and w13.dtype == torch.float16
                 and w2.dtype == torch.float16
-                and ws.dtype == torch.float16
-                and hidden_states.is_cuda and w13.is_cuda and w2.is_cuda
-                and eids.is_cuda and ws.is_cuda
+                and hidden_states.is_cuda and w13.is_cuda
                 and hidden_states.is_contiguous()
                 and w13.is_contiguous() and w2.is_contiguous()
-                and eids.is_contiguous() and ws.is_contiguous()
-                and hidden_states.shape == (1, 2048)
                 and w13.shape == (256, 256, 2048)
                 and w2.shape == (256, 2048, 128)
-                and eids.shape == (8,) and ws.shape == (8,))
+                and eids.numel() == 8)
             if not hasattr(self, '_direct_routed_logged'):
                 self._direct_routed_logged = True
                 logger.info(
                     "MoE T=1 direct_routed check: flag=%s match=%s "
-                    "hs=%s w13=%s w2=%s eids=%s ws=%s",
+                    "hs=%s w13=%s w2=%s eids=%s ws=%s dtype_eids=%s",
                     _USE_COREX_MOE_DIRECT_ROUTED, use_corex_direct,
                     tuple(hidden_states.shape), tuple(w13.shape),
-                    tuple(w2.shape), tuple(eids.shape), tuple(ws.shape))
+                    tuple(w2.shape), tuple(eids.shape), tuple(ws.shape),
+                    eids.dtype)
             if use_corex_direct:
+                eids_i64 = eids.to(torch.int64)  # kernel requires int64
                 gate_up = _corex_moe_direct_routed.w13(
-                    hidden_states, w13, eids)
-                act = self.act_fn(gate_up)
+                    hidden_states, w13, eids_i64)              # (8, 256)
+                gate, up = gate_up.chunk(2, dim=-1)            # (8, 128) each
+                act = (torch.nn.functional.silu(gate) * up).contiguous()  # (8, 128)
                 return _corex_moe_direct_routed.w2_reduce(
-                    act, w2, eids, ws)
+                    act, w2, eids_i64, ws)                     # (1, 2048)
 
             # Tier 1.5: CUTLASS batched GEMM (verified 2.462ms, issue #68)
             # 1 launch for 8 experts vs 8 launches for F.linear loop
