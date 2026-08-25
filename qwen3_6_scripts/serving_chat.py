@@ -396,8 +396,23 @@ class OpenAIServingChat(OpenAIServing):
             # OpenAI API: max_completion_tokens takes precedence over max_tokens
             if request.max_completion_tokens is not None and request.max_tokens is None:
                 request.max_tokens = request.max_completion_tokens
-            default_max_tokens = min(self.max_model_len - len(
-                prompt_inputs["prompt_token_ids"]), 8192)
+
+            # [BI100] Adaptive max_tokens based on prompt length.
+            _prompt_len = len(prompt_inputs["prompt_token_ids"])
+            if _prompt_len > 65536:
+                _adaptive_cap = 256
+            elif _prompt_len > 32768:
+                _adaptive_cap = 512
+            elif _prompt_len > 16384:
+                _adaptive_cap = 1024
+            else:
+                _adaptive_cap = 8192
+
+            if request.max_tokens is not None:
+                request.max_tokens = min(request.max_tokens, _adaptive_cap)
+
+            default_max_tokens = min(self.max_model_len - _prompt_len,
+                                     _adaptive_cap)
             if request.use_beam_search:
                 sampling_params = request.to_beam_search_params(
                     default_max_tokens)
@@ -412,7 +427,7 @@ class OpenAIServingChat(OpenAIServing):
                              prompt_adapter_request=prompt_adapter_request)
 
             engine_inputs = TokensPrompt(
-                prompt_token_ids=prompt_inputs["prompt_token_ids"]), 8192)
+                prompt_token_ids=prompt_inputs["prompt_token_ids"])
             if mm_data is not None:
                 engine_inputs["multi_modal_data"] = mm_data
 

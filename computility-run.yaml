@@ -9,9 +9,9 @@ command:
         cp /workspace/qwen3_6_scripts/serving_chat.py "${VLLM_ROOT}/entrypoints/openai/serving_chat.py" 2>/dev/null && echo '[runtime] serving_chat.py redeployed' || echo '[runtime] serving_chat.py redeploy skipped';
         cp /workspace/qwen3_6_scripts/multimodal_utils.py "${VLLM_ROOT}/multimodal/utils.py" 2>/dev/null && echo '[runtime] multimodal_utils.py redeployed' || echo '[runtime] multimodal_utils.py redeploy skipped';
         cp /workspace/qwen3_6_scripts/envs.py "${VLLM_ROOT}/envs.py" 2>/dev/null && echo '[runtime] envs.py redeployed' || echo '[runtime] envs.py redeploy skipped';
-        find "${VLLM_ROOT}" -name '*.pyc' -path '*/openai/*' -delete 2>/dev/null;
-        find "${VLLM_ROOT}" -name '*.pyc' -path '*/multimodal/*' -delete 2>/dev/null;
-        find "${VLLM_ROOT}" -maxdepth 1 -name 'envs*.pyc' -delete 2>/dev/null;
+        cp /workspace/qwen3_6_scripts/vendor_overrides/vllm/sampling_params.py "${VLLM_ROOT}/sampling_params.py" 2>/dev/null && echo '[runtime] sampling_params.py redeployed' || echo '[runtime] sampling_params.py redeploy skipped';
+        find "${VLLM_ROOT}" -name '*.pyc' -delete 2>/dev/null;
+        find "${VLLM_ROOT}" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null;
         exec python3 -m vllm.entrypoints.openai.api_server
         --model /model
         --served-model-name llm
