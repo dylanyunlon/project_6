@@ -467,23 +467,4 @@ find . -path './wheels' -prune -o -name '*.py' -print0 | xargs -0 python3 -m py_
 # Source files (sampling_params.py, serving_chat.py, multimodal_utils.py)
 # are already patched and deployed via cp above.
 # =====================================================================
-build_stage "clearing .pyc caches"
-find "${VLLM_ROOT}" -name '*.pyc' -delete 2>/dev/null || true
-find "${VLLM_ROOT}" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
-
-build_stage "patching config.py for BI100_MAX_NUM_SEQS env override"
-CONFIG_PY="${VLLM_ROOT}/config.py"
-if [ -f "$CONFIG_PY" ] && ! grep -q "BI100_MAX_NUM_SEQS" "$CONFIG_PY"; then
-    sed -i 's/        self\.max_num_seqs = max_num_seqs/        self.max_num_seqs = max_num_seqs\n        import os as _os\n        _mns = _os.environ.get("BI100_MAX_NUM_SEQS")\n        if _mns is not None:\n            self.max_num_seqs = max(int(_mns), self.max_num_seqs)/' "$CONFIG_PY"
-    echo "[patch_ops] config.py: BI100_MAX_NUM_SEQS override applied"
-fi
-
-find "${VLLM_ROOT}" -name '*.pyc' -delete 2>/dev/null || true
-find "${VLLM_ROOT}" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
-
-build_stage "verifying dlopen chain"
-python3 ./verify_dlopen_chain.py --vllm-root "${VLLM_ROOT}" || {
-    echo "[WARN] dlopen chain verification found issues (non-fatal)"
-}
-
 build_stage "patch script completed"
