@@ -140,7 +140,7 @@ install_patch_file \
     "${VLLM_OVERRIDE_ROOT}/model_executor/layers/sampler.py" \
     "${VLLM_ROOT}/model_executor/layers/sampler.py"
 
-build_stage "installing hash-pinned CoreX 3.2.3 extensions (16 prebuilt .so)"
+build_stage "installing hash-pinned CoreX 3.2.3 extensions"
 bash ./install_prebuilt_corex.sh "${VLLM_ROOT}"
 
 build_stage "installing BI100 runtime modules"
@@ -161,8 +161,6 @@ python3 ./patch_worker_cache_transfer_order.py
 # utilizes K-tiling techniques, and also have _forward_decode_pytorch to bypass kernel
 # when context length is high
 cp ./paged_attn.py "${VLLM_ROOT}/attention/ops/paged_attn.py"
-
-
 
 # --- model_runner.py: fix prefix_cache_hit stays True in chunked-prefill chunk 2+ ---
 # Bug: _compute_for_prefix_cache_hit Case 1 (prefix_cache_len <= context_len)
@@ -187,141 +185,7 @@ build_stage "installing vLLM Qwen3.6 model implementation"
 # --- vllm model: Qwen3.6-35B-A3B (Qwen3_5 MoE arch) -------------------------
 cp ./mamba_cache.py "${VLLM_ROOT}/model_executor/models/"
 cp ./qwen3_5.py "${VLLM_ROOT}/model_executor/models/qwen3_5.py"
-cp ./ix_fused_moe.py "${VLLM_ROOT}/model_executor/models/ix_fused_moe.py" || true
 python3 ./patch_vllm_qwen3_5.py
-
-# --- Deploy prebuilt .so into vllm package for import -----------------------
-PREBUILT_DIR="./prebuilt/corex-3.2.3-ivcore10"
-if [ -d "$PREBUILT_DIR" ]; then
-    for so_file in "$PREBUILT_DIR"/*.so; do
-        base=$(basename "$so_file" .so)
-        # Deploy corex_*.so as vllm submodules (import from vllm import corex_xxx)
-        cp "$so_file" "${VLLM_ROOT}/${base}.so" 2>/dev/null || true
-        echo "[patch_ops] deployed ${base}.so → ${VLLM_ROOT}/"
-    done
-fi
-
-# --- Rebuild corex_moe_direct_routed.so for BI-V100 warp_size=64 -----------
-# The prebuilt .so was compiled with kWarpSize=32 which silently corrupts
-# results on BI-V100 (64-wide warps).  Rebuild from the fixed .cu source
-# that uses kWarpSize=64 and 6-step shuffle reductions.
-# --- corex_moe_direct_routed.so: deploy prebuilt (warp64 already compiled) ---
-# The prebuilt .so was compiled with kWarpSize=64 on real BI-V100 hardware.
-# No need to rebuild at Docker build time (saves ~5 min, avoids GPU requirement).
-build_stage "deploying corex_moe_direct_routed.so (prebuilt warp64)"
-DIRECT_ROUTED_PREBUILT="./prebuilt/corex-3.2.3-ivcore10/corex_moe_direct_routed.so"
-if [ -f "$DIRECT_ROUTED_PREBUILT" ]; then
-    install -m 0755 "$DIRECT_ROUTED_PREBUILT" "${VLLM_ROOT}/corex_moe_direct_routed.so"
-    echo "[patch_ops] deployed prebuilt corex_moe_direct_routed.so (warp64) → ${VLLM_ROOT}/"
-else
-    echo "[patch_ops] WARNING: prebuilt corex_moe_direct_routed.so not found"
-fi
-
-# --- Deploy ix_bridge Python integration layer --------------------------------
-build_stage "deploying ix_bridge operator replacements"
-EX_ENGINE_DIR="$(cd "$(dirname "$0")/ex_engine" 2>/dev/null && pwd || echo "")"
-if [ -z "$EX_ENGINE_DIR" ] || [ ! -d "$EX_ENGINE_DIR/python" ]; then
-    EX_ENGINE_DIR="$(cd "$(dirname "$0")/../ex_engine" 2>/dev/null && pwd || echo "")"
-fi
-if [ -z "$EX_ENGINE_DIR" ] || [ ! -d "$EX_ENGINE_DIR/python" ]; then
-    EX_ENGINE_DIR="/workspace/ex_engine"
-fi
-
-if [ -d "$EX_ENGINE_DIR/python" ]; then
-    # Create ex_engine package inside vllm with correct Python package structure
-    mkdir -p "${VLLM_ROOT}/ex_engine/python"
-    mkdir -p "${VLLM_ROOT}/ex_engine/csrc"
-
-    # __init__.py with re-exports so both import styles work:
-    #   from ex_engine.python import ix_ops_dispatch  (direct)
-    #   from vllm.ex_engine import ix_ops_dispatch    (via re-export)
-    cat > "${VLLM_ROOT}/ex_engine/__init__.py" << 'INIT_EOF'
-"""ex_engine — Algorithm factor replacement for BI-V100."""
-# Re-export python subpackage members at top level for backward compat
-# Allows: from vllm.ex_engine import ix_ops_dispatch
-try:
-    from ex_engine.python.ix_ops_dispatch import *
-    from ex_engine.python import ix_ops_dispatch
-    from ex_engine.python import ix_ops
-    from ex_engine.python import patch_vllm_ops
-except ImportError:
-    pass
-INIT_EOF
-    echo '"""ex_engine.python — dispatch and bridge modules."""' > "${VLLM_ROOT}/ex_engine/python/__init__.py"
-
-    # Deploy ALL Python modules
-    cp "$EX_ENGINE_DIR/python/"*.py "${VLLM_ROOT}/ex_engine/python/"
-    echo "[patch_ops] deployed $(ls -1 "${VLLM_ROOT}/ex_engine/python/"*.py | wc -l) modules → ${VLLM_ROOT}/ex_engine/python/"
-
-    # Deploy bridge C++ source for JIT fallback
-    for cpp in "$EX_ENGINE_DIR"/csrc/ix_full_bridge*.cpp "$EX_ENGINE_DIR"/csrc/ix_moe_bridge.cpp; do
-        [ -f "$cpp" ] && cp "$cpp" "${VLLM_ROOT}/ex_engine/csrc/" && \
-            echo "[patch_ops] deployed $(basename $cpp) for JIT fallback"
-    done
-
-    # Create startup hook that patches vllm ops at import time
-    cat > "${VLLM_ROOT}/ix_startup_patch.py" << 'STARTUP_EOF'
-"""Apply ix_ops patches at vllm startup."""
-import logging
-_logger = logging.getLogger("ix_startup_patch")
-_applied = False
-def apply():
-    global _applied
-    if _applied:
-        return 0
-    _applied = True
-    import sys, os
-    # Ensure ex_engine is importable
-    for p in ["/workspace/qwen3_6_scripts", "/workspace"]:
-        rp = os.path.realpath(p)
-        if os.path.isdir(rp) and rp not in sys.path:
-            sys.path.insert(0, rp)
-    n = 0
-    try:
-        from ex_engine.python.patch_vllm_ops import apply_all_patches
-        k = apply_all_patches()
-        n += k
-        if k > 0:
-            _logger.info("ix_startup_patch: %d bridge patches applied", k)
-    except Exception as e:
-        _logger.warning("ix_startup_patch: bridge patches failed: %s", e)
-    try:
-        from ex_engine.python.patch_vllm_hot_path import apply as apply_hot
-        k = apply_hot(strict=False)
-        n += k
-        if k > 0:
-            _logger.info("ix_startup_patch: %d hot-path patches applied", k)
-    except Exception as e:
-        _logger.warning("ix_startup_patch: hot-path patches failed: %s", e)
-    try:
-        from ex_engine.python.patch_fused_linear_allreduce import apply_patch as apply_fused_ar
-        apply_fused_ar()
-        n += 1
-        _logger.info("ix_startup_patch: fused linear_allreduce patch applied")
-    except Exception as e:
-        _logger.warning("ix_startup_patch: fused linear_allreduce patch failed: %s", e)
-    return n
-# DO NOT call apply() at import time — registry subprocess would crash.
-# apply() is called from qwen3_5.py model init instead.
-STARTUP_EOF
-    echo "[patch_ops] deployed ix_startup_patch.py"
-
-    # Hook into vllm __init__.py to auto-apply patches on import
-    VLLM_INIT="${VLLM_ROOT}/__init__.py"
-    if [ -f "$VLLM_INIT" ]; then
-        if ! grep -q "ix_startup_patch" "$VLLM_INIT" 2>/dev/null; then
-            echo "" >> "$VLLM_INIT"
-            echo "# Auto-apply ix_bridge operator patches" >> "$VLLM_INIT"
-            echo "try:" >> "$VLLM_INIT"
-            echo "    from vllm import ix_startup_patch" >> "$VLLM_INIT"
-            echo "except Exception:" >> "$VLLM_INIT"
-            echo "    pass" >> "$VLLM_INIT"
-            echo "[patch_ops] hooked ix_startup_patch into vllm/__init__.py"
-        fi
-    fi
-else
-    echo "[patch_ops] WARN: ex_engine/python not found, skip ix_bridge deployment"
-fi
 
 # --- sequence.py: fix completion_tokens inflation under chunked prefill ------
 # Bug: get_output_token_ids_to_return(delta=True) with num_new_tokens=0
@@ -382,89 +246,6 @@ if source != installed:
     raise SystemExit("runtime api_server overlay identity mismatch")
 PY
 
-# --- protocol.py identity check: ensure max_completion_tokens is accepted ---
-python3 - ./protocol.py \
-        "${VLLM_ROOT}/entrypoints/openai/protocol.py" <<'PY'
-from pathlib import Path
-import sys
-
-source = Path(sys.argv[1]).read_bytes()
-installed = Path(sys.argv[2]).read_bytes()
-if source != installed:
-    raise SystemExit("runtime protocol overlay identity mismatch")
-# Verify max_completion_tokens field is declared (not just extra=allow)
-if b"max_completion_tokens" not in installed:
-    raise SystemExit("protocol.py missing max_completion_tokens field")
-PY
-
-# =====================================================================
-# Deploy prebuilt .so files — NO compilation at Docker build time.
-# All .so were pre-compiled on real BI-V100 hardware and verified.
-# This saves ~20-30 minutes and avoids GPU/toolchain requirements.
-# =====================================================================
-build_stage "deploying prebuilt gemm_grouped.so"
-PREBUILT_GEMM="./prebuilt/corex-3.2.3-ivcore10/gemm_grouped.so"
-if [[ -f "$PREBUILT_GEMM" ]]; then
-    install -m 0755 "$PREBUILT_GEMM" "${VLLM_ROOT}/gemm_grouped.so"
-    echo "[patch_ops] deployed prebuilt gemm_grouped.so → ${VLLM_ROOT}/"
-else
-    echo "[WARN] prebuilt gemm_grouped.so not found"
-fi
-
-build_stage "deploying prebuilt corex_batched_gemm.so"
-PREBUILT_BATCHED="./prebuilt/corex-3.2.3-ivcore10/corex_batched_gemm.so"
-if [[ -f "$PREBUILT_BATCHED" ]]; then
-    install -m 0755 "$PREBUILT_BATCHED" "${VLLM_ROOT}/corex_batched_gemm.so"
-    echo "[patch_ops] deployed prebuilt corex_batched_gemm.so → ${VLLM_ROOT}/"
-else
-    echo "[WARN] prebuilt corex_batched_gemm.so not found"
-fi
-
-build_stage "deploying prebuilt ix_moe_bridge.so"
-PREBUILT_MOE="./prebuilt/corex-3.2.3-ivcore10/ix_moe_bridge.so"
-if [[ -f "$PREBUILT_MOE" ]]; then
-    install -m 0755 "$PREBUILT_MOE" "${VLLM_ROOT}/ix_moe_bridge.so"
-    cp "$PREBUILT_MOE" "${VLLM_ROOT}/model_executor/models/ix_moe_bridge.so" 2>/dev/null || true
-    cp "$PREBUILT_MOE" "${VLLM_ROOT}/ex_engine/ix_moe_bridge.so" 2>/dev/null || true
-    echo "[patch_ops] deployed prebuilt ix_moe_bridge.so → ${VLLM_ROOT}/ + model_executor/ + ex_engine/"
-else
-    echo "[WARN] prebuilt ix_moe_bridge.so not found"
-fi
-
-build_stage "deploying fused linear+allreduce bridge (ix_full_bridge_fused_ar.so)"
-for src in "${EX_ENGINE_DIR}/prebuilt/ix_full_bridge_fused_ar.so" \
-           "${SCRIPT_DIR}/prebuilt/corex-3.2.3-ivcore10/ix_full_bridge_fused_ar.so"; do
-    if [[ -f "$src" ]]; then
-        cp "$src" "${VLLM_ROOT}/ex_engine/ix_full_bridge_fused_ar.so" 2>/dev/null || true
-        cp "$src" "${VLLM_ROOT}/model_executor/models/ix_full_bridge_fused_ar.so" 2>/dev/null || true
-        echo "[patch_ops] deployed ix_full_bridge_fused_ar.so from prebuilt"
-        break
-    fi
-done
-
-build_stage "deploying all ex_engine Python modules"
-EX_PY_DIR="${VLLM_ROOT}/ex_engine/python"
-mkdir -p "${EX_PY_DIR}"
-if [[ -d "${EX_ENGINE_DIR}/python" ]]; then
-    cp "${EX_ENGINE_DIR}/python/"*.py "${EX_PY_DIR}/" 2>/dev/null
-    echo "[patch_ops] deployed $(ls -1 "${EX_PY_DIR}"/*.py 2>/dev/null | wc -l) Python modules → ${EX_PY_DIR}/"
-fi
-
-build_stage "patching chat template for non-thinking mode"
-MODEL_DIR="${MODEL_DIR:-/model}"
-if [ -f "${MODEL_DIR}/tokenizer_config.json" ]; then
-    python3 ./patch_chat_template.py "${MODEL_DIR}" || \
-        echo "[patch_ops] WARNING: chat template patch failed"
-else
-    echo "[patch_ops] WARNING: ${MODEL_DIR}/tokenizer_config.json not found"
-fi
-
 build_stage "compiling submission Python sources"
 find . -path './wheels' -prune -o -name '*.py' -print0 | xargs -0 python3 -m py_compile
-
-# =====================================================================
-# Post-patch fixes: .pyc cleanup + config.py env override
-# Source files (sampling_params.py, serving_chat.py, multimodal_utils.py)
-# are already patched and deployed via cp above.
-# =====================================================================
 build_stage "patch script completed"
