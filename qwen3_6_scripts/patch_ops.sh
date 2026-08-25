@@ -209,37 +209,16 @@ fi
 # The prebuilt .so was compiled with kWarpSize=32 which silently corrupts
 # results on BI-V100 (64-wide warps).  Rebuild from the fixed .cu source
 # that uses kWarpSize=64 and 6-step shuffle reductions.
-build_stage "rebuilding corex_moe_direct_routed.so (warp64)"
-COREX_ROOT="${COREX_ROOT:-/usr/local/corex-3.2.3}"
-if [ ! -d "$COREX_ROOT" ]; then
-    COREX_ROOT="/usr/local/corex"
-fi
-TORCH_ROOT="${TORCH_ROOT:-$(python3 -c 'import torch,os;print(os.path.dirname(torch.__file__))' 2>/dev/null || echo "${COREX_ROOT}/lib64/python3/dist-packages/torch")}"
-DIRECT_ROUTED_SRC="./corex_moe_direct_routed.cu"
-DIRECT_ROUTED_DST="${VLLM_ROOT}/corex_moe_direct_routed.so"
-if [ -f "$DIRECT_ROUTED_SRC" ] && [ -x "${COREX_ROOT}/bin/clang++" ]; then
-    "${COREX_ROOT}/bin/clang++" \
-        -std=c++17 -O3 -shared -fPIC \
-        --cuda-path="${COREX_ROOT}" --cuda-gpu-arch=ivcore10 \
-        --no-cuda-version-check -D_GLIBCXX_USE_CXX11_ABI=0 \
-        -DTORCH_EXTENSION_NAME=corex_moe_direct_routed \
-        -DTORCH_API_INCLUDE_EXTENSION_H \
-        -I"${TORCH_ROOT}/include" \
-        -I"${TORCH_ROOT}/include/torch/csrc/api/include" \
-        -I"${TORCH_ROOT}/include/TH" -I"${TORCH_ROOT}/include/THC" \
-        -I/usr/local/include/python3.10 \
-        "$DIRECT_ROUTED_SRC" \
-        -L"${TORCH_ROOT}/lib" -L"${COREX_ROOT}/lib64" \
-        -Wl,-rpath,"${TORCH_ROOT}/lib" -Wl,-rpath,"${COREX_ROOT}/lib64" \
-        -ltorch_python -ltorch_cuda -ltorch_cpu -ltorch \
-        -lc10_cuda -lc10 -lcudart \
-        -o "$DIRECT_ROUTED_DST" 2>&1 && \
-    echo "[patch_ops] REBUILT corex_moe_direct_routed.so (warp64) → ${DIRECT_ROUTED_DST}" || \
-    echo "[patch_ops] WARNING: corex_moe_direct_routed.so rebuild FAILED, using prebuilt"
-elif [ ! -x "${COREX_ROOT}/bin/clang++" ]; then
-    echo "[patch_ops] WARNING: CoreX clang++ not found at ${COREX_ROOT}/bin/clang++, cannot rebuild direct_routed"
+# --- corex_moe_direct_routed.so: deploy prebuilt (warp64 already compiled) ---
+# The prebuilt .so was compiled with kWarpSize=64 on real BI-V100 hardware.
+# No need to rebuild at Docker build time (saves ~5 min, avoids GPU requirement).
+build_stage "deploying corex_moe_direct_routed.so (prebuilt warp64)"
+DIRECT_ROUTED_PREBUILT="./prebuilt/corex-3.2.3-ivcore10/corex_moe_direct_routed.so"
+if [ -f "$DIRECT_ROUTED_PREBUILT" ]; then
+    install -m 0755 "$DIRECT_ROUTED_PREBUILT" "${VLLM_ROOT}/corex_moe_direct_routed.so"
+    echo "[patch_ops] deployed prebuilt corex_moe_direct_routed.so (warp64) → ${VLLM_ROOT}/"
 else
-    echo "[patch_ops] WARNING: ${DIRECT_ROUTED_SRC} not found, cannot rebuild direct_routed"
+    echo "[patch_ops] WARNING: prebuilt corex_moe_direct_routed.so not found"
 fi
 
 # --- Deploy ix_bridge Python integration layer --------------------------------
@@ -422,74 +401,38 @@ if b"max_completion_tokens" not in installed:
     raise SystemExit("protocol.py missing max_completion_tokens field")
 PY
 
-build_stage "building CUTLASS grouped GEMM (gemm_grouped.so)"
-if [[ -f "${EX_ENGINE_DIR}/build_gemm_grouped.sh" ]]; then
-    bash "${EX_ENGINE_DIR}/build_gemm_grouped.sh" 2>&1 || {
-        echo "[WARN] gemm_grouped build failed — will use torch.mm fallback"
-    }
-    # Deploy compiled .so if it exists
-    for so in "${EX_ENGINE_DIR}"/gemm_grouped.so "${EX_ENGINE_DIR}"/csrc/gemm_grouped.so; do
-        if [[ -f "$so" ]]; then
-            cp "$so" "${VLLM_ROOT}/gemm_grouped.so"
-            echo "[patch_ops] deployed gemm_grouped.so → ${VLLM_ROOT}/"
-            break
-        fi
-    done
+# =====================================================================
+# Deploy prebuilt .so files — NO compilation at Docker build time.
+# All .so were pre-compiled on real BI-V100 hardware and verified.
+# This saves ~20-30 minutes and avoids GPU/toolchain requirements.
+# =====================================================================
+build_stage "deploying prebuilt gemm_grouped.so"
+PREBUILT_GEMM="./prebuilt/corex-3.2.3-ivcore10/gemm_grouped.so"
+if [[ -f "$PREBUILT_GEMM" ]]; then
+    install -m 0755 "$PREBUILT_GEMM" "${VLLM_ROOT}/gemm_grouped.so"
+    echo "[patch_ops] deployed prebuilt gemm_grouped.so → ${VLLM_ROOT}/"
+else
+    echo "[WARN] prebuilt gemm_grouped.so not found"
 fi
 
-build_stage "building CUTLASS batched GEMM (corex_batched_gemm.so)"
-if [[ -f "${EX_ENGINE_DIR}/xllm_kernels/cuda/corex_batched_gemm_kernel.cu" ]]; then
-    python3 << PYEOF
-import os, sys, shutil
-try:
-    from torch.utils.cpp_extension import load
-    ex = "${EX_ENGINE_DIR}"
-    cutlass_inc = ""
-    for d in ["/usr/local/corex-samples-3.2.3_x86_64/samples/cutlass/include",
-              "/usr/local/corex/include/cutlass", "/usr/include/cutlass"]:
-        if os.path.isdir(d):
-            cutlass_inc = d
-            break
-    if not cutlass_inc:
-        print("[batched_gemm] No cutlass headers — skip"); sys.exit(0)
-    mod = load(
-        name="corex_batched_gemm",
-        sources=[
-            os.path.join(ex, "xllm_kernels/cuda/corex_batched_gemm_kernel.cu"),
-            os.path.join(ex, "xllm_kernels/cuda/bindings/corex_batched_gemm_bind.cpp"),
-        ],
-        extra_include_paths=[cutlass_inc],
-        extra_cflags=["-O2", "-std=c++17"],
-        extra_cuda_cflags=["-O2", f"-I{cutlass_inc}"],
-        extra_ldflags=["/usr/local/corex/lib64/libcuinfer.so", "-Wl,-rpath,/usr/local/corex/lib64"],
-        verbose=False,
-    )
-    print("[batched_gemm] ✓ Compiled")
-    import importlib
-    spec = importlib.util.find_spec("corex_batched_gemm")
-    if spec and spec.origin:
-        shutil.copy2(spec.origin, "${VLLM_ROOT}/corex_batched_gemm.so")
-        print("[batched_gemm] ✓ Deployed to ${VLLM_ROOT}/")
-except Exception as e:
-    print(f"[batched_gemm] WARN: {e}")
-PYEOF
+build_stage "deploying prebuilt corex_batched_gemm.so"
+PREBUILT_BATCHED="./prebuilt/corex-3.2.3-ivcore10/corex_batched_gemm.so"
+if [[ -f "$PREBUILT_BATCHED" ]]; then
+    install -m 0755 "$PREBUILT_BATCHED" "${VLLM_ROOT}/corex_batched_gemm.so"
+    echo "[patch_ops] deployed prebuilt corex_batched_gemm.so → ${VLLM_ROOT}/"
+else
+    echo "[WARN] prebuilt corex_batched_gemm.so not found"
 fi
 
-build_stage "building MoE bridge (ix_moe_bridge.so)"
-if [[ -f "${EX_ENGINE_DIR}/csrc/ix_moe_bridge.cpp" ]]; then
-    SCRIPT_DIR="${EX_ENGINE_DIR}" bash "${EX_ENGINE_DIR}/build_moe_bridge.sh" "${VLLM_ROOT}" 2>&1 || {
-        echo "[WARN] MoE bridge build failed — will use Python fallback"
-    }
-    # Deploy .so to all paths ix_fused_moe.py searches
-    for src in "${VLLM_ROOT}/ex_engine/ix_moe_bridge.so" \
-               "${EX_ENGINE_DIR}/prebuilt/ix_moe_bridge.so"; do
-        if [[ -f "$src" ]]; then
-            cp "$src" "${VLLM_ROOT}/ix_moe_bridge.so" 2>/dev/null || true
-            cp "$src" "${VLLM_ROOT}/model_executor/models/ix_moe_bridge.so" 2>/dev/null || true
-            echo "[patch_ops] deployed ix_moe_bridge.so to vllm search paths"
-            break
-        fi
-    done
+build_stage "deploying prebuilt ix_moe_bridge.so"
+PREBUILT_MOE="./prebuilt/corex-3.2.3-ivcore10/ix_moe_bridge.so"
+if [[ -f "$PREBUILT_MOE" ]]; then
+    install -m 0755 "$PREBUILT_MOE" "${VLLM_ROOT}/ix_moe_bridge.so"
+    cp "$PREBUILT_MOE" "${VLLM_ROOT}/model_executor/models/ix_moe_bridge.so" 2>/dev/null || true
+    cp "$PREBUILT_MOE" "${VLLM_ROOT}/ex_engine/ix_moe_bridge.so" 2>/dev/null || true
+    echo "[patch_ops] deployed prebuilt ix_moe_bridge.so → ${VLLM_ROOT}/ + model_executor/ + ex_engine/"
+else
+    echo "[WARN] prebuilt ix_moe_bridge.so not found"
 fi
 
 build_stage "deploying fused linear+allreduce bridge (ix_full_bridge_fused_ar.so)"
