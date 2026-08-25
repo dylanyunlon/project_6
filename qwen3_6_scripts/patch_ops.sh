@@ -467,149 +467,21 @@ build_stage "compiling submission Python sources"
 find . -path './wheels' -prune -o -name '*.py' -print0 | xargs -0 python3 -m py_compile
 
 # =====================================================================
-# FIX 1: Clear .pyc cache — prevents stale base-image protocol.py from
-#        shadowing our patched version (root cause of 221× max_completion_tokens
-#        extra_forbidden 400 errors in sub791).
+# Post-patch fixes: .pyc cleanup + config.py env override
+# Source files (sampling_params.py, serving_chat.py, multimodal_utils.py)
+# are already patched and deployed via cp above.
 # =====================================================================
 build_stage "clearing .pyc caches"
 find "${VLLM_ROOT}" -name '*.pyc' -delete 2>/dev/null || true
 find "${VLLM_ROOT}" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
-echo "[patch_ops] cleared all .pyc under ${VLLM_ROOT}"
 
-# =====================================================================
-# FIX 2: Allow greedy sampling with n>1 — fixes t2_n_2 functional test.
-#        vLLM rejects n=2+temperature=0 in SamplingParams._verify_greedy_sampling.
-#        For greedy, n identical copies are deterministic; allow it and let
-#        serving_chat.py's sequential fanout handle the duplication.
-# =====================================================================
-build_stage "patching SamplingParams to allow greedy n>1"
-SAMPLING_PY="${VLLM_ROOT}/sampling_params.py"
-if [ -f "$SAMPLING_PY" ]; then
-    python3 - "$SAMPLING_PY" << 'FIXPY'
-import sys, re
-path = sys.argv[1]
-src = open(path).read()
-# Replace the _verify_greedy_sampling body: allow n>1 silently
-old = '''    def _verify_greedy_sampling(self) -> None:
-        if self.n > 1:
-            raise ValueError("n must be 1 when using greedy sampling, "
-                             f"got {self.n}.")'''
-new = '''    def _verify_greedy_sampling(self) -> None:
-        # [BI100] Allow n>1 with greedy: results are deterministic duplicates.
-        pass'''
-if old in src:
-    src = src.replace(old, new)
-    open(path, 'w').write(src)
-    print(f"[patch_ops] SamplingParams: greedy n>1 allowed")
-else:
-    print(f"[patch_ops] SamplingParams: pattern not found, trying regex")
-    src2 = re.sub(
-        r'(def _verify_greedy_sampling\(self\)[^:]*:)\s*\n\s*if self\.n > 1:\s*\n\s*raise ValueError\([^)]+\)',
-        r'\1\n        # [BI100] Allow n>1 with greedy.\n        pass',
-        src)
-    if src2 != src:
-        open(path, 'w').write(src2)
-        print(f"[patch_ops] SamplingParams: greedy n>1 allowed (regex)")
-    else:
-        print(f"[WARN] SamplingParams: could not patch _verify_greedy_sampling")
-FIXPY
-fi
-
-# Also fix serving_chat.py fanout: remove max_num_seqs==1 restriction
-build_stage "patching serving_chat.py fanout for n=2"
-SERVING_CHAT="${VLLM_ROOT}/entrypoints/openai/serving_chat.py"
-if [ -f "$SERVING_CHAT" ]; then
-    python3 - "$SERVING_CHAT" << 'FIXPY'
-import sys
-path = sys.argv[1]
-src = open(path).read()
-# Widen fanout: drop the max_num_seqs == 1 restriction so n=2 works
-# regardless of the platform's max_num_seqs setting
-old = "        max_num_seqs == 1\n        and n == 2"
-new = "        n == 2  # [BI100] allow fanout regardless of max_num_seqs"
-if old in src:
-    src = src.replace(old, new)
-    open(path, 'w').write(src)
-    print("[patch_ops] serving_chat: fanout max_num_seqs restriction removed")
-else:
-    print("[WARN] serving_chat: fanout pattern not found")
-FIXPY
-fi
-
-# =====================================================================
-# FIX 3: Ensure max_num_seqs >= 2 at runtime — allows n=2 via native
-#        vLLM path when platform sets max_num_seqs=1.
-#        Read BI100_MAX_NUM_SEQS env to override command-line value.
-# =====================================================================
-build_stage "patching SchedulerConfig for max_num_seqs override"
+build_stage "patching config.py for BI100_MAX_NUM_SEQS env override"
 CONFIG_PY="${VLLM_ROOT}/config.py"
-if [ -f "$CONFIG_PY" ]; then
-    python3 - "$CONFIG_PY" << 'FIXPY'
-import sys
-path = sys.argv[1]
-src = open(path).read()
-marker = "# [BI100] max_num_seqs env override"
-if marker in src:
-    print("[patch_ops] config.py: max_num_seqs override already patched")
-else:
-    old = "        self.max_num_seqs = max_num_seqs"
-    new = """        self.max_num_seqs = max_num_seqs
-        # [BI100] max_num_seqs env override
-        import os as _os
-        _mns_override = _os.environ.get("BI100_MAX_NUM_SEQS")
-        if _mns_override is not None:
-            self.max_num_seqs = max(int(_mns_override), self.max_num_seqs)"""
-    if old in src:
-        src = src.replace(old, new, 1)
-        open(path, 'w').write(src)
-        print(f"[patch_ops] config.py: max_num_seqs env override patched")
-    else:
-        print(f"[WARN] config.py: max_num_seqs assignment not found")
-FIXPY
+if [ -f "$CONFIG_PY" ] && ! grep -q "BI100_MAX_NUM_SEQS" "$CONFIG_PY"; then
+    sed -i 's/        self\.max_num_seqs = max_num_seqs/        self.max_num_seqs = max_num_seqs\n        import os as _os\n        _mns = _os.environ.get("BI100_MAX_NUM_SEQS")\n        if _mns is not None:\n            self.max_num_seqs = max(int(_mns), self.max_num_seqs)/' "$CONFIG_PY"
+    echo "[patch_ops] config.py: BI100_MAX_NUM_SEQS override applied"
 fi
 
-# =====================================================================
-# FIX 4: Multimodal image fetch — increase timeout and add retry for
-#        remote images to fix t13_multimodal_base64 (HTTP timeout in
-#        Docker container network).
-# =====================================================================
-build_stage "patching multimodal image fetch timeout"
-MM_UTILS="${VLLM_ROOT}/multimodal/utils.py"
-if [ -f "$MM_UTILS" ]; then
-    python3 - "$MM_UTILS" << 'FIXPY'
-import sys
-path = sys.argv[1]
-src = open(path).read()
-# Increase timeout and add retry
-old = """    if image_url.startswith('http'):
-        image_raw = await global_http_connection.async_get_bytes(
-            image_url, timeout=VLLM_IMAGE_FETCH_TIMEOUT)
-        image = _load_image_from_bytes(image_raw)"""
-new = """    if image_url.startswith('http'):
-        # [BI100] Retry with increasing timeout for container network issues
-        _last_exc = None
-        for _attempt in range(3):
-            try:
-                _timeout = VLLM_IMAGE_FETCH_TIMEOUT * (_attempt + 1)
-                image_raw = await global_http_connection.async_get_bytes(
-                    image_url, timeout=_timeout)
-                _last_exc = None
-                break
-            except Exception as _e:
-                _last_exc = _e
-        if _last_exc is not None:
-            raise _last_exc
-        image = _load_image_from_bytes(image_raw)"""
-if old in src:
-    src = src.replace(old, new)
-    open(path, 'w').write(src)
-    print("[patch_ops] multimodal: image fetch retry patched")
-else:
-    print("[WARN] multimodal: image fetch pattern not found")
-FIXPY
-fi
-
-# Clear .pyc again after all patches
 find "${VLLM_ROOT}" -name '*.pyc' -delete 2>/dev/null || true
 find "${VLLM_ROOT}" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 
