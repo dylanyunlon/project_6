@@ -227,6 +227,13 @@ python3 ./patch_vllm_tool_parser.py
 # Adds --reasoning-parser qwen3 support.
 # Routes thinking tokens to reasoning_content, rest to content in the delta.
 # Works together with --tool-call-parser qwen3_coder (think → tool call flow).
+#
+# PRD #69: Clear __pycache__ BEFORE copying patched .py files.
+# Base image's compiled .pyc (protocol.py with extra="forbid") would otherwise
+# shadow our patched .py, causing ~25% of requests to reject
+# max_completion_tokens / reasoning_effort with HTTP 400.
+find "${VLLM_ROOT}/entrypoints" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
 cp -r ./reasoning "${VLLM_ROOT}/"
 cp ./protocol.py "${VLLM_ROOT}/entrypoints/openai/protocol.py"
 cp ./cli_args.py "${VLLM_ROOT}/entrypoints/openai/cli_args.py"
@@ -245,6 +252,11 @@ installed = Path(sys.argv[2]).read_bytes()
 if source != installed:
     raise SystemExit("runtime api_server overlay identity mismatch")
 PY
+
+# PRD #69: Clear ALL __pycache__ under VLLM_ROOT after every cp/patch is done.
+# py_compile below only compiles ./qwen3_6_scripts, not VLLM_ROOT, so this
+# ensures the docker snapshot has no stale .pyc for any patched vllm module.
+find "${VLLM_ROOT}" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
 build_stage "compiling submission Python sources"
 find . -path './wheels' -prune -o -name '*.py' -print0 | xargs -0 python3 -m py_compile
