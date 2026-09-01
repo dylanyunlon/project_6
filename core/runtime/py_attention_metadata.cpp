@@ -341,3 +341,8 @@ py::object PyAttentionMetadataView::optional_tensor(
 }
 
 }  // namespace project6
+
+PYBIND11_MODULE(py_attention_metadata, m) {
+  m.doc() = "DP-aware attention metadata (project6, ported from xLLM PR #2258)";
+  project6::register_attention_metadata_views(m);
+}
