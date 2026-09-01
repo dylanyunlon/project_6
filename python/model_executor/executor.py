@@ -120,13 +120,8 @@ class ModelExecutor:
         ).lower()
         graph_disabled = graph_backend in ("", "off", "none", "0")
         if graph_disabled and config.get("enable_graph", False):
-            # Default to ACL graph on NPU platforms
-            try:
-                import torch_npu  # noqa: F401
-
-                return "aclgraph"
-            except ImportError:
-                pass
+            import torch_npu  # noqa: F401
+            return "aclgraph"
         return graph_backend
 
     @torch.inference_mode()

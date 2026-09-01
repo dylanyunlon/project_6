@@ -104,15 +104,11 @@ def _dp_all_gather(
     """All-gather ``tensor`` along ``dim`` across the DP process group."""
     if world_size <= 1:
         return tensor
-    try:
-        from vllm.distributed import get_dp_group
-        group = get_dp_group()
-        gathered = [torch.empty_like(tensor) for _ in range(world_size)]
-        torch.distributed.all_gather(gathered, tensor, group=group)
-        return torch.cat(gathered, dim=dim)
-    except (ImportError, RuntimeError):
-        # Fallback: repeat for testing without actual distributed backend
-        return tensor.repeat(world_size, *([1] * (tensor.dim() - 1)))
+    from vllm.distributed import get_dp_group
+    group = get_dp_group()
+    gathered = [torch.empty_like(tensor) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered, tensor, group=group)
+    return torch.cat(gathered, dim=dim)
 
 
 def _dp_all_gather_variable(
@@ -123,20 +119,17 @@ def _dp_all_gather_variable(
 ) -> torch.Tensor:
     """Variable-length all-gather: each rank contributes a different number
     of tokens.  Returns a compact concatenation without padding."""
-    try:
-        from vllm.distributed import get_dp_group
-        group = get_dp_group()
-        world_size = len(token_counts)
-        hidden_dim = tensor.shape[1] if tensor.dim() > 1 else 1
-        recv_tensors = []
-        for i, count in enumerate(token_counts):
-            if i == dp_rank:
-                recv_tensors.append(tensor[:count])
-            else:
-                recv_tensors.append(
-                    torch.empty(count, hidden_dim, dtype=tensor.dtype, device=tensor.device)
-                )
-        torch.distributed.all_gather(recv_tensors, tensor[:token_counts[dp_rank]], group=group)
-        return torch.cat(recv_tensors, dim=0)
-    except (ImportError, RuntimeError):
-        return tensor
+    from vllm.distributed import get_dp_group
+    group = get_dp_group()
+    world_size = len(token_counts)
+    hidden_dim = tensor.shape[1] if tensor.dim() > 1 else 1
+    recv_tensors = []
+    for i, count in enumerate(token_counts):
+        if i == dp_rank:
+            recv_tensors.append(tensor[:count])
+        else:
+            recv_tensors.append(
+                torch.empty(count, hidden_dim, dtype=tensor.dtype, device=tensor.device)
+            )
+    torch.distributed.all_gather(recv_tensors, tensor[:token_counts[dp_rank]], group=group)
+    return torch.cat(recv_tensors, dim=0)
