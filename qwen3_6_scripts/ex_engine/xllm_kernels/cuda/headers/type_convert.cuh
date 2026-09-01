@@ -57,7 +57,7 @@ class _typeConvert<float> {
 };
 
 #if defined(USE_DCU) || (defined(CUDA_VERSION) && (CUDA_VERSION >= 12000)) || \
-    defined(USE_MACA)
+    defined(USE_MACA) || defined(__ILUVATAR__)
 // CUDA < 12.0 runs into issues with packed type conversion
 template <>
 class _typeConvert<c10::Half> {

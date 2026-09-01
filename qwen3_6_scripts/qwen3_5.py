@@ -7,6 +7,7 @@ import hashlib
 import os
 import sys
 import time
+print("[qwen3_5] module load START", file=sys.stderr, flush=True)
 from typing import (Any, Dict, Iterable, List, Literal, Mapping, Optional,
                     Tuple, TypedDict, Union)
 
@@ -166,6 +167,41 @@ except ImportError:
     except ImportError:
         _xllm_moe = None
 
+# --- xllm prebuilt kernel loading (PRD build) ---
+def _load_xllm_prebuilt(name):
+    """Load a prebuilt xllm .so from corex-3.2.3-ivcore10 directory."""
+    import importlib.util as _ilu
+    _search = [
+        f"/workspace/qwen3_6_scripts/prebuilt/corex-3.2.3-ivcore10/{name}.so",
+        os.path.join(os.path.dirname(__file__), "prebuilt",
+                     "corex-3.2.3-ivcore10", f"{name}.so"),
+        # When patch_ops.sh copies this file into vllm package, __file__
+        # points to vllm/model_executor/models/ — look back up to workspace
+        f"/home/dylan/0814/project_6/qwen3_6_scripts/prebuilt/corex-3.2.3-ivcore10/{name}.so",
+    ]
+    for _p in _search:
+        if os.path.isfile(_p):
+            print(f"[xllm] loading {name} from {_p} ...", file=sys.stderr, flush=True)
+            try:
+                _spec = _ilu.spec_from_file_location(name, _p)
+                _mod = _ilu.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                print(f"[xllm] {name} OK: {[x for x in dir(_mod) if not x.startswith('_')]}", file=sys.stderr, flush=True)
+                return _mod
+            except Exception as _e:
+                print(f"[xllm] {name} FAILED: {_e}", file=sys.stderr, flush=True)
+                return None
+    print(f"[xllm] {name} not found", file=sys.stderr, flush=True)
+    return None
+
+print("[xllm] loading prebuilt kernels ...", file=sys.stderr, flush=True)
+_xllm_norm = _load_xllm_prebuilt("xllm_norm")
+_xllm_rope = _load_xllm_prebuilt("xllm_rope")
+_xllm_activation = _load_xllm_prebuilt("xllm_activation")
+_xllm_cache = _load_xllm_prebuilt("xllm_cache")
+_xllm_fused_qknorm_rope = _load_xllm_prebuilt("xllm_fused_qknorm_rope")
+print("[xllm] prebuilt kernel loading done", file=sys.stderr, flush=True)
+
 # ix_moe_bridge: direct GEMV (4.1x faster than F.linear for decode M=1)
 # Benchmark: F.linear 133us vs br.linear 32us on BI-V100
 try:
@@ -189,7 +225,7 @@ _HAS_BRIDGE_LINEAR = (
     _ix_moe_bridge is not None
     and hasattr(_ix_moe_bridge, 'linear'))
 if _HAS_BRIDGE_LINEAR:
-    logger.info("ix_moe_bridge.linear ENABLED — 4.1x GEMV speedup for decode")
+    print("[xllm] ix_moe_bridge.linear ENABLED", file=sys.stderr, flush=True)
 
 
 def _fast_linear(x: torch.Tensor, weight: torch.Tensor,
@@ -268,6 +304,141 @@ _USE_XLLM_MOE = (
 if _USE_XLLM_MOE:
     logger.info("xllm_moe ENABLED — fused_topk + compute_index + combine_result")
 _USE_FUSED_MOE_ACTIVATION = env_bool("BI100_MOE_FUSED_ACTIVATION", True)
+
+# --- xllm CUDA kernel flags ---
+_USE_XLLM_NORM = (
+    _xllm_norm is not None
+    and env_bool("BI100_XLLM_NORM", True))
+_USE_XLLM_ROPE = (
+    _xllm_rope is not None
+    and env_bool("BI100_XLLM_ROPE", True))
+_USE_XLLM_ACTIVATION = (
+    _xllm_activation is not None
+    and env_bool("BI100_XLLM_ACTIVATION", True))
+_USE_XLLM_CACHE = (
+    _xllm_cache is not None
+    and env_bool("BI100_XLLM_CACHE", True))
+_USE_XLLM_FUSED_QKNORM_ROPE = (
+    _xllm_fused_qknorm_rope is not None
+    and env_bool("BI100_XLLM_FUSED_QKNORM_ROPE", True))
+if _USE_XLLM_NORM:
+    logger.info("xllm_norm ENABLED — fused RMSNorm CUDA kernel")
+if _USE_XLLM_ROPE:
+    logger.info("xllm_rope ENABLED — fused RoPE CUDA kernel")
+if _USE_XLLM_ACTIVATION:
+    logger.info("xllm_activation ENABLED — fused SiLU-and-Mul CUDA kernel")
+if _USE_XLLM_CACHE:
+    logger.info("xllm_cache ENABLED — fused reshape_paged_cache CUDA kernel")
+if _USE_XLLM_FUSED_QKNORM_ROPE:
+    logger.info("xllm_fused_qknorm_rope ENABLED — fused QK-Norm+RoPE (saves 128 launches/fwd)")
+
+# ---------------------------------------------------------------------------
+# xllm kernel monkey-patches: replace PyTorch fallback → fused CUDA kernels
+# ---------------------------------------------------------------------------
+print("[xllm] applying monkey-patches ...", file=sys.stderr, flush=True)
+
+# --- 1. RMSNorm: xllm_norm replaces GemmaRMSNorm.forward_cuda ---
+# GemmaRMSNorm uses  x * (1 + weight)  while xllm kernel uses  x * weight.
+# We pre-compute (1 + weight) and cache it so the kernel sees the correct
+# effective weight.  The cached tensor is lazily materialised on first call
+# and invalidated if shape/device/dtype change (should never happen after
+# model init).
+if _USE_XLLM_NORM:
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm as _GemmaRMSNorm
+
+    def _xllm_rms_norm_forward_cuda(self, x, residual=None):
+        """Drop-in for GemmaRMSNorm.forward_cuda using xllm_norm CUDA kernel."""
+        # Lazily compute and cache  effective_weight = 1 + weight
+        _ew = getattr(self, '_xllm_eff_weight', None)
+        if (_ew is None
+                or _ew.shape != self.weight.shape
+                or _ew.device != self.weight.device
+                or _ew.dtype != self.weight.dtype):
+            _ew = (1.0 + self.weight.data.float()).to(self.weight.dtype)
+            self._xllm_eff_weight = _ew
+
+        if residual is not None:
+            # fused_add_rms_norm:  input = RMSNorm(input + residual),
+            #                     residual = input + residual  (before norm)
+            # The kernel modifies input and residual IN-PLACE.
+            _xllm_norm.fused_add_rms_norm(
+                x, residual, _ew, self.variance_epsilon)
+            return x, residual
+        else:
+            out = torch.empty_like(x)
+            _xllm_norm.rms_norm(out, x, _ew, self.variance_epsilon)
+            return out
+
+    _GemmaRMSNorm.forward_cuda = _xllm_rms_norm_forward_cuda
+    logger.info("xllm_norm PATCHED — GemmaRMSNorm.forward_cuda → xllm CUDA kernel")
+
+
+# --- 2. SiluAndMul: xllm_activation replaces SiluAndMul.forward_cuda ---
+if _USE_XLLM_ACTIVATION:
+
+    def _xllm_silu_and_mul_forward_cuda(self, x):
+        """Drop-in for SiluAndMul.forward_cuda using xllm_activation kernel."""
+        d = x.shape[-1] // 2
+        output_shape = x.shape[:-1] + (d,)
+        # Reuse cached output tensor for stable shapes (decode)
+        _cache_key = (output_shape, x.dtype, x.device)
+        _cached = getattr(self, '_out_cache', {}).get(_cache_key)
+        if _cached is not None and _cached.shape == output_shape:
+            out = _cached
+        else:
+            out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+            if not hasattr(self, '_out_cache'):
+                self._out_cache = {}
+            self._out_cache[_cache_key] = out
+        _xllm_activation.silu_and_mul(out, x)
+        return out
+
+    SiluAndMul.forward_cuda = _xllm_silu_and_mul_forward_cuda
+    logger.info("xllm_activation PATCHED — SiluAndMul.forward_cuda → xllm CUDA kernel")
+
+
+# --- 3. Cache ops: xllm_cache (reshape_paged_cache / block_copy) ---
+# Replace ixformer vllm_cache_ops_reshape_and_cache with xllm_cache.
+# xllm_cache signature: reshape_paged_cache(slot_ids, keys, values, kc, vc)
+# vllm calls:           ops.reshape_and_cache(key, value, kc, vc, slot_mapping, ...)
+# Difference: arg order, slot_ids must be int32.
+if _USE_XLLM_CACHE:
+    import vllm._custom_ops as _vllm_ops
+
+    _orig_reshape_and_cache = _vllm_ops.reshape_and_cache
+
+    def _xllm_reshape_and_cache(key, value, key_cache, value_cache,
+                                slot_mapping, kv_cache_dtype="auto",
+                                k_scale=1.0, v_scale=1.0):
+        slot_ids = slot_mapping.flatten().to(torch.int32)
+        _xllm_cache.reshape_paged_cache(slot_ids, key, value,
+                                        key_cache, value_cache)
+
+    _vllm_ops.reshape_and_cache = _xllm_reshape_and_cache
+    logger.info("xllm_cache PATCHED — reshape_and_cache → xllm CUDA kernel")
+
+
+# --- 4. RoPE: xllm_rope ---
+# Qwen3.5 uses interleaved multi-axis RoPE (MRoPE) with partial rotary
+# factor 0.25.  The xllm_rope kernel accepts (positions, query, key,
+# cos_sin_cache, is_neox) and modifies q/k in-place, but it applies RoPE
+# to the FULL head dim.  Qwen3.5's forward only rotates the first 25% of
+# each head (rotary_dim = 64 out of 256), then concatenates the unrotated
+# tail.  The multi-axis interleaving of cos/sin across T/H/W axes also
+# requires Python-level assembly before calling any kernel.
+#
+# A safe replacement would need to:
+#  1. Assemble the interleaved cos_sin for the partial dim.
+#  2. Call xllm_rope on just the rotary_dim slice of q and k.
+#  3. Skip the concat step since the kernel modifies in-place.
+#
+# This is doable but requires careful per-position indexing that differs
+# from the standard "positions → cos_sin_cache[positions]" pattern.
+# We mark this as TODO and leave the current _apply_rotary_emb path.
+if _USE_XLLM_ROPE:
+    logger.info("xllm_rope LOADED but NOT PATCHED — Qwen3.5 interleaved MRoPE "
+                "requires adapter; using PyTorch _apply_rotary_emb fallback")
+
 
 # ix_fused_moe: full 7-step fused MoE pipeline via ixformer C++ API
 # Source: xllm/core/layers/ilu/fused_moe.cpp → ix_moe_bridge.so
@@ -1578,10 +1749,6 @@ class Qwen3_5FullAttention(nn.Module):
             q = qg[:, :, :self.head_dim].reshape(total_tokens, -1)
             gate = qg[:, :, self.head_dim:].reshape(total_tokens, -1)
 
-            q = self.q_norm.forward_cuda(
-                q.view(total_tokens, self.local_num_heads, self.head_dim)
-                .contiguous()).view(total_tokens, -1)
-
             # Select the one rank-local KV head before k_norm and RoPE.
             if self.q_per_kv_global is not None:
                 tp_rank = get_tensor_model_parallel_rank()
@@ -1592,10 +1759,53 @@ class Qwen3_5FullAttention(nn.Module):
                 v = (v.view(total_tokens, self.proj_kv_heads, self.head_dim)
                       [:, kv_idx, :].contiguous())
 
-            k = self.k_norm.forward_cuda(
-                k.view(total_tokens, self.local_num_kv_heads, self.head_dim)
-                .contiguous()).view(total_tokens, -1)
-            q, k = self.rotary_emb(positions, q, k)
+            # --- Fused QK-Norm + RoPE path (saves 4 kernel launches per layer) ---
+            # Only for 1D positions (decode / text-only prefill).
+            # 2D MRoPE positions (vision prefill) fall back to separate ops.
+            if (_USE_XLLM_FUSED_QKNORM_ROPE
+                    and positions.ndim == 1
+                    and q.is_contiguous() and k.is_contiguous()):
+                # Pack Q, K, V into contiguous [T, (Hq+Hk+Hv)*D] for fused kernel
+                v_flat = v.view(total_tokens, -1)
+                qkv = torch.cat([q, k.view(total_tokens, -1), v_flat], dim=-1)
+                # GemmaRMSNorm weight convention: kernel uses x*w, Gemma uses x*(1+w)
+                _q_ew = getattr(self, '_fused_q_ew', None)
+                if _q_ew is None:
+                    _q_ew = (1.0 + self.q_norm.weight.data.float()).to(
+                        self.q_norm.weight.dtype)
+                    self._fused_q_ew = _q_ew
+                _k_ew = getattr(self, '_fused_k_ew', None)
+                if _k_ew is None:
+                    _k_ew = (1.0 + self.k_norm.weight.data.float()).to(
+                        self.k_norm.weight.dtype)
+                    self._fused_k_ew = _k_ew
+                _xllm_fused_qknorm_rope.fused_qk_norm_rope(
+                    qkv,
+                    self.local_num_heads,
+                    self.local_num_kv_heads,
+                    self.local_num_kv_heads,
+                    self.head_dim,
+                    self.rms_norm_eps,
+                    _q_ew,
+                    _k_ew,
+                    self.rotary_emb.cos_sin_cache,
+                    True,  # interleaved (Qwen3.5 uses interleaved RoPE)
+                    positions.to(torch.int64))
+                # Unpack
+                q_dim = self.local_num_heads * self.head_dim
+                k_dim = self.local_num_kv_heads * self.head_dim
+                q = qkv[:, :q_dim]
+                k = qkv[:, q_dim:q_dim + k_dim]
+                # v is untouched by fused kernel, keep original
+            else:
+                # Fallback: separate q_norm, k_norm, rotary_emb
+                q = self.q_norm.forward_cuda(
+                    q.view(total_tokens, self.local_num_heads, self.head_dim)
+                    .contiguous()).view(total_tokens, -1)
+                k = self.k_norm.forward_cuda(
+                    k.view(total_tokens, self.local_num_kv_heads, self.head_dim)
+                    .contiguous()).view(total_tokens, -1)
+                q, k = self.rotary_emb(positions, q, k)
 
         with bi100_timer("full_attn.attention"):
             with bi100_timer(f"L{self.layer_idx}.full_attn"):
@@ -2890,3 +3100,4 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         _bi100_model_trace(
             f"MoE load_weights complete items={loaded_count} "
             f"vision_items={vision_loaded_count}")
+print("[qwen3_5] module load COMPLETE", file=sys.stderr, flush=True)

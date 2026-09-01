@@ -216,6 +216,13 @@ class Worker(LocalOrDistributedWorkerBase):
         """
         # Profile the memory usage of the model and get the maximum number of
         # cache blocks that can be allocated with the remaining free memory.
+        # PRD: skip profile_run when num_gpu_blocks_override is set
+        _ovr = getattr(self.cache_config, 'num_gpu_blocks_override', None)
+        if _ovr is not None and _ovr > 0:
+            logger.info("Skipping profile_run -- num_gpu_blocks_override=%d", _ovr)
+            _cbs = self.get_cache_block_size_bytes()
+            _cpu = self.cache_config.swap_space_bytes // _cbs if _cbs > 0 else 256
+            return int(_ovr), int(_cpu)
         torch.cuda.empty_cache()
 
         # Execute a forward pass with dummy inputs to profile the memory usage

@@ -817,6 +817,7 @@ struct RandomSampleParams {
 };
 
 // Rejection sampling parameters for speculative decoding
+// PRD #0 (9e0f1402): Added mode field for explicit greedy/probabilistic dispatch
 struct RejectionSampleParams {
   // Candidate draft token indices to be verified.
   // Shape: [total_draft_tokens]. Dtype: int32.
@@ -849,6 +850,10 @@ struct RejectionSampleParams {
   // The maximum number of draft tokens in the batch (max value in
   // num_draft_tokens).
   int32_t max_spec_len;
+  // PRD #0 (9e0f1402): Explicit sampling mode — Greedy uses exact-match,
+  // Probabilistic uses min(1, p/q) acceptance ratio.
+  // Default: Probabilistic (preserves legacy behavior).
+  uint8_t draft_sampling_mode = 1;  // 0=Greedy, 1=Probabilistic
 };
 
 // Masked indexer select paged KV cache parameters

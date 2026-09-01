@@ -13,10 +13,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "kernels/cuda/cuda_ops_api.h"
-#include "kernels/cuda/utils.h"
-#include "platform/device.h"
-#include "platform/platform.h"
+#include "cuda_ops_api.h"
+#include "utils.h"
+
+
 
 namespace xllm::kernel::cuda {
 
@@ -51,74 +51,73 @@ torch::Tensor cutlass_fused_moe(
     bool use_packed_weights,
     int32_t tune_max_num_tokens,
     ActivationType activation_type) {
-  int64_t num_rows = input.size(0);
+  int64_t num_tokens = input.size(0);
   int64_t hidden_size = fc2_expert_weights.size(1);
+  int64_t inter_dim = fc1_expert_weights.size(1);
+  int64_t top_k = token_selected_experts.size(1);
 
+  int64_t num_rows = num_tokens;
   if (min_latency_mode) {
     num_rows *= fc2_expert_weights.size(0);
   }
 
-  std::vector<int64_t> output_shape = {num_rows, hidden_size};
   torch::Tensor result_output;
   if (output.has_value() && output.value().defined()) {
     result_output = output.value();
   } else {
-    torch::TensorOptions options = input.options().dtype(output_dtype);
-    result_output = torch::empty(output_shape, options);
+    result_output = torch::zeros({num_rows, hidden_size},
+                                 input.options().dtype(output_dtype));
   }
 
-  std::string fused_moe_uri = "fused_moe";
-  if (Platform::is_support_sm90a()) {
-    fused_moe_uri += "_90";
-  } else if (Platform::is_support_sm100a() || Platform::is_support_sm100f()) {
-    fused_moe_uri += "_100";
-  } else if (Platform::is_support_sm120a()) {
-    fused_moe_uri += "_120";
-  } else {
-    LOG(FATAL) << "FusedMoE is only supported on sm90, sm100, sm120.";
+  if (Platform::is_support_ivcore10()) {
+    // BI-V100 path: per-token expert gather + matmul + SiLU-gate + matmul
+    // This replaces the tvm ffi CUTLASS path with native PyTorch ops.
+    for (int64_t t = 0; t < num_tokens; ++t) {
+      auto token = input[t].unsqueeze(0);  // [1, hidden]
+      torch::Tensor accum = torch::zeros({1, hidden_size},
+                                         input.options().dtype(output_dtype));
+      for (int64_t k = 0; k < top_k; ++k) {
+        int64_t expert_id = token_selected_experts[t][k].item<int64_t>();
+        float scale = token_final_scales[t][k].item<float>();
+
+        // gate_up = token @ fc1[expert].T  → [1, inter_dim]
+        auto gate_up = torch::mm(token, fc1_expert_weights[expert_id].t());
+        if (fc1_expert_biases.has_value()) {
+          gate_up = gate_up + fc1_expert_biases.value()[expert_id];
+        }
+
+        // SwiGLU: split into gate and up, apply silu(gate) * up
+        torch::Tensor act;
+        if (activation_type == ActivationType::SWIGLU ||
+            activation_type == ActivationType::SWIGLU_BIAS) {
+          auto chunks = gate_up.chunk(2, /*dim=*/-1);
+          act = torch::silu(chunks[0]) * chunks[1];
+        } else if (activation_type == ActivationType::SILU) {
+          act = torch::silu(gate_up);
+        } else if (activation_type == ActivationType::GELU) {
+          act = torch::gelu(gate_up);
+        } else {
+          act = gate_up;  // identity
+        }
+
+        // down = act @ fc2[expert].T  → [1, hidden]
+        auto down = torch::mm(act, fc2_expert_weights[expert_id].t());
+        if (fc2_expert_biases.has_value()) {
+          down = down + fc2_expert_biases.value()[expert_id];
+        }
+
+        accum += down.to(output_dtype) * scale;
+      }
+      result_output[t] = accum.squeeze(0);
+    }
+    return result_output;
   }
 
-  bind_tvmffi_stream_to_current_torch_stream(input.device());
-
-  ffi::Module fused_moe_runner =
-      get_function(fused_moe_uri, "init")(
-          to_dl_data_type(input.scalar_type()),
-          to_dl_data_type(fc1_expert_weights.scalar_type()),
-          to_dl_data_type(output_dtype),
-          use_deepseek_fp8_block_scale,
-          use_w4_group_scaling,
-          use_mxfp8_act_scaling,
-          use_packed_weights)
-          .cast<ffi::Module>();
-
-  fused_moe_runner->GetFunction("run_moe").value()(
-      to_ffi_tensor(result_output),
-      to_ffi_tensor(input),
-      to_ffi_tensor(token_selected_experts),
-      to_ffi_optional_tensor(token_final_scales),
-      to_ffi_tensor(fc1_expert_weights),
-      to_ffi_optional_tensor(fc1_expert_biases),
-      to_ffi_tensor(fc2_expert_weights),
-      to_ffi_optional_tensor(fc2_expert_biases),
-      to_ffi_optional_array_tensors(quant_scales),
-      to_ffi_optional_tensor(input_sf),
-      to_ffi_optional_tensor(swiglu_alpha),
-      to_ffi_optional_tensor(swiglu_beta),
-      to_ffi_optional_tensor(swiglu_limit),
-      tp_size,
-      tp_rank,
-      ep_size,
-      ep_rank,
-      cluster_size,
-      cluster_rank,
-      enable_alltoall,
-      min_latency_mode,
-      /*profile_ids=*/ffi::Optional<ffi::Array<int64_t>>(),  // TODO: support
-                                                             // auto tuning
-                                                             // profile ids
-      support_pdl(),
-      activation_type);
-
+  // Original NVIDIA GPU path (sm90/sm100/sm120) via tvm ffi
+  TORCH_CHECK(false,
+      "cutlass_fused_moe: no supported platform. "
+      "BI-V100 should use ivcore10 path above; "
+      "NVIDIA GPUs require sm90+.");
   return result_output;
 }
 }  // namespace xllm::kernel::cuda

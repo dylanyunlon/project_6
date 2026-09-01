@@ -23,8 +23,8 @@ limitations under the License.
 
 #include <cub/util_type.cuh>
 
-#if !defined(USE_DCU) && !defined(USE_MACA)
-#endif
+// <cuda/functional> requires CUDA 12+ (libcudacxx); BI-V100 runs CUDA 10.2
+// and does not ship that header.  The include is unused in this file anyway.
 
 #include "device_utils.cuh"
 

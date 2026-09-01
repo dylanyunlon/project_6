@@ -17,7 +17,8 @@ limitations under the License.
 
 #include <ATen/DynamicLibrary.h>
 #include <ATen/core/dispatch/Dispatcher.h>
-#include <glog/logging.h>
+// PRD build fix: replace glog with torch logging (no glog-dev on BI-V100)
+#include <c10/util/Logging.h>
 
 #include <optional>
 #include <tuple>
@@ -54,7 +55,7 @@ void block_copy(torch::Tensor key_cache_ptrs,
                 torch::Tensor cum_sum,
                 int64_t numel_per_block,
                 torch::ScalarType cache_dtype);
-#if !defined(USE_DCU)
+#if !defined(USE_DCU) && !defined(__ILUVATAR__)
 void batch_prefill(const std::string& uri,
                    ffi::Array<int64_t> plan_info,
                    torch::Tensor float_workspace_buffer,
@@ -142,7 +143,7 @@ void batch_decode(const std::string& uri,
                   std::optional<torch::Tensor>& output_lse,
                   bool use_tensor_core,
                   std::optional<torch::Tensor> qo_indptr = std::nullopt);
-#endif  // !defined(USE_DCU)
+#endif  // !defined(USE_DCU) && !defined(__ILUVATAR__)
 void rms_norm(torch::Tensor output,
               torch::Tensor input,
               torch::Tensor weight,

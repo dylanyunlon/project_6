@@ -146,7 +146,7 @@ echo "============================================================"
 echo "  6. xllm_moe.so"
 echo "============================================================"
 build_so "xllm_moe" \
-    "ex_engine/xllm_kernels/cuda/moe/moe_fused_topk.cu ex_engine/xllm_kernels/cuda/moe/moe_compute_index.cu ex_engine/xllm_kernels/cuda/moe/moe_combine.cu ex_engine/xllm_kernels/cuda/moe/fused_moe.cpp ex_engine/xllm_kernels/cuda/bindings/xllm_moe_bind.cpp"
+    "ex_engine/xllm_kernels/cuda/moe/moe_fused_topk.cu ex_engine/xllm_kernels/cuda/moe/moe_compute_index.cu ex_engine/xllm_kernels/cuda/moe/moe_combine.cu ex_engine/xllm_kernels/cuda/bindings/xllm_moe_bind.cpp"
 
 echo ""
 echo "============================================================"

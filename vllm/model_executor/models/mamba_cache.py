@@ -10,11 +10,11 @@ class MambaCacheManager:
     def __init__(self, dtype, num_mamba_layers, max_batch_size,
                  conv_state_shape, temporal_state_shape):
 
-        conv_state = torch.empty(size=(num_mamba_layers, max_batch_size) +
+        conv_state = torch.zeros(size=(num_mamba_layers, max_batch_size) +
                                  conv_state_shape,
                                  dtype=dtype,
                                  device="cuda")
-        temporal_state = torch.empty(size=(num_mamba_layers, max_batch_size) +
+        temporal_state = torch.zeros(size=(num_mamba_layers, max_batch_size) +
                                      temporal_state_shape,
                                      dtype=dtype,
                                      device="cuda")
@@ -101,6 +101,8 @@ class MambaCacheManager:
             self._move_out_if_already_occupied(
                 index=destination_index,
                 all_occupied_indices=all_occupied_indices)
+            for cache_t in self.mamba_cache:
+                cache_t[:, destination_index].zero_()
             self.mamba_cache_indices_mapping[cur_rid] = {
                 seq_id: destination_index
             }
@@ -206,7 +208,10 @@ class MambaCacheManager:
                                    finished_seq_groups_req_ids: List[str]):
         for req_id in finished_seq_groups_req_ids:
             if req_id in self.mamba_cache_indices_mapping:
-                self.mamba_cache_indices_mapping.pop(req_id)
+                seq_mapping = self.mamba_cache_indices_mapping.pop(req_id)
+                for cache_idx in seq_mapping.values():
+                    for cache_t in self.mamba_cache:
+                        cache_t[:, cache_idx].zero_()
 
     def _first_free_index_in_mamba_cache(
             self, indices_range: Optional[List[int]] = None) -> int:

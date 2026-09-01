@@ -21,9 +21,10 @@ limitations under the License.
 #else
 #include <c10/cuda/CUDAGuard.h>
 #endif
-#include <glog/logging.h>
+// PRD build fix: replace glog with c10 logging (no glog-dev on BI-V100)
+#include <c10/util/Logging.h>
 #include <torch/torch.h>
-#if !defined(USE_DCU)
+#if !defined(USE_DCU) && !defined(__ILUVATAR__)
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/extra/c_env_api.h>
@@ -46,7 +47,7 @@ limitations under the License.
 #define HOST_INLINE inline
 #endif
 
-#if !defined(USE_DCU)
+#if !defined(USE_DCU) && !defined(__ILUVATAR__)
 namespace ffi = tvm::ffi;
 #endif
 
@@ -124,7 +125,7 @@ std::string get_batch_decode_uri(torch::ScalarType dtype_q,
 
 std::tuple<torch::Tensor, double> split_scale_param(const torch::Tensor& scale);
 
-#if !defined(USE_DCU)
+#if !defined(USE_DCU) && !defined(__ILUVATAR__)
 DLDataType to_dl_data_type(torch::ScalarType scalar_type);
 
 // below are tvm-ffi related functions
@@ -159,5 +160,5 @@ inline void bind_tvmffi_stream_to_current_torch_stream(
                  << " dev=" << device.index();
   }
 }
-#endif  // !defined(USE_DCU)
+#endif  // !defined(USE_DCU) && !defined(__ILUVATAR__)
 }  // namespace xllm::kernel::cuda
