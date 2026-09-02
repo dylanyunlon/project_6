@@ -46,10 +46,14 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
 
         if self.end_token not in model_output:
             # Thinking enabled but output truncated before </think>.
-            return model_output, None
+            return model_output or None, None
 
         reasoning, _, content = model_output.partition(self.end_token)
-        return reasoning, content or None
+        # Normalize empty strings to None.  When the model skips thinking
+        # (outputs </think> immediately), reasoning is "" — returning None
+        # keeps reasoning_content out of the JSON response so the test
+        # framework sees "no reasoning" rather than "empty reasoning".
+        return reasoning or None, content or None
 
     def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
         token_ids = list(token_ids)

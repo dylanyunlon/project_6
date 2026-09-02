@@ -144,9 +144,9 @@ class BaseThinkingReasoningParser(ReasoningParser):
         model_output = parts[2] if parts[1] else parts[0]
 
         if self.end_token not in model_output:
-            return model_output, None
+            return model_output or None, None
         reasoning, _, content = model_output.partition(self.end_token)
-        return reasoning, content or None
+        return reasoning or None, content or None
 
     def extract_reasoning_streaming(
         self,
@@ -180,9 +180,9 @@ class BaseThinkingReasoningParser(ReasoningParser):
                     content=content or None,
                 )
             elif end_in_prev:
-                return _DeltaMessage(content=delta_text)
+                return _DeltaMessage(content=delta_text) if delta_text else None
             else:
-                return _DeltaMessage(reasoning_content=delta_text)
+                return _DeltaMessage(reasoning_content=delta_text) if delta_text else None
 
         elif start_in_delta:
             if end_in_delta:
@@ -190,15 +190,17 @@ class BaseThinkingReasoningParser(ReasoningParser):
                 end_idx = delta_text.find(self.end_token)
                 reasoning = delta_text[start_idx + len(self.start_token):end_idx]
                 content = delta_text[end_idx + len(self.end_token):]
+                if not reasoning and not content:
+                    return None
                 return _DeltaMessage(
                     reasoning_content=reasoning or None,
                     content=content or None,
                 )
             else:
-                return _DeltaMessage(reasoning_content=delta_text)
+                return _DeltaMessage(reasoning_content=delta_text) if delta_text else None
 
         else:
-            return _DeltaMessage(content=delta_text)
+            return _DeltaMessage(content=delta_text) if delta_text else None
 
 
 class ReasoningParserManager:
