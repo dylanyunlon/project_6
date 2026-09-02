@@ -1,5 +1,6 @@
 echo "[build] trigger 20260901"
 echo "[build] trigger 202609011237"
+echo "[build] trigger 202609011636"
 #!/usr/bin/env bash
 # BI-V100 patch script for Qwen3.6-35B-A3B (Qwen3_5 MoE architecture)
 #
@@ -141,6 +142,23 @@ install_patch_file \
 install_patch_file \
     "${VLLM_OVERRIDE_ROOT}/model_executor/layers/sampler.py" \
     "${VLLM_ROOT}/model_executor/layers/sampler.py"
+
+build_stage "installing BI100-DP data parallel overrides"
+install_patch_file \
+    "${VLLM_OVERRIDE_ROOT}/config.py" \
+    "${VLLM_ROOT}/config.py"
+install_patch_file \
+    "${VLLM_OVERRIDE_ROOT}/engine/arg_utils.py" \
+    "${VLLM_ROOT}/engine/arg_utils.py"
+install_patch_file \
+    "${VLLM_OVERRIDE_ROOT}/engine/llm_engine.py" \
+    "${VLLM_ROOT}/engine/llm_engine.py"
+install_patch_file \
+    "${VLLM_OVERRIDE_ROOT}/executor/multiproc_gpu_executor.py" \
+    "${VLLM_ROOT}/executor/multiproc_gpu_executor.py"
+install_patch_file \
+    "${VLLM_OVERRIDE_ROOT}/worker/worker.py" \
+    "${VLLM_ROOT}/worker/worker.py"
 
 build_stage "installing hash-pinned CoreX 3.2.3 extensions"
 bash ./install_prebuilt_corex.sh "${VLLM_ROOT}"
