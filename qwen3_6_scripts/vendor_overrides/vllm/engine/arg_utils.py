@@ -1,6 +1,7 @@
 import argparse
 import dataclasses
 import json
+import os
 from dataclasses import dataclass
 from typing import (TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional,
                     Tuple, Type, Union)
@@ -105,7 +106,7 @@ class EngineArgs:
                                                  Type[ExecutorBase]]] = None
     pipeline_parallel_size: int = 1
     tensor_parallel_size: int = 1
-    data_parallel_size: int = 1
+    data_parallel_size: int = int(os.environ.get("VLLM_DATA_PARALLEL_SIZE", "1"))
     max_parallel_loading_workers: Optional[int] = None
     block_size: int = 16
     enable_prefix_caching: bool = False
@@ -349,12 +350,6 @@ class EngineArgs:
                             type=int,
                             default=EngineArgs.tensor_parallel_size,
                             help='Number of tensor parallel replicas.')
-        parser.add_argument('--data-parallel-size',
-                            '-dp',
-                            type=int,
-                            default=EngineArgs.data_parallel_size,
-                            help='Number of data parallel replicas. '
-                            'Total GPUs = tp * pp * dp.')
         parser.add_argument(
             '--max-parallel-loading-workers',
             type=int,

@@ -243,6 +243,7 @@ class OpenAIServingChat(OpenAIServing):
 
         # set up reasoning parser
         self.reasoning_parser_cls = None
+        self._template_patched = False  # [BI100] one-shot chat template patch
         if reasoning_parser:
             try:
                 from vllm.reasoning import ReasoningParserManager
@@ -308,6 +309,19 @@ class OpenAIServingChat(OpenAIServing):
 
             model_config = self.model_config
             tokenizer = await self.engine_client.get_tokenizer(lora_request)
+
+            # [BI100] Runtime equivalent of patch_chat_template.py.
+            # Qwen3.5/3.6-MoE templates inject '<think>\n\n</think>\n\n'
+            # when enable_thinking=false, which causes the model to
+            # degenerate (outputs '!!!!!'). Patch it out once.
+            if not self._template_patched and hasattr(tokenizer, 'chat_template'):
+                _tgt = r"{{- '<think>\n\n</think>\n\n' }}"
+                if isinstance(tokenizer.chat_template, str) and _tgt in tokenizer.chat_template:
+                    tokenizer.chat_template = tokenizer.chat_template.replace(
+                        _tgt, "{{- '' }}", 1)
+                    logger.info("[BI100] Patched chat_template: removed empty "
+                                "<think></think> block for non-thinking mode")
+                self._template_patched = True
 
             conversation, mm_data_future = parse_chat_messages_futures(
                 request.messages, model_config, tokenizer)
