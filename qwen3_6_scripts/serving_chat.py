@@ -410,9 +410,24 @@ class OpenAIServingChat(OpenAIServing):
 
             if request.max_tokens is not None:
                 request.max_tokens = min(request.max_tokens, _adaptive_cap)
+            else:
+                # [BI100] max_tokens=None means "no limit" in the OpenAI API.
+                # Cap to _adaptive_cap to prevent generation timeout (300s).
+                request.max_tokens = _adaptive_cap
 
             default_max_tokens = min(self.max_model_len - _prompt_len,
                                      _adaptive_cap)
+
+            # [BI100] Qwen3 tool calling fix: greedy decoding (temperature=0)
+            # causes thinking to degrade, so the model never generates
+            # <tool_call> tags.  Force temperature≥0.6 when tools are active.
+            if (request.tools and request.tool_choice in ("auto", None)
+                    and (request.temperature is None
+                         or request.temperature < 0.6)):
+                request.temperature = 0.6
+                if request.top_p is None or request.top_p > 0.95:
+                    request.top_p = 0.95
+
             if request.use_beam_search:
                 sampling_params = request.to_beam_search_params(
                     default_max_tokens)
