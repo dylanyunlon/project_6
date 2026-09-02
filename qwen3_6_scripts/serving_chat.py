@@ -316,6 +316,16 @@ class OpenAIServingChat(OpenAIServing):
                 tool.model_dump() for tool in request.tools
             ]
 
+            # [BI100] Ensure enable_thinking defaults to True when the
+            # request does not specify it.  The Qwen3.5 chat template
+            # may disable thinking when tools are present and the flag
+            # is absent, which prevents the model from reasoning about
+            # tool selection and generating <tool_call> tags.
+            if request.chat_template_kwargs is None:
+                request.chat_template_kwargs = {}
+            if "enable_thinking" not in request.chat_template_kwargs:
+                request.chat_template_kwargs["enable_thinking"] = True
+
             prompt: Union[str, List[int]]
             is_mistral_tokenizer = isinstance(tokenizer, MistralTokenizer)
             if is_mistral_tokenizer:
