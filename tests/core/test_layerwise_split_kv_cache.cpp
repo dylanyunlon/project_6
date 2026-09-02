@@ -30,12 +30,12 @@ limitations under the License.
 #include <unordered_set>
 #include <vector>
 
-#include "core/config/parallel_config_layerwise.h"
-#include "core/distributed_runtime/layerwise_split_engine_ext.h"
-#include "core/distributed_runtime/layerwise_split_master.h"
-#include "core/framework/kv_cache/kv_cache_estimation_layerwise.h"
-#include "core/framework/kv_cache/layerwise_split_layout.h"
-#include "core/framework/parallel_state/mapping_ilu.h"
+#include "config/parallel_config_layerwise.h"
+#include "distributed_runtime/layerwise_split_engine_ext.h"
+#include "distributed_runtime/layerwise_split_master.h"
+#include "framework/kv_cache/kv_cache_estimation_layerwise.h"
+#include "framework/kv_cache/layerwise_split_layout.h"
+#include "framework/parallel_state/mapping_ilu.h"
 
 namespace xllm {
 namespace {

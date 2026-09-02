@@ -28,6 +28,8 @@ limitations under the License.
 // a block will have idle lanes — we pad head_dim to the next multiple of
 // 64 on ILU to avoid this.
 
+#include "framework/kv_cache/kv_cache_layerwise.h"
+
 #include "framework/kv_cache/kv_cache.h"
 
 #include <glog/logging.h>
