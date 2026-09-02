@@ -148,6 +148,18 @@ echo "============================================================"
 build_so "xllm_moe" \
     "ex_engine/xllm_kernels/cuda/moe/moe_fused_topk.cu ex_engine/xllm_kernels/cuda/moe/moe_compute_index.cu ex_engine/xllm_kernels/cuda/moe/moe_combine.cu ex_engine/xllm_kernels/cuda/bindings/xllm_moe_bind.cpp"
 
+# 7. py_attention_metadata — DP-aware attention metadata (pybind11, pure C++)
+#    Source: core/runtime/py_attention_metadata.cpp
+#    Ported from xLLM upstream PR #2258 (commit 78aa2a85)
+#    Exports: AttentionMetadataView with dp_token_counts / dp_is_decode fields
+#    Note: Pure C++ pybind11 — no CUDA, no .cu files
+echo ""
+echo "============================================================"
+echo "  7. py_attention_metadata.so"
+echo "============================================================"
+build_so "py_attention_metadata" \
+    "core/runtime/py_attention_metadata.cpp"
+
 echo ""
 echo "============================================================"
 echo "  Build complete. Output:"
