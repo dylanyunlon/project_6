@@ -17,18 +17,27 @@ limitations under the License.
 // ILU-specific device-to-layer mapping for layerwise split KV cache.
 //
 // Verified Iluvatar BI-V100 topology (ixsmi topo -m):
-//   - 4 cards, Bus-Id 4B:00.0 – 4E:00.0, all on NUMA node 1
+//   - 4 cards: GPU0-GPU3, Bus-Id 4B:00.0 – 4E:00.0, all on NUMA node 1
 //   - All pairs connected via PIX (single PCIe bridge) — FLAT topology
-//   - No switch hierarchy: all inter-card bandwidth is equal
-//   - 32 GB HBM per card (32768 MiB), 1500 MHz SM, 1200 MHz mem
-//   - Warp size: 64 (verified via CUDA kernel warpSize builtin)
+//   - No NVLink, no HCCS mesh, no multi-switch hierarchy
+//   - 32 GB HBM per card (32768 MiB), baseline ~257 MiB
+//   - 1500 MHz SM, 1200 MHz mem
+//   - CPU affinity: 16-31,80-95
+//   - Warp size: 64 (verified via BI-V150 docs, same ivcore architecture)
 //   - IX-ML 3.2.3, Driver 3.2.1, CUDA 10.2 (CoreX)
 //   - CoreX SDK at /usr/local/corex/
 //
+// Model: Qwen3.6-35B-A3B (Qwen3_5 MoE architecture)
+//   - Interleaved full_attention + linear_attention layers
+//   - Only full_attention layers have KV cache
+//   - num_kv_heads=4, with TP=4: local_kv_heads=1 per rank per layer
+//   - head_dim=256, GQA ratio=4
+//
 // Strategy (flat PIX topology):
-//   Dense attention layers (many KV heads) → shard across ALL TP ranks
-//   MoE layers (few KV heads via GQA)      → round-robin across ranks to
-//     balance HBM usage (no grouping benefit since all links are equal)
+//   All full-attention layers have kv_heads=4 >= world_size=4,
+//   so every layer shards across ALL ranks (each gets 1 head).
+//   If kv_heads < world_size, round-robin starting rank to spread
+//   HBM load (no grouping benefit since all PIX links are equal).
 
 #include "framework/parallel_state/mapping_ilu.h"
 
@@ -43,7 +52,7 @@ limitations under the License.
 
 namespace xllm {
 
-LayerwiseSplitLayout compute_ilu_layerwise_layout(
+IluLayerwiseLayout compute_ilu_layerwise_layout(
     int64_t num_layers,
     const std::vector<int64_t>& per_layer_kv_heads,
     int32_t world_size,
@@ -54,7 +63,7 @@ LayerwiseSplitLayout compute_ilu_layerwise_layout(
   std::vector<LayerShardSpec> specs;
   specs.reserve(num_layers);
 
-  // For MoE layers with fewer heads than ranks, we round-robin the starting
+  // For layers with fewer heads than ranks, we round-robin the starting
   // rank so that different layers land on different subsets, balancing HBM
   // pressure across the flat PIX topology.
   int32_t rr_offset = 0;
@@ -65,7 +74,8 @@ LayerwiseSplitLayout compute_ilu_layerwise_layout(
     const int64_t total_heads = per_layer_kv_heads[lid];
 
     if (total_heads >= world_size) {
-      // Dense attention: shard across all ranks.
+      // Dense case (Qwen3.5 full_attention with TP=4, 4 heads → 1 each):
+      // shard across all ranks.
       for (int32_t r = 0; r < world_size; ++r)
         spec.assigned_ranks.push_back(r);
       int64_t base = total_heads / world_size;
@@ -73,9 +83,8 @@ LayerwiseSplitLayout compute_ilu_layerwise_layout(
       for (int32_t r = 0; r < world_size; ++r)
         spec.heads_per_rank.push_back(base + (r < rem ? 1 : 0));
     } else {
-      // MoE / GQA layer: heads < world_size.
-      // Flat PIX topology — all links equal, so round-robin starting rank
-      // to spread HBM load evenly.
+      // Fewer heads than ranks: round-robin subset.
+      // (Not the case for Qwen3.5 with TP=4, but needed for other models.)
       int32_t needed = static_cast<int32_t>(total_heads);
       for (int32_t j = 0; j < needed; ++j) {
         int32_t rank = (rr_offset + j) % world_size;
@@ -94,7 +103,7 @@ LayerwiseSplitLayout compute_ilu_layerwise_layout(
             << " layers, " << world_size << " ranks, topo="
             << (topo_kind == IluTopoKind::kFlatPIX ? "flat_PIX" : "grouped");
 
-  return LayerwiseSplitLayout(std::move(specs));
+  return IluLayerwiseLayout(std::move(specs));
 }
 
 }  // namespace xllm

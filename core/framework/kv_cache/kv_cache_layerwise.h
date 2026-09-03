@@ -18,20 +18,31 @@ limitations under the License.
 #include <cstdint>
 #include <vector>
 
-#include "framework/kv_cache/kv_cache.h"
-#include "framework/kv_cache/kv_cache_shape.h"
-#include "framework/kv_cache/kv_cache_utils.h"
 #include "framework/kv_cache/layerwise_split_layout.h"
 
 namespace xllm {
 
-/// Allocate KV caches with per-layer head counts determined by |layout|.
-/// Layers not assigned to |current_rank| receive an empty (default) KVCache.
+/// Allocate KV caches with per-layer ownership determined by |layout|.
+/// Layers not owned by |current_rank| receive an empty (placeholder) KVCache.
+///
+/// |layer_cache_owned|: precomputed ownership mask from build_layer_cache_owned.
+///   - true  → this rank allocates real KV cache tensors for this layer.
+///   - false → this rank uses a shared scratch (zero-sized) placeholder.
+///
+/// For Qwen3.5: linear_attention layers always have owned=true but their
+/// cache slot is unused (GDN uses conv+temporal state, not KV cache).
+/// Only full_attention layers participate in layerwise split.
+///
+/// BI-V100 KV cache tensor layout (from verified runtime logs):
+///   key_cache:   (n_blocks, n_kv_heads_local, block_size, head_dim/x, x)
+///   value_cache: (n_blocks, n_kv_heads_local, head_dim, block_size)
+///   where x = 128 / sizeof_dtype_bits (=8 for fp16/bf16)
+///
+/// This is the "block-major" transposed layout used by the vendor vLLM
+/// on Iluvatar BI-V100.  head dimension sits at axis 1.
 void allocate_kv_caches_layerwise(
-    std::vector<KVCache>& kv_caches,
-    const KVCacheShape& base_shape,
-    const KVCacheCreateOptions& create_options,
-    const LayerwiseSplitLayout& layout,
+    const std::vector<bool>& layer_cache_owned,
+    int64_t num_layers,
     int32_t current_rank);
 
 }  // namespace xllm

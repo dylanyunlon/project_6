@@ -35,16 +35,20 @@ enum class IluTopoKind : int8_t {
   kGrouped = 1,
 };
 
-/// Compute a layerwise-split layout for Iluvatar BI-V100.
+/// Compute a layerwise-split IluLayerwiseLayout for Iluvatar BI-V100.
 ///
-/// |per_layer_kv_heads|: total KV head count for each layer.
-/// Dense attention layers (heads >= world_size) spread across all ranks.
-/// MoE / GQA layers (heads < world_size) are round-robin distributed
-/// across ranks (flat PIX) or grouped by PCIe switch (grouped topology).
+/// |per_layer_kv_heads|: total KV head count for each full-attention layer.
+///   For Qwen3.5 with TP=4: each full_attention layer has 4 total KV heads,
+///   so local_kv_heads = 4/4 = 1 per rank.
+///   Linear-attention layers are NOT included in this vector — they have no
+///   KV cache.
+///
+/// Dense attention layers (heads >= world_size) spread across ALL TP ranks.
+/// Layers with fewer heads than ranks are round-robin distributed.
 ///
 /// Default: kFlatPIX — matches the verified 4-card BI-V100 topology
 /// where all pairs are PIX-connected with equal bandwidth.
-LayerwiseSplitLayout compute_ilu_layerwise_layout(
+IluLayerwiseLayout compute_ilu_layerwise_layout(
     int64_t num_layers,
     const std::vector<int64_t>& per_layer_kv_heads,
     int32_t world_size,

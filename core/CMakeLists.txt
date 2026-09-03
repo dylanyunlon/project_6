@@ -2,6 +2,12 @@
 # Commit: 494f293b5629 · feat · PR #2260  (adapted for Iluvatar BI-V100)
 
 cmake_minimum_required(VERSION 3.18)
+project(layerwise_split_kv_cache LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GLOG REQUIRED IMPORTED_TARGET libglog)
+find_package(GTest QUIET)
 
 # ---------- layerwise split KV cache library ----------
 add_library(layerwise_split_kv STATIC
@@ -21,8 +27,7 @@ target_include_directories(layerwise_split_kv PUBLIC
 
 target_link_libraries(layerwise_split_kv PUBLIC
   gflags
-  glog::glog
-  torch
+  PkgConfig::GLOG
 )
 
 # Iluvatar BI-V100 build: define USE_ILU
@@ -32,14 +37,23 @@ endif()
 
 # ---------- tests ----------
 if(BUILD_TESTING)
+  if(NOT GTest_FOUND)
+    # Fallback: link gtest directly (Ubuntu libgtest-dev)
+    find_library(GTEST_LIB gtest)
+    find_library(GTEST_MAIN_LIB gtest_main)
+  endif()
+
   add_executable(test_layerwise_split
     ${CMAKE_CURRENT_SOURCE_DIR}/../tests/core/test_layerwise_split_kv_cache.cpp
   )
-  target_link_libraries(test_layerwise_split PRIVATE
-    layerwise_split_kv
-    GTest::gtest_main
-    gflags
-    glog::glog
-  )
+
+  if(GTest_FOUND)
+    target_link_libraries(test_layerwise_split PRIVATE
+      layerwise_split_kv GTest::gtest_main gflags PkgConfig::GLOG)
+  else()
+    target_link_libraries(test_layerwise_split PRIVATE
+      layerwise_split_kv ${GTEST_LIB} ${GTEST_MAIN_LIB} gflags PkgConfig::GLOG pthread)
+  endif()
+
   add_test(NAME LayerwiseSplitKVTests COMMAND test_layerwise_split)
 endif()

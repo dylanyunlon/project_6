@@ -17,4 +17,9 @@ limitations under the License.
 
 #include <gflags/gflags.h>
 
+// Bool flag for enabling layerwise split (used by engine_ext / master).
 DECLARE_bool(enable_layerwise_split);
+
+// Int32 flag matching upstream xLLM's parallel_config.
+// 1 = disabled (default), >1 = group size for layerwise split.
+DECLARE_int32(layerwise_split_size);

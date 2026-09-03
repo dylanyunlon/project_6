@@ -24,9 +24,13 @@ limitations under the License.
 namespace xllm {
 
 /// Called by llm_engine / speculative_engine at startup.
-/// Returns a LayerwiseSplitLayout if the feature is enabled, otherwise
+/// Returns a IluLayerwiseLayout if the feature is enabled, otherwise
 /// std::nullopt (fallback to uniform allocation).
-std::optional<LayerwiseSplitLayout> maybe_compute_layerwise_layout(
+///
+/// |per_layer_kv_heads|: KV head count for each full-attention layer.
+///   Linear-attention layers are excluded.
+///   For Qwen3.5 TP=4: all entries are 4 (each full-attn layer has 4 KV heads).
+std::optional<IluLayerwiseLayout> maybe_compute_layerwise_layout(
     int64_t num_layers,
     const std::vector<int64_t>& per_layer_kv_heads,
     int32_t world_size);

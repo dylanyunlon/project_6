@@ -17,19 +17,22 @@ limitations under the License.
 
 #include <cstdint>
 #include <optional>
+#include <string>
+#include <vector>
 
 #include "framework/kv_cache/layerwise_split_layout.h"
 
 namespace xllm {
 
 /// Master-side entry point: compute and log the layerwise layout.
-/// |first_moe_layer|: index of the first MoE layer (layers before it are
-///                     dense attention with |dense_kv_heads|).
-std::optional<LayerwiseSplitLayout> master_compute_layerwise_layout(
-    int64_t num_layers,
-    int64_t dense_kv_heads,
-    int64_t moe_kv_heads,
-    int64_t first_moe_layer,
+///
+/// For Qwen3.5 (Qwen3.6-35B-A3B):
+///   |layer_types|: "full_attention" or "linear_attention" per layer.
+///   |kv_heads_per_full_attn_layer|: KV heads for each full-attention layer.
+///   Linear-attention layers are skipped (they use GDN conv+temporal state).
+std::optional<IluLayerwiseLayout> master_compute_layerwise_layout(
+    const std::vector<std::string>& layer_types,
+    int64_t kv_heads_per_full_attn_layer,
     int32_t world_size,
     int64_t n_blocks,
     int64_t block_size,

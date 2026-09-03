@@ -14,18 +14,27 @@ limitations under the License.
 ==============================================================================*/
 
 // Commit: 494f293b5629 · feat · PR #2260  (adapted for Iluvatar BI-V100)
-// gflag definition for enabling/disabling layerwise split KV cache.
+// gflag definitions for layerwise split KV cache.
 //
 // Usage:
-//   --enable_layerwise_split=true   (enable the feature)
-//   --enable_layerwise_split=false  (default — uniform sharding, no change)
+//   --enable_layerwise_split=true --layerwise_split_size=2
+//
+// For Qwen3.5 (Qwen3.6-35B-A3B) on 4× BI-V100 with TP=4:
+//   layerwise_split_size=2 means each rank owns ~half the full-attention
+//   layers' KV cache, reducing peak per-rank KV memory.
 
 #include <gflags/gflags.h>
 
 DEFINE_bool(enable_layerwise_split, false,
             "Enable layerwise-split KV cache sharding.  When true, each "
-            "layer's KV cache is independently sharded across a configurable "
-            "subset of TP ranks, allowing dense attention layers to spread "
-            "across all ranks while MoE layers (few KV heads, GQA) "
-            "concentrate on fewer ranks.  Requires a heterogeneous-layer "
-            "model (e.g. DeepSeek-V3).  Default: false (uniform sharding).");
+            "full-attention layer's KV cache ownership is assigned to a "
+            "subset of TP ranks via round-robin.  Linear-attention layers "
+            "(GDN/DeltaNet) are unaffected — they use conv+temporal state, "
+            "not KV cache.  Default: false (uniform sharding).");
+
+DEFINE_int32(layerwise_split_size, 1,
+             "Layer-owner KV cache group size inside each attention TP group. "
+             "1 disables layerwise split; values > 1 shard persistent KV by "
+             "layer owner and enable layerwise-split communication. The value "
+             "must divide attention TP size.  Matches upstream xLLM "
+             "parallel_config.layerwise_split_size.");

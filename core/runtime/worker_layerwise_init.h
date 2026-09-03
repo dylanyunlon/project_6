@@ -16,22 +16,25 @@ limitations under the License.
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
-#include "framework/kv_cache/kv_cache.h"
-#include "framework/kv_cache/kv_cache_shape.h"
-#include "framework/kv_cache/kv_cache_utils.h"
 #include "framework/kv_cache/layerwise_split_layout.h"
 
 namespace xllm {
 
-/// Worker-side entry: allocate KV caches per the received layout.
-/// Returns true on success; false if any verification check fails.
-bool worker_allocate_layerwise_kv_cache(
-    std::vector<KVCache>& kv_caches,
-    const KVCacheShape& kv_cache_shape,
-    const KVCacheCreateOptions& create_options,
-    const LayerwiseSplitLayout& layout,
-    int32_t rank);
+/// Worker-side entry: compute the layer_cache_owned mask and validate.
+///
+/// For Qwen3.5: the worker receives layerwise_split_size from the master
+/// and builds its ownership mask.  Only full_attention layers participate
+/// in the split; linear_attention layers are always "owned" (no KV cache).
+///
+/// Returns the layer_cache_owned mask, which the vendor vLLM cache engine
+/// uses to decide which layers get real KV allocations vs scratch.
+std::vector<bool> worker_compute_layer_cache_owned(
+    const std::vector<std::string>& layer_types,
+    int32_t layerwise_split_size,
+    int32_t rank,
+    int64_t num_layers);
 
 }  // namespace xllm

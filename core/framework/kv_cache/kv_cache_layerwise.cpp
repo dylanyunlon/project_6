@@ -14,33 +14,36 @@ limitations under the License.
 ==============================================================================*/
 
 // Commit: 494f293b5629 · feat · PR #2260  (adapted for Iluvatar BI-V100)
-// allocate_kv_caches_layerwise: per-layer KV allocation using
-// LayerwiseSplitLayout.  Each layer's shard size is determined by the number
-// of heads assigned to the current rank instead of uniform division.
+// allocate_kv_caches_layerwise: per-layer KV allocation using the
+// layer_cache_owned mask.
 //
-// On ILU (Iluvatar CoreX / BI-V100) the cache tensor layout is transposed:
-//   [n_blocks, n_heads, block_size, head_dim]
-// — the head dimension sits at axis 1, not axis 2 as on CUDA/NPU.
+// On BI-V100 the KV cache tensor layout is transposed ("block-major"):
+//   key_cache:   (n_blocks, n_kv_heads_local, block_size, head_dim/x, x)
+//   value_cache: (n_blocks, n_kv_heads_local, head_dim, block_size)
 //
-// BI-V100 warp size = 64.  head_dim (typically 128) is already a multiple
+// Verified from runtime log with Qwen3.6-35B-A3B TP=4:
+//   key_cache=(68837, 1, 32, 16, 8)  value_cache=(68837, 1, 256, 16)
+//   query=(1, 4, 256)  →  4 q-heads, 1 kv-head per rank, head_dim=256
+//
+// This file implements the scheduling/allocation logic only.  The actual
+// tensor creation is done by the vendor vLLM cache engine (which calls
+// into prebuilt corex_*.so for the kernel layer).  This module decides
+// WHICH layers get real allocations vs scratch placeholders.
+//
+// BI-V100 warp size = 64.  head_dim (256 for Qwen3.5) is a multiple
 // of 64, so coalesced warp-wide loads across the head dimension are aligned.
-// When local_heads * head_dim is not a multiple of 64, the last warp in
-// a block will have idle lanes — we pad head_dim to the next multiple of
-// 64 on ILU to avoid this.
+// When head_dim is not a multiple of 64, the allocator pads to the next
+// multiple to avoid idle warp lanes.
 
 #include "framework/kv_cache/kv_cache_layerwise.h"
 
-#include "framework/kv_cache/kv_cache.h"
-
 #include <glog/logging.h>
-#include <torch/torch.h>
 
 #include <algorithm>
 #include <cstdint>
 #include <vector>
 
 #include "config/ilu_hw_constants.h"
-#include "framework/kv_cache/kv_cache_utils.h"
 #include "framework/kv_cache/layerwise_split_layout.h"
 
 namespace xllm {
@@ -55,72 +58,39 @@ inline int64_t align_up(int64_t val, int64_t align) {
 }  // namespace
 
 void allocate_kv_caches_layerwise(
-    std::vector<KVCache>& kv_caches,
-    const KVCacheShape& base_shape,
-    const KVCacheCreateOptions& create_options,
-    const LayerwiseSplitLayout& layout,
+    const std::vector<bool>& layer_cache_owned,
+    int64_t num_layers,
     int32_t current_rank) {
-  CHECK(kv_caches.empty()) << "KV caches already initialized.";
+  CHECK_EQ(static_cast<int64_t>(layer_cache_owned.size()), num_layers)
+      << "layer_cache_owned size must match num_layers.";
 
-  const int64_t num_layers = create_options.num_layers();
-  CHECK_EQ(num_layers, layout.num_layers())
-      << "Layout/config layer count mismatch.";
-  kv_caches.reserve(num_layers);
-
+  int64_t owned_count = 0;
+  int64_t scratch_count = 0;
   for (int64_t i = 0; i < num_layers; ++i) {
-    if (!layout.rank_owns_layer(current_rank, i)) {
-      kv_caches.emplace_back();          // empty placeholder
-      continue;
-    }
-
-    const int64_t local_heads = layout.heads_for_rank(current_rank, i);
-    CHECK_GT(local_heads, 0);
-
-    // ---------- key cache ----------
-    CHECK(base_shape.has_key_cache_shape());
-    std::vector<int64_t> k_shape = base_shape.key_cache_shape();
-    CHECK_GE(k_shape.size(), 4u);
-
-    // ILU/MLU transposed layout: [n_blocks, n_heads, block_size, head_dim]
-    // CUDA/NPU default layout:   [n_blocks, block_size, n_heads, head_dim]
-    //
-    // BI-V100 warp = 64: pad head_dim to multiple of 64 so that each warp's
-    // contiguous load spans an aligned region.  Standard head_dim (128) is
-    // already aligned; non-standard sizes (e.g. 96) get padded.
-#if defined(USE_ILU) || defined(USE_MLU)
-    constexpr int64_t kHeadDimAlign = ilu_hw::kWarpSize;  // 64
-    k_shape[1] = local_heads;            // axis 1 = n_heads (transposed)
-    k_shape[3] = align_up(k_shape[3], kHeadDimAlign);  // pad head_dim
-#else
-    k_shape[2] = local_heads;            // axis 2 = n_heads (default)
-#endif
-
-    auto opts = torch::TensorOptions()
-                    .dtype(create_options.dtype())
-                    .device(create_options.device());
-    torch::Tensor k_tensor = torch::zeros(k_shape, opts);
-
-    // ---------- value cache ----------
-    if (base_shape.has_value_cache_shape()) {
-      std::vector<int64_t> v_shape = base_shape.value_cache_shape();
-      CHECK_GE(v_shape.size(), 4u);
-#if defined(USE_ILU) || defined(USE_MLU)
-      v_shape[1] = local_heads;
-      v_shape[3] = align_up(v_shape[3], kHeadDimAlign);
-#else
-      v_shape[2] = local_heads;
-#endif
-      torch::Tensor v_tensor = torch::zeros(v_shape, opts);
-      kv_caches.emplace_back(KVCacheTensors{k_tensor, v_tensor});
+    if (layer_cache_owned[static_cast<size_t>(i)]) {
+      ++owned_count;
     } else {
-      kv_caches.emplace_back(KVCacheTensors{k_tensor, torch::Tensor{}});
+      ++scratch_count;
     }
   }
 
-  CHECK_EQ(static_cast<int64_t>(kv_caches.size()), num_layers);
+  // Scheduling decision log — the actual tensor allocation is done by
+  // the vendor vLLM cache engine (CacheEngine._allocate_kv_cache).
+  // This module only decides the ownership mask.
   LOG(INFO) << "[LayerwiseSplit] rank " << current_rank << ": "
-            << layout.layers_on_rank(current_rank) << "/" << num_layers
-            << " layers assigned.";
+            << owned_count << "/" << num_layers
+            << " layers owned, " << scratch_count << " scratch.";
+
+  // Validate head_dim alignment for BI-V100 warp size.
+  // Qwen3.5 head_dim=256, which is 256/64=4 warps — perfectly aligned.
+  constexpr int64_t kHeadDim = ilu_hw::kQwen35HeadDim;
+  constexpr int64_t kWarpAlign = ilu_hw::kWarpSize;
+  const int64_t padded = align_up(kHeadDim, kWarpAlign);
+  if (padded != kHeadDim) {
+    LOG(WARNING) << "[LayerwiseSplit] head_dim=" << kHeadDim
+                 << " not aligned to warp_size=" << kWarpAlign
+                 << ", padded to " << padded;
+  }
 }
 
 }  // namespace xllm

@@ -14,60 +14,73 @@ limitations under the License.
 ==============================================================================*/
 
 // Commit: 494f293b5629 · feat · PR #2260  (adapted for Iluvatar BI-V100)
-// Worker-side helper: after the worker receives its LayerwiseSplitLayout
-// from the master, it calls this to allocate per-layer KV caches with
-// the correct shard sizes.
+// Worker-side helper: after the worker receives its layerwise_split_size
+// from the master, it computes the layer_cache_owned mask for KV cache
+// allocation.
+//
+// On BI-V100, the actual KV cache tensor allocation is done by the vendor
+// vLLM cache engine (CacheEngine._allocate_kv_cache), which uses the
+// prebuilt corex_*.so kernel extensions.  This module only decides the
+// ownership mask at the scheduling layer.
 
 #include "runtime/worker_layerwise_init.h"
 
 #include <glog/logging.h>
 
+#include <string>
 #include <vector>
 
-#include "framework/kv_cache/kv_cache.h"
 #include "framework/kv_cache/kv_cache_layerwise.h"
-#include "framework/kv_cache/kv_cache_shape.h"
-#include "framework/kv_cache/kv_cache_utils.h"
 #include "framework/kv_cache/layerwise_split_layout.h"
 
 namespace xllm {
 
-bool worker_allocate_layerwise_kv_cache(
-    std::vector<KVCache>& kv_caches,
-    const KVCacheShape& kv_cache_shape,
-    const KVCacheCreateOptions& create_options,
-    const LayerwiseSplitLayout& layout,
-    int32_t rank) {
-  LOG(INFO) << "[Worker " << rank << "] Applying layerwise KV layout: "
-            << layout.layers_on_rank(rank) << " layers assigned.";
+std::vector<bool> worker_compute_layer_cache_owned(
+    const std::vector<std::string>& layer_types,
+    int32_t layerwise_split_size,
+    int32_t rank,
+    int64_t num_layers) {
+  CHECK_GE(layerwise_split_size, 1);
+  CHECK_GE(rank, 0);
+  CHECK_GT(num_layers, 0);
 
-  try {
-    allocate_kv_caches_layerwise(
-        kv_caches, kv_cache_shape, create_options, layout, rank);
-  } catch (const std::exception& e) {
-    LOG(ERROR) << "[Worker " << rank
-               << "] Failed to allocate layerwise KV cache: " << e.what();
-    return false;
+  if (layerwise_split_size <= 1) {
+    // No layerwise split — all layers owned.
+    LOG(INFO) << "[Worker " << rank << "] No layerwise split, all "
+              << num_layers << " layers owned.";
+    return std::vector<bool>(static_cast<size_t>(num_layers), true);
   }
 
-  // Verify: assigned layers should have non-empty caches.
-  for (int64_t lid = 0; lid < layout.num_layers(); ++lid) {
-    bool owns = layout.rank_owns_layer(rank, lid);
-    bool empty = kv_caches[lid].empty();
-    if (owns && empty) {
-      LOG(ERROR) << "[Worker " << rank << "] Layer " << lid
-                 << " is assigned but KV cache is empty.";
-      return false;
+  const LayerwiseSplitLayout layout(
+      /*enabled=*/true,
+      layerwise_split_size,
+      rank % layerwise_split_size);
+
+  auto owned = build_layer_cache_owned(layer_types, layout, num_layers);
+
+  // Verify and log.
+  int64_t owned_count = 0;
+  int64_t linear_count = 0;
+  for (int64_t i = 0; i < num_layers; ++i) {
+    if (owned[static_cast<size_t>(i)]) {
+      ++owned_count;
     }
-    if (!owns && !empty) {
-      LOG(ERROR) << "[Worker " << rank << "] Layer " << lid
-                 << " is NOT assigned but KV cache is non-empty.";
-      return false;
+    if (!layer_types.empty() &&
+        static_cast<size_t>(i) < layer_types.size() &&
+        layer_types[static_cast<size_t>(i)] == "linear_attention") {
+      ++linear_count;
     }
   }
 
-  LOG(INFO) << "[Worker " << rank << "] Layerwise KV cache allocation OK.";
-  return true;
+  LOG(INFO) << "[Worker " << rank << "] Layerwise split (size="
+            << layerwise_split_size << "): " << owned_count << "/"
+            << num_layers << " layers owned, " << linear_count
+            << " linear-attention (always owned).";
+
+  // Delegate to scheduling-layer allocation check.
+  allocate_kv_caches_layerwise(owned, num_layers, rank);
+
+  return owned;
 }
 
 }  // namespace xllm

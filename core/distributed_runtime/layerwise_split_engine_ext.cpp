@@ -20,6 +20,11 @@ limitations under the License.
 // In the upstream xLLM, this would be edits to llm_engine.cpp (+18 lines)
 // and speculative_engine.cpp (+12 lines).  Here we isolate them in a
 // self-contained compilation unit that the engines call into.
+//
+// The vendor vLLM on BI-V100 uses prebuilt CoreX .so extensions
+// (corex_paged_kv_gather.so, etc.) for the kernel layer.  This module
+// operates at the scheduling layer above — deciding which layers each
+// rank owns for KV cache purposes.
 
 #include "distributed_runtime/layerwise_split_engine_ext.h"
 
@@ -29,16 +34,15 @@ limitations under the License.
 #include <optional>
 #include <vector>
 
-#include "common/global_flags.h"
 #include "framework/kv_cache/layerwise_split_layout.h"
 #include "framework/parallel_state/mapping_ilu.h"
 
-// The flag is declared in parallel_config.cpp / global_flags.h (sub-task 7).
+// The flag is declared in parallel_config_layerwise.h / .cpp (sub-task 7).
 DECLARE_bool(enable_layerwise_split);
 
 namespace xllm {
 
-std::optional<LayerwiseSplitLayout> maybe_compute_layerwise_layout(
+std::optional<IluLayerwiseLayout> maybe_compute_layerwise_layout(
     int64_t num_layers,
     const std::vector<int64_t>& per_layer_kv_heads,
     int32_t world_size) {
@@ -47,24 +51,13 @@ std::optional<LayerwiseSplitLayout> maybe_compute_layerwise_layout(
   }
 
   LOG(INFO) << "[LayerwiseSplit] Computing layout for " << num_layers
-            << " layers, world_size=" << world_size;
+            << " full-attention layers, world_size=" << world_size;
 
-#if defined(USE_ILU)
   // Iluvatar BI-V100: verified 4-card flat PIX topology (ixsmi topo -m).
   // All pairs connected via single PCIe bridge, equal bandwidth.
   return compute_ilu_layerwise_layout(
       num_layers, per_layer_kv_heads, world_size,
       IluTopoKind::kFlatPIX);
-#elif defined(USE_NPU)
-  // Ascend NPU: would use mapping_npu.cpp (not this adaptation).
-  LOG(WARNING) << "[LayerwiseSplit] NPU path not compiled in this build.";
-  return std::nullopt;
-#else
-  // Generic CUDA fallback: flat topology (all ranks equidistant).
-  return compute_ilu_layerwise_layout(
-      num_layers, per_layer_kv_heads, world_size,
-      IluTopoKind::kFlatPIX);
-#endif
 }
 
 }  // namespace xllm

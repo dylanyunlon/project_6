@@ -81,6 +81,41 @@ constexpr bool kFlatTopology = true;
 /// TDP per card: 250W (from ixsmi Pwr cap).
 constexpr int32_t kTdpWatts = 250;
 
+// ---------- KV cache tensor layout (verified from runtime logs) ----------
+//
+// key_cache   shape = (n_blocks, n_kv_heads_local, block_size, head_dim/x, x)
+//           example = (68837,    1,                32,         16,         8)
+// value_cache shape = (n_blocks, n_kv_heads_local, head_dim, block_size)
+//           example = (68837,    1,                256,      16)
+//
+// This is the transposed ("block-major") layout used by the vendor vLLM
+// for Iluvatar BI-V100.  Key cache splits head_dim into two factors
+// (head_dim/x, x) where x=8 for fp16 (128-bit / sizeof(fp16)).
+// Value cache transposes block_size to the last axis.
+//
+// Source: runtime log with Qwen3.6-35B-A3B (Qwen3_5 arch), TP=4:
+//   [BI100 PAGED_ATTN] decode_dispatch ... query=(1, 4, 256)
+//   key_cache=(68837, 1, 32, 16, 8) value_cache=(68837, 1, 256, 16)
+//   block_tables=(1, 2841) required_blocks=2841 threshold=32768
+//
+// The x factor for the key cache head_dim split:
+//   x = 128 / sizeof(dtype_bits)  →  128/16=8 for fp16, 128/16=8 for bf16
+constexpr int32_t kKeyCacheHeadDimSplitFp16 = 8;
+
+/// Default block size used by the vendor vLLM paged attention.
+constexpr int32_t kDefaultBlockSize = 16;
+
+// ---------- Qwen3.5 model constants (Qwen3.6-35B-A3B) ----------
+// From the model config and verified runtime shapes:
+//   num_attention_heads=16, num_key_value_heads=4, head_dim=256
+//   With TP=4: local_q_heads=4, local_kv_heads=1, GQA ratio=4
+//   layer_types: interleaved full_attention and linear_attention
+//   Linear attention layers (GDN/DeltaNet) do NOT use KV cache.
+constexpr int32_t kQwen35NumAttentionHeads = 16;
+constexpr int32_t kQwen35NumKVHeads = 4;
+constexpr int32_t kQwen35HeadDim = 256;
+constexpr int32_t kQwen35GQARatio = kQwen35NumAttentionHeads / kQwen35NumKVHeads;
+
 // ---------- Software ----------
 
 /// CUDA compatibility version exposed by CoreX SDK.
