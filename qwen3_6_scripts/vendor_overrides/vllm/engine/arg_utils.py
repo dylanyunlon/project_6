@@ -107,6 +107,12 @@ class EngineArgs:
     pipeline_parallel_size: int = 1
     tensor_parallel_size: int = 1
     data_parallel_size: int = int(os.environ.get("VLLM_DATA_PARALLEL_SIZE", "1"))
+    # [PR #2269] EP support: enable expert parallelism for MoE models.
+    enable_expert_parallel: bool = bool(int(os.environ.get(
+        "VLLM_ENABLE_EXPERT_PARALLEL", "0")))
+    all2all_backend: str = os.environ.get(
+        "VLLM_ALL2ALL_BACKEND", "allgather_reducescatter")
+    enable_eplb: bool = bool(int(os.environ.get("VLLM_ENABLE_EPLB", "0")))
     max_parallel_loading_workers: Optional[int] = None
     block_size: int = 16
     enable_prefix_caching: bool = False
@@ -928,6 +934,9 @@ class EngineArgs:
             pipeline_parallel_size=self.pipeline_parallel_size,
             tensor_parallel_size=self.tensor_parallel_size,
             data_parallel_size=self.data_parallel_size,
+            enable_expert_parallel=self.enable_expert_parallel,
+            all2all_backend=self.all2all_backend,
+            enable_eplb=self.enable_eplb,
             worker_use_ray=self.worker_use_ray,
             max_parallel_loading_workers=self.max_parallel_loading_workers,
             disable_custom_all_reduce=True,

@@ -468,8 +468,8 @@ def init_worker_distributed_environment(
     #   [dp0_tp0, dp0_tp1, dp1_tp0, dp1_tp1] for tp=2, dp=2
     # Each DP group contains ranks with the same TP-local position.
     dp_size = parallel_config.data_parallel_size
+    tp_size = parallel_config.tensor_parallel_size
     if dp_size > 1:
-        tp_size = parallel_config.tensor_parallel_size
         dp_rank = rank // tp_size
         tp_rank = rank % tp_size
         parallel_config.dp_rank = dp_rank
@@ -482,6 +482,28 @@ def init_worker_distributed_environment(
             group = dist.new_group(dp_ranks)
             if tp_rank == tp_pos:
                 parallel_config._dp_group = group
+
+    # [PR #2269] Initialize expert parallel process group.
+    # When enable_expert_parallel is True, MoE experts are sharded across
+    # all devices (ep_size = tp_size * dp_size). Each device holds
+    # num_experts / ep_size experts and uses all-to-all to dispatch tokens
+    # to the correct expert-holding rank.
+    #
+    # xllm equivalent: collective_communicator.cpp creates moe_ep_group_
+    # with ep_size ranks, using the same rank layout.
+    #
+    # EP group = all ranks (since ep_size = world_size in the standard
+    # DeepSeek-style EP layout where every rank holds a disjoint expert
+    # shard). For DP+EP, ep_size = tp_size * dp_size = world_size.
+    if parallel_config.enable_expert_parallel:
+        import torch.distributed as dist
+        world_size = parallel_config.world_size
+        ep_ranks = list(range(world_size))
+        parallel_config._ep_group = dist.new_group(ep_ranks)
+        logger.info(
+            "[PR #2269] EP process group initialized: ep_size=%d, "
+            "all2all_backend=%s, rank=%d",
+            world_size, parallel_config.all2all_backend, rank)
 
 
 def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):

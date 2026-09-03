@@ -826,6 +826,9 @@ class ParallelConfig:
         pipeline_parallel_size: int,
         tensor_parallel_size: int,
         data_parallel_size: int = 1,
+        enable_expert_parallel: bool = False,
+        all2all_backend: str = "allgather_reducescatter",
+        enable_eplb: bool = False,
         worker_use_ray: Optional[bool] = None,
         max_parallel_loading_workers: Optional[int] = None,
         disable_custom_all_reduce: bool = False,
@@ -838,6 +841,13 @@ class ParallelConfig:
         self.pipeline_parallel_size = pipeline_parallel_size
         self.tensor_parallel_size = tensor_parallel_size
         self.data_parallel_size = data_parallel_size
+        # [PR #2269] EP support: when enable_expert_parallel is True, MoE
+        # experts are sharded across devices via expert parallelism instead
+        # of tensor parallelism. ep_size is derived from tp_size * dp_size
+        # in FusedMoEParallelConfig.from_parallel_config().
+        self.enable_expert_parallel = enable_expert_parallel
+        self.all2all_backend = all2all_backend
+        self.enable_eplb = enable_eplb
         self.distributed_executor_backend = distributed_executor_backend
         self.max_parallel_loading_workers = max_parallel_loading_workers
         self.disable_custom_all_reduce = disable_custom_all_reduce
@@ -848,6 +858,10 @@ class ParallelConfig:
                            * self.data_parallel_size)
         # dp_rank is assigned per-worker during init_device
         self.dp_rank: int = 0
+        # _dp_group is assigned per-worker during init_device
+        self._dp_group = None
+        # [PR #2269] _ep_group is assigned per-worker during init_device
+        self._ep_group = None
 
         if worker_use_ray:
             if self.distributed_executor_backend is None:
