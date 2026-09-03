@@ -24,6 +24,111 @@ limitations under the License.
 namespace xllm {
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// Minja compatibility: rewrite "is undefined" / "is not undefined" tests.
+//
+// Qwen3.8-27B's official chat template uses Jinja2's "is undefined" test:
+//   {% if enable_thinking is undefined %}...{% endif %}
+// Minja (xLLM's Jinja engine) represents missing template arguments as null
+// (None), not as truly undefined variables.  Minja supports "is none" but not
+// "is undefined".  We rewrite the tests before handing the template to Minja.
+//
+// Commit: 9071dd22 · feat · PR #2246
+// ---------------------------------------------------------------------------
+
+/// Replace "is undefined" → "is none" and "is not undefined" → "is not none"
+/// within a single Jinja expression/statement block.  Tracks quoted strings
+/// so that literal text like "'value is undefined'" is left untouched.
+std::string replace_undefined_tests(const std::string& block) {
+  std::string result;
+  result.reserve(block.size());
+
+  char in_quote = 0;  // 0 = not in string, '\'' or '"' = current quote char
+  size_t i = 0;
+
+  while (i < block.size()) {
+    // Track quote boundaries (skip escaped quotes).
+    if (!in_quote && (block[i] == '\'' || block[i] == '"')) {
+      in_quote = block[i];
+      result += block[i];
+      ++i;
+      continue;
+    }
+    if (in_quote) {
+      if (block[i] == '\\' && i + 1 < block.size()) {
+        // Escaped character inside string — copy both.
+        result += block[i];
+        result += block[i + 1];
+        i += 2;
+        continue;
+      }
+      if (block[i] == in_quote) {
+        in_quote = 0;
+      }
+      result += block[i];
+      ++i;
+      continue;
+    }
+
+    // Outside quotes — try to match "is not undefined" first (longer match).
+    const std::string kIsNotUndefined = "is not undefined";
+    const std::string kIsUndefined = "is undefined";
+
+    if (block.compare(i, kIsNotUndefined.size(), kIsNotUndefined) == 0) {
+      result += "is not none";
+      i += kIsNotUndefined.size();
+    } else if (block.compare(i, kIsUndefined.size(), kIsUndefined) == 0) {
+      result += "is none";
+      i += kIsUndefined.size();
+    } else {
+      result += block[i];
+      ++i;
+    }
+  }
+
+  return result;
+}
+
+/// Scan a Jinja template for {{ }} and {% %} blocks and apply
+/// replace_undefined_tests() within each block.  Plain text outside
+/// Jinja blocks is passed through unmodified.
+std::string normalize_minja_tests(const std::string& tmpl) {
+  std::string result;
+  result.reserve(tmpl.size());
+
+  size_t i = 0;
+  while (i < tmpl.size()) {
+    // Look for Jinja block openers: {{ or {%
+    if (i + 1 < tmpl.size() && tmpl[i] == '{' &&
+        (tmpl[i + 1] == '{' || tmpl[i + 1] == '%')) {
+      const bool is_expr = (tmpl[i + 1] == '{');
+      const std::string closer = is_expr ? "}}" : "%}";
+
+      // Find the matching closer.
+      size_t end = tmpl.find(closer, i + 2);
+      if (end == std::string::npos) {
+        // Unclosed block — copy the rest verbatim.
+        result += tmpl.substr(i);
+        break;
+      }
+
+      // Extract the block (including delimiters), rewrite only the interior.
+      const std::string opener = tmpl.substr(i, 2);
+      const std::string interior = tmpl.substr(i + 2, end - (i + 2));
+      result += opener;
+      result += replace_undefined_tests(interior);
+      result += closer;
+      i = end + 2;
+    } else {
+      result += tmpl[i];
+      ++i;
+    }
+  }
+
+  return result;
+}
+
 const std::unordered_map<std::string, std::string> type_to_modality = {
     {"video_url", "video"},
     {"image_url", "image"},
@@ -35,8 +140,12 @@ const std::unordered_map<std::string, std::string> type_to_modality = {
 
 JinjaChatTemplate::JinjaChatTemplate(const TokenizerArgs& args) : args_(args) {
   try {
+    // Normalize "is undefined" → "is none" for Minja compatibility
+    // (Qwen3.8-27B and other models that use Jinja2's "is undefined" test).
+    const std::string normalized_template =
+        normalize_minja_tests(args_.chat_template());
     template_ = std::make_unique<minja::chat_template>(
-        args_.chat_template(), args_.bos_token(), args_.eos_token());
+        normalized_template, args_.bos_token(), args_.eos_token());
     LOG(INFO) << "Jinja chat template init succeed.";
 
   } catch (const std::exception& e) {

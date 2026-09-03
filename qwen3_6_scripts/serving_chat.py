@@ -45,6 +45,80 @@ from vllm.utils import iterate_with_cancellation, random_uuid
 logger = init_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# [9071dd22] Minja / Jinja2 compat: rewrite "is undefined" → "is none"
+# Qwen3.8-27B's official chat template uses Jinja2's "is undefined" test.
+# Some Jinja2 environments treat missing kwargs inconsistently.
+# This preprocessing normalizes the template before rendering.
+# Ported from upstream xLLM commit 9071dd22 (PR #2246).
+# ---------------------------------------------------------------------------
+import re as _re
+
+def _normalize_undefined_tests(template: str) -> str:
+    """Rewrite 'is undefined' → 'is none' inside Jinja2 blocks.
+
+    Only rewrites inside {% %} and {{ }} blocks.  Plain text and
+    quoted strings within blocks are left untouched.
+    """
+    def _replace_in_block(block_interior: str) -> str:
+        """Quote-aware replacement within a single Jinja block."""
+        result = []
+        in_quote = None
+        i = 0
+        while i < len(block_interior):
+            ch = block_interior[i]
+            # Track quote boundaries.
+            if not in_quote and ch in ("'", '"'):
+                in_quote = ch
+                result.append(ch)
+                i += 1
+                continue
+            if in_quote:
+                if ch == '\\' and i + 1 < len(block_interior):
+                    result.append(ch)
+                    result.append(block_interior[i + 1])
+                    i += 2
+                    continue
+                if ch == in_quote:
+                    in_quote = None
+                result.append(ch)
+                i += 1
+                continue
+            # Outside quotes: rewrite (longer match first).
+            tail = block_interior[i:]
+            if tail.startswith("is not undefined"):
+                result.append("is not none")
+                i += len("is not undefined")
+            elif tail.startswith("is undefined"):
+                result.append("is none")
+                i += len("is undefined")
+            else:
+                result.append(ch)
+                i += 1
+        return "".join(result)
+
+    # Scan for {{ }} and {% %} blocks; rewrite only their interiors.
+    out = []
+    i = 0
+    while i < len(template):
+        if (i + 1 < len(template) and template[i] == '{'
+                and template[i + 1] in ('{', '%')):
+            is_expr = (template[i + 1] == '{')
+            closer = "}}" if is_expr else "%}"
+            end = template.find(closer, i + 2)
+            if end == -1:
+                out.append(template[i:])
+                break
+            out.append(template[i:i + 2])               # opener
+            out.append(_replace_in_block(template[i + 2:end]))  # interior
+            out.append(closer)
+            i = end + 2
+        else:
+            out.append(template[i])
+            i += 1
+    return "".join(out)
+
+
 def _serialize_tool_arguments(arguments) -> str:
     if arguments is None:
         return "{}"
@@ -314,13 +388,28 @@ class OpenAIServingChat(OpenAIServing):
             # Qwen3.5/3.6-MoE templates inject '<think>\n\n</think>\n\n'
             # when enable_thinking=false, which causes the model to
             # degenerate (outputs '!!!!!'). Patch it out once.
+            #
+            # [9071dd22] Qwen3.8-27B templates use Jinja2's "is undefined"
+            # test.  HuggingFace Jinja2 handles this natively, but some
+            # older transformers builds bundle Jinja2 < 3.0 where the
+            # "undefined" test may behave inconsistently.  Rewrite
+            # "is undefined" → "is none" and "is not undefined" →
+            # "is not none" inside Jinja blocks for robustness.
             if not self._template_patched and hasattr(tokenizer, 'chat_template'):
-                _tgt = r"{{- '<think>\n\n</think>\n\n' }}"
-                if isinstance(tokenizer.chat_template, str) and _tgt in tokenizer.chat_template:
-                    tokenizer.chat_template = tokenizer.chat_template.replace(
-                        _tgt, "{{- '' }}", 1)
-                    logger.info("[BI100] Patched chat_template: removed empty "
-                                "<think></think> block for non-thinking mode")
+                if isinstance(tokenizer.chat_template, str):
+                    _tgt = r"{{- '<think>\n\n</think>\n\n' }}"
+                    if _tgt in tokenizer.chat_template:
+                        tokenizer.chat_template = tokenizer.chat_template.replace(
+                            _tgt, "{{- '' }}", 1)
+                        logger.info("[BI100] Patched chat_template: removed empty "
+                                    "<think></think> block for non-thinking mode")
+                    # [9071dd22] Normalize "is undefined" → "is none" for
+                    # Qwen3.8-27B compatibility (PR #2246).
+                    if "is undefined" in tokenizer.chat_template:
+                        tokenizer.chat_template = _normalize_undefined_tests(
+                            tokenizer.chat_template)
+                        logger.info("[BI100] Patched chat_template: rewrote "
+                                    "'is undefined' → 'is none' for Minja compat")
                 self._template_patched = True
 
             conversation, mm_data_future = parse_chat_messages_futures(
