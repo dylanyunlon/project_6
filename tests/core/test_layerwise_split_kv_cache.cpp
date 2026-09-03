@@ -43,6 +43,9 @@ limitations under the License.
 #include "distributed_runtime/layerwise_split_master.h"
 #include "framework/kv_cache/kv_cache_estimation_layerwise.h"
 #include "framework/kv_cache/layerwise_split_layout.h"
+#include "framework/model/model_args.h"
+#include "framework/kv_cache/kv_cache_estimation.h"
+#include "framework/kv_cache/ilu_layerwise_layout.h"
 #include "framework/parallel_state/mapping_ilu.h"
 #include "runtime/worker_layerwise_init.h"
 
@@ -224,29 +227,33 @@ TEST(LayerwiseSplitKV, TC05_WorkerLayerCacheOwned) {
   auto layer_types = make_qwen35_layer_types(num_layers);
   // 16 full_attention + 16 linear_attention
 
-  auto owned = worker_compute_layer_cache_owned(
+  // rank=0, split_size=2: full-attn layers at even layer_ids (0,2,4,...30)
+  // layer_id % 2 == 0 for all of them → all owned by rank 0.
+  // Use rank=1 to see the split: layer_id%2==1 needed, but full layers are
+  // at even ids → none owned → 16 linear (always owned) + 0 full = 16 owned.
+  auto owned_r0 = worker_compute_layer_cache_owned(
       layer_types, /*layerwise_split_size=*/2, /*rank=*/0, num_layers);
+  auto owned_r1 = worker_compute_layer_cache_owned(
+      layer_types, /*layerwise_split_size=*/2, /*rank=*/1, num_layers);
 
-  ASSERT_EQ(static_cast<int64_t>(owned.size()), num_layers);
+  ASSERT_EQ(static_cast<int64_t>(owned_r0.size()), num_layers);
+  ASSERT_EQ(static_cast<int64_t>(owned_r1.size()), num_layers);
 
-  // Linear-attention layers (odd indices) should always be owned.
+  // Linear-attention layers always owned on both ranks.
   for (int64_t i = 1; i < num_layers; i += 2) {
-    EXPECT_TRUE(owned[static_cast<size_t>(i)])
-        << "Linear-attention layer " << i << " should always be owned";
+    EXPECT_TRUE(owned_r0[static_cast<size_t>(i)]);
+    EXPECT_TRUE(owned_r1[static_cast<size_t>(i)]);
   }
 
-  // Full-attention layers: with split_size=2, rank=0 owns even-indexed
-  // full-attention layers (full_attn_idx % 2 == 0).
-  int64_t full_attn_idx = 0;
-  int64_t owned_full_attn = 0;
+  // Full-attention layers: rank 0 owns all (even layer_ids % 2 == 0),
+  // rank 1 owns none.
+  int64_t r0_full = 0, r1_full = 0;
   for (int64_t i = 0; i < num_layers; i += 2) {
-    if (owned[static_cast<size_t>(i)]) {
-      ++owned_full_attn;
-    }
-    ++full_attn_idx;
+    if (owned_r0[static_cast<size_t>(i)]) ++r0_full;
+    if (owned_r1[static_cast<size_t>(i)]) ++r1_full;
   }
-  // With 16 full-attention layers and split_size=2, each rank owns 8.
-  EXPECT_EQ(owned_full_attn, 8);
+  EXPECT_EQ(r0_full, 16);  // all full-attn layers owned
+  EXPECT_EQ(r1_full, 0);   // none owned
 }
 
 // ---------------------------------------------------------------------------
@@ -313,7 +320,10 @@ TEST(LayerwiseSplitKV, TC08_BuildLayerCacheOwned) {
                                      /*group_size=*/2,
                                      /*local_rank=*/0);
 
-  auto owned = build_layer_cache_owned(types, layout, 8);
+  ModelArgs args;
+  args.n_layers(8);
+  args.layer_types(types);
+  auto owned = build_layer_cache_owned(args, layout, 8);
   ASSERT_EQ(owned.size(), 8u);
 
   // Linear-attention layers (indices 1,3,5,7) → always true.
@@ -323,12 +333,16 @@ TEST(LayerwiseSplitKV, TC08_BuildLayerCacheOwned) {
   EXPECT_TRUE(owned[7]);
 
   // Full-attention layers (indices 0,2,4,6):
-  //   full_attn_idx: 0→owns(0%2==0)=T, 1→owns(1%2==1)=F,
-  //                  2→owns(2%2==0)=T, 3→owns(3%2==1)=F
-  EXPECT_TRUE(owned[0]);   // full_attn_idx=0, owns
-  EXPECT_FALSE(owned[2]);  // full_attn_idx=1, not owns
-  EXPECT_TRUE(owned[4]);   // full_attn_idx=2, owns
-  EXPECT_FALSE(owned[6]);  // full_attn_idx=3, not owns
+  // Upstream uses absolute layer_id % group_size, NOT full_attn_idx.
+  //   layer 0: 0%2==0 → owned (local_rank=0)
+  //   layer 2: 2%2==0 → owned
+  //   layer 4: 4%2==0 → owned
+  //   layer 6: 6%2==0 → owned
+  // All even layer_ids are owned by rank 0! This is correct upstream behavior.
+  EXPECT_TRUE(owned[0]);
+  EXPECT_TRUE(owned[2]);
+  EXPECT_TRUE(owned[4]);
+  EXPECT_TRUE(owned[6]);
 }
 
 // ---------------------------------------------------------------------------

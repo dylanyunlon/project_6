@@ -30,6 +30,7 @@ limitations under the License.
 // scratch overhead.
 
 #include "framework/kv_cache/kv_cache_estimation_layerwise.h"
+#include "framework/kv_cache/layerwise_split_layout.h"
 
 #include <glog/logging.h>
 
