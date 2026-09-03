@@ -840,7 +840,14 @@ class EngineArgs:
         # Get the list of attributes of this dataclass.
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         # Set the attributes from the parsed arguments.
-        engine_args = cls(**{attr: getattr(args, attr) for attr in attrs})
+        # Fields that exist in the dataclass but have no corresponding CLI
+        # argument (e.g. data_parallel_size, enable_expert_parallel) will
+        # fall back to their dataclass defaults (typically read from env vars).
+        engine_args = cls(**{
+            attr: getattr(args, attr)
+            for attr in attrs
+            if hasattr(args, attr)
+        })
         return engine_args
 
     def create_model_config(self) -> ModelConfig:
