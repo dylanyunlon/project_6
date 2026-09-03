@@ -414,6 +414,10 @@ def patch_fused_moe_for_ep():
         if self.use_grouped_topk:
             from vllm.model_executor.layers.fused_moe.fused_moe import (
                 grouped_topk)
+            logger.info("[EP] routing: grouped_topk (num_expert_group=%s, "
+                        "topk_group=%s, num_experts=%d, top_k=%d)",
+                        self.num_expert_group, self.topk_group,
+                        self.num_experts, self.top_k)
             topk_weights, topk_ids = grouped_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -463,34 +467,18 @@ def patch_fused_moe_for_ep():
         # topk_ids: (T_local, K) with values in [0, num_experts)
         # topk_weights: (T_local, K)
 
-        # ----- Step 2: All-Gather hidden states + routing info -----
-        # Replicate all tokens on every rank so each rank can compute its
-        # local experts on the full token set.
-        if ep_size > 1:
-            gathered_hidden_list = [torch.empty_like(hidden_states)
-                                    for _ in range(ep_size)]
-            dist.all_gather(gathered_hidden_list, hidden_states.contiguous())
-            all_hidden = torch.cat(gathered_hidden_list, dim=0)  # (T_global, H)
-
-            # Pack topk_ids and topk_weights into one tensor for a single
-            # all_gather (Google's 3-to-2 optimization, PR #2836).
-            # topk_ids is int64, topk_weights is fp16/fp32 — cast weights
-            # to int and stack.
-            topk_ids_i32 = topk_ids.to(torch.int32).contiguous()
-            topk_weights_i32 = topk_weights.to(torch.float32).view(
-                torch.int32).contiguous()
-            # blob shape: (T_local, K, 2) — pack ids and weights
-            blob = torch.stack([topk_ids_i32, topk_weights_i32], dim=-1)
-            gathered_blob_list = [torch.empty_like(blob) for _ in range(ep_size)]
-            dist.all_gather(gathered_blob_list, blob)
-            all_blob = torch.cat(gathered_blob_list, dim=0)  # (T_global, K, 2)
-            all_topk_ids = all_blob[:, :, 0].long()
-            all_topk_weights = all_blob[:, :, 1].view(torch.float32).to(
-                topk_weights.dtype)
-        else:
-            all_hidden = hidden_states
-            all_topk_ids = topk_ids
-            all_topk_weights = topk_weights
+        # ----- Step 2: Token replication -----
+        # Under TP=4 + EP=4 (same process group), every rank already sees
+        # ALL tokens (TP shards hidden dimensions, not tokens).  No need
+        # to all_gather — each rank can directly compute its local experts
+        # on hidden_states, then all_reduce the partial results.
+        #
+        # all_gather + reduce_scatter is only needed when EP spans a
+        # DIFFERENT group than TP (e.g. DP>1 where different DP ranks
+        # have different tokens).  For now TP==EP, so skip.
+        all_hidden = hidden_states
+        all_topk_ids = topk_ids
+        all_topk_weights = topk_weights
 
         T_global = all_hidden.shape[0]
 
@@ -571,20 +559,14 @@ def patch_fused_moe_for_ep():
         # unsorted_output is (T_global * K, H), reshape to (T_global, K, H)
         token_output = unsorted_output.view(T_global, K, H).sum(dim=1)
 
-        # ----- Step 4: Reduce-Scatter (or All-Reduce) -----
+        # ----- Step 4: All-Reduce partial results -----
         # Each rank computed a partial result (only its local experts contribute
         # non-zero values). Sum across all EP ranks to get the full output.
+        # Since all ranks have the SAME token set (TP=EP), use all_reduce.
         if ep_size > 1:
-            # Reduce-scatter: each rank gets its local T_local tokens back
-            # token_output is (T_global, H) = (T_local * ep_size, H)
-            # After reduce_scatter, result is (T_local, H)
-            output = torch.empty(
-                T_local, H, dtype=hidden_states.dtype, device=device)
-            dist.reduce_scatter_tensor(output, token_output)
-        else:
-            output = token_output
+            dist.all_reduce(token_output)
 
-        return output
+        return token_output
 
     # Apply patches
     FusedMoE.__init__ = _ep_init
