@@ -35,6 +35,8 @@ command:
 env:
     - name: VLLM_ENGINE_ITERATION_TIMEOUT_S
       value: 3600
+    - name: VLLM_ENABLE_EXPERT_PARALLEL
+      value: 1
     - name: BI100_MAX_NUM_SEQS
       value: 2
     - name: BI100_MOE_COREX_DIRECT_ROUTED

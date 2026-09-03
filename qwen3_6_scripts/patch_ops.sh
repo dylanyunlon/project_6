@@ -164,17 +164,6 @@ install_patch_file \
     "${VLLM_OVERRIDE_ROOT}/worker/worker.py" \
     "${VLLM_ROOT}/worker/worker.py"
 
-build_stage "installing PR #2269 DP/EP-aware speculative decoding overrides"
-install_patch_file \
-    "${VLLM_OVERRIDE_ROOT}/spec_decode/spec_decode_worker.py" \
-    "${VLLM_ROOT}/spec_decode/spec_decode_worker.py"
-install_patch_file \
-    "${VLLM_OVERRIDE_ROOT}/spec_decode/multi_step_worker.py" \
-    "${VLLM_ROOT}/spec_decode/multi_step_worker.py"
-install_patch_file \
-    "${VLLM_OVERRIDE_ROOT}/spec_decode/metrics.py" \
-    "${VLLM_ROOT}/spec_decode/metrics.py"
-
 build_stage "installing hash-pinned CoreX 3.2.3 extensions"
 bash ./install_prebuilt_corex.sh "${VLLM_ROOT}"
 
