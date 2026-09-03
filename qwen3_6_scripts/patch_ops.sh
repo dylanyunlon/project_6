@@ -181,6 +181,7 @@ cp ./bi100_env.py "${VLLM_ROOT}/bi100_env.py"
 cp ./bi100_profile.py "${VLLM_ROOT}/bi100_profile.py"
 cp ./block_major_kv_cache.py "${VLLM_ROOT}/block_major_kv_cache.py"
 cp ./gdn_prefix.py "${VLLM_ROOT}/gdn_prefix.py"
+cp ./ep_fused_moe_patch.py "${VLLM_ROOT}/ep_fused_moe_patch.py"
 
 build_stage "installing CoreX paged-KV swap compatibility"
 python3 ./patch_corex_swap_blocks.py

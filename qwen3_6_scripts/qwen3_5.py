@@ -66,6 +66,15 @@ from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                ReplicatedLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.fused_moe import FusedMoE
+# [PR #2269] Apply EP patch to FusedMoE before any layers are constructed.
+# When VLLM_ENABLE_EXPERT_PARALLEL=1, this replaces TP-sharded MoE weights
+# with EP-sharded MoE weights (each card holds num_experts/ep_size experts
+# with full intermediate_size), solving the OOM under TP=2.
+try:
+    from vllm.ep_fused_moe_patch import patch_fused_moe_for_ep as _patch_ep
+    _patch_ep()
+except ImportError:
+    pass  # EP patch not installed — TP mode unchanged
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import (
