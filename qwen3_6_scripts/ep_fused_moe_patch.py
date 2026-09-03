@@ -39,43 +39,30 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
-def _get_ep_config():
-    """Read EP configuration from ParallelConfig.
+def _is_ep_requested():
+    """Check if EP is requested via environment variable.
 
-    Returns (ep_enabled, ep_size, ep_rank, ep_group).
-    Safe to call during model init — returns disabled if ParallelConfig
-    doesn't have EP fields (backward compat with unpatched vllm).
+    This is safe to call at any time (no dist dependency).
     """
-    try:
-        from vllm.config import ParallelConfig as _PC
-        # ParallelConfig is a per-worker singleton-ish object.
-        # We check if the fields exist (set by our config.py patch).
-        # During weight loading, the global TP group is already initialized.
-        from vllm.distributed import (
-            get_tensor_model_parallel_world_size,
-            get_tensor_model_parallel_rank,
-        )
-        # EP config is on the parallel_config instance that was passed
-        # through the worker. We can't easily get it here without plumbing,
-        # so we use env vars (set in arg_utils.py) as the source of truth.
-        import os
-        ep_enabled = bool(int(os.environ.get("VLLM_ENABLE_EXPERT_PARALLEL", "0")))
-        if not ep_enabled:
-            return False, 1, 0, None
+    import os
+    return bool(int(os.environ.get("VLLM_ENABLE_EXPERT_PARALLEL", "0")))
 
-        # When EP is enabled, ep_size = world_size (all ranks participate).
-        # ep_rank = global rank (since EP group = all ranks).
-        if dist.is_initialized():
-            ep_size = dist.get_world_size()
-            ep_rank = dist.get_rank()
-        else:
-            ep_size = 1
-            ep_rank = 0
-            ep_enabled = False
 
-        return ep_enabled, ep_size, ep_rank, None
-    except Exception:
-        return False, 1, 0, None
+def _get_ep_runtime_config():
+    """Get EP size and rank at runtime when dist is initialized.
+
+    Must only be called from within worker processes (during __init__,
+    weight_loader, or forward) where torch.distributed is guaranteed
+    to be initialized.
+
+    Returns (ep_size, ep_rank).
+    """
+    if dist.is_initialized():
+        return dist.get_world_size(), dist.get_rank()
+    # Fallback — should not happen during normal model loading
+    logger.warning("[PR #2269] dist not initialized when querying EP config, "
+                   "falling back to ep_size=1")
+    return 1, 0
 
 
 def patch_fused_moe_for_ep():
@@ -83,15 +70,20 @@ def patch_fused_moe_for_ep():
 
     Call this during model loading (e.g. in qwen3_5.py module init or
     patch_ops.sh) BEFORE any FusedMoE layers are constructed.
+
+    Only checks the env var at patch time. Actual ep_size/ep_rank are
+    queried at runtime (inside __init__, weight_loader, forward) when
+    torch.distributed is guaranteed to be initialized.
     """
     from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 
-    ep_enabled, ep_size, ep_rank, _ = _get_ep_config()
-    if not ep_enabled or ep_size <= 1:
-        logger.info("[PR #2269] EP not enabled or ep_size<=1, skipping FusedMoE EP patch")
+    if not _is_ep_requested():
+        logger.info("[PR #2269] EP not enabled (VLLM_ENABLE_EXPERT_PARALLEL!=1), "
+                    "skipping FusedMoE EP patch")
         return
 
-    num_experts_per_rank = None  # set per-layer in __init__
+    logger.info("[PR #2269] EP requested via env var, installing FusedMoE monkey-patches "
+                "(ep_size/ep_rank will be resolved at runtime)")
 
     _orig_init = FusedMoE.__init__
 
@@ -101,6 +93,9 @@ def patch_fused_moe_for_ep():
                  topk_group=None, quant_config=None, tp_size=None,
                  prefix="", custom_routing_function=None):
         """EP-aware __init__: allocate only local experts, full intermediate."""
+
+        # Query ep_size/ep_rank NOW — dist is initialized in worker processes
+        ep_size, ep_rank = _get_ep_runtime_config()
 
         # Store global expert info before modifying
         self._ep_enabled = True
@@ -348,6 +343,5 @@ def patch_fused_moe_for_ep():
     FusedMoE.forward = _ep_forward
 
     logger.info(
-        "[PR #2269] FusedMoE patched for EP: ep_size=%d, ep_rank=%d. "
-        "Each card holds %d/%d-th of experts with full intermediate_size.",
-        ep_size, ep_rank, 1, ep_size)
+        "[PR #2269] FusedMoE patched for EP. "
+        "ep_size/ep_rank will be resolved per-layer at runtime.")
