@@ -19,7 +19,7 @@ limitations under the License.
 #include <optional>
 #include <vector>
 
-#include "framework/kv_cache/layerwise_split_layout.h"
+#include "framework/kv_cache/ilu_layerwise_layout.h"
 
 namespace xllm {
 

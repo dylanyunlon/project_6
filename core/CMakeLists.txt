@@ -1,5 +1,6 @@
 # Copyright 2026 The xLLM Authors. All Rights Reserved.
-# Commit: 494f293b5629 · feat · PR #2260  (adapted for Iluvatar BI-V100)
+# Layerwise split KV cache — migrated from upstream PR #2260
+# Adapted for Iluvatar BI-V100 + Qwen3.5 (Qwen3.6-35B-A3B)
 
 cmake_minimum_required(VERSION 3.18)
 project(layerwise_split_kv_cache LANGUAGES CXX)
@@ -11,13 +12,17 @@ find_package(GTest QUIET)
 
 # ---------- layerwise split KV cache library ----------
 add_library(layerwise_split_kv STATIC
+  # Upstream-migrated files
+  framework/config/parallel_config.cpp
+  framework/kv_cache/kv_cache_estimation.cpp
+  # BI-V100 adaptation files
+  config/parallel_config_layerwise.cpp
   framework/kv_cache/kv_cache_layerwise.cpp
   framework/kv_cache/kv_cache_estimation_layerwise.cpp
   framework/parallel_state/mapping_ilu.cpp
   distributed_runtime/layerwise_split_engine_ext.cpp
   distributed_runtime/layerwise_split_master.cpp
   runtime/worker_layerwise_init.cpp
-  config/parallel_config_layerwise.cpp
 )
 
 target_include_directories(layerwise_split_kv PUBLIC
@@ -38,7 +43,6 @@ endif()
 # ---------- tests ----------
 if(BUILD_TESTING)
   if(NOT GTest_FOUND)
-    # Fallback: link gtest directly (Ubuntu libgtest-dev)
     find_library(GTEST_LIB gtest)
     find_library(GTEST_MAIN_LIB gtest_main)
   endif()
