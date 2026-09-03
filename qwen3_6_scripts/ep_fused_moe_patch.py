@@ -357,6 +357,8 @@ def patch_fused_moe_for_ep():
 
     _orig_forward = FusedMoE.forward
 
+    _diag_counter = [0]  # mutable counter for one-shot diagnostics
+
     def _ep_forward(self, hidden_states, router_logits):
         """EP-aware forward: all-to-all dispatch, local compute, all-to-all combine.
 
@@ -370,6 +372,8 @@ def patch_fused_moe_for_ep():
         """
         if not getattr(self, '_ep_enabled', False):
             return _orig_forward(self, hidden_states, router_logits)
+
+        _do_diag = (_diag_counter[0] < 3 and self._ep_rank == 0)
 
         # Step 1: Global routing — every rank computes topk over ALL experts
         # Use the same kernel priority as _pure_pytorch_experts in qwen3_5.py:
@@ -412,6 +416,20 @@ def patch_fused_moe_for_ep():
         K = self.top_k
         device = hidden_states.device
 
+        if _do_diag:
+            logger.info("[EP_DIAG] fwd#%d rank=%d T=%d K=%d H=%d "
+                        "num_experts=%d local=%d start=%d end=%d "
+                        "topk_ids range=[%d,%d] topk_weights range=[%.4f,%.4f] "
+                        "w13_shape=%s w2_shape=%s "
+                        "hidden_states norm=%.4f",
+                        _diag_counter[0], ep_rank, T, K, H,
+                        self.num_experts, self._num_experts_per_rank,
+                        start_expert, end_expert,
+                        topk_ids.min().item(), topk_ids.max().item(),
+                        topk_weights.min().item(), topk_weights.max().item(),
+                        list(self.w13_weight.shape), list(self.w2_weight.shape),
+                        hidden_states.float().norm().item())
+
         # Step 2: Determine which tokens go to which EP rank.
         dest_ranks = topk_ids.div(self._num_experts_per_rank, rounding_mode='trunc')  # (T, K)
 
@@ -430,6 +448,14 @@ def patch_fused_moe_for_ep():
 
         total_send = send_counts.sum().item()
         total_recv = recv_counts.sum().item()
+
+        if _do_diag:
+            logger.info("[EP_DIAG] fwd#%d send_counts=%s recv_counts=%s "
+                        "total_send=%d total_recv=%d dest_ranks range=[%d,%d]",
+                        _diag_counter[0],
+                        send_counts.tolist(), recv_counts.tolist(),
+                        total_send, total_recv,
+                        dest_ranks.min().item(), dest_ranks.max().item())
 
         # Flatten topk dimension: each (token, k_slot) is a "work item"
         flat_ids = topk_ids.view(-1)           # (T*K,)
@@ -469,6 +495,20 @@ def patch_fused_moe_for_ep():
         # Remap global expert ids to local
         local_ids = recv_ids - start_expert  # now 0..num_experts_per_rank-1
 
+        if _do_diag:
+            logger.info("[EP_DIAG] fwd#%d recv_ids range=[%d,%d] "
+                        "local_ids range=[%d,%d] (expect 0..%d) "
+                        "recv_hidden norm=%.4f recv_weights range=[%.4f,%.4f]",
+                        _diag_counter[0],
+                        recv_ids.min().item() if total_recv > 0 else -1,
+                        recv_ids.max().item() if total_recv > 0 else -1,
+                        local_ids.min().item() if total_recv > 0 else -1,
+                        local_ids.max().item() if total_recv > 0 else -1,
+                        self._num_experts_per_rank - 1,
+                        recv_hidden.float().norm().item() if total_recv > 0 else 0,
+                        recv_weights_buf.min().item() if total_recv > 0 else 0,
+                        recv_weights_buf.max().item() if total_recv > 0 else 0)
+
         if total_recv > 0:
             local_output = _bi100_local_expert_compute(
                 recv_hidden, local_ids, recv_weights_buf,
@@ -476,6 +516,11 @@ def patch_fused_moe_for_ep():
                 self._num_experts_per_rank, _kernels)
         else:
             local_output = torch.empty(0, H, dtype=hidden_states.dtype, device=device)
+
+        if _do_diag:
+            logger.info("[EP_DIAG] fwd#%d local_output norm=%.4f",
+                        _diag_counter[0],
+                        local_output.float().norm().item() if total_recv > 0 else 0)
 
         # Step 4: All-to-all combine — send results back
         combine_output = torch.empty(total_send, H, dtype=hidden_states.dtype, device=device)
@@ -491,6 +536,14 @@ def patch_fused_moe_for_ep():
         # scatter_add by token index
         token_indices = flat_token_idx.unsqueeze(1).expand(-1, H)  # (T*K, H)
         final_output.scatter_add_(0, token_indices, unsorted_output)
+
+        if _do_diag:
+            logger.info("[EP_DIAG] fwd#%d final_output norm=%.4f "
+                        "combine_output norm=%.4f",
+                        _diag_counter[0],
+                        final_output.float().norm().item(),
+                        combine_output.float().norm().item())
+            _diag_counter[0] += 1
 
         # EP reduce
         if self._reduce_results_ep:
