@@ -30,6 +30,7 @@ xllm equivalent: core/layers/cuda/fused_moe.cpp
 """
 
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from typing import Callable, List, Optional, Tuple
 
@@ -37,6 +38,61 @@ from vllm.config import ParallelConfig
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# BI-V100 kernel availability (same probing logic as qwen3_5.py)
+# ---------------------------------------------------------------------------
+def _probe_bi100_kernels():
+    """Probe available BI-V100 MoE kernels at import time.
+
+    Returns a dict of (module_or_None, enabled_bool) for each kernel tier.
+    This mirrors the probing in qwen3_5.py but is self-contained so
+    ep_fused_moe_patch.py doesn't depend on qwen3_5 module-level globals.
+    """
+    import os
+
+    def env_bool(name, default=True):
+        val = os.environ.get(name, "")
+        if val == "":
+            return default
+        return val.strip().lower() in ("1", "true", "yes")
+
+    # --- grouped GEMM (CUTLASS Cu10) ---
+    try:
+        from vllm import gemm_grouped
+    except ImportError:
+        gemm_grouped = None
+    use_gemm_grouped = (gemm_grouped is not None
+                        and env_bool("BI100_MOE_GEMM_GROUPED", True))
+
+    # --- corex_moe_index_combine (fused histogram+prefix_sum+place) ---
+    try:
+        from vllm import corex_moe_index_combine
+    except ImportError:
+        corex_moe_index_combine = None
+    use_corex_index = (corex_moe_index_combine is not None
+                       and env_bool("BI100_MOE_COREX_INDEX_COMBINE", True))
+
+    # --- xllm_moe (fused topk + compute_index) ---
+    try:
+        from vllm import xllm_moe
+    except ImportError:
+        try:
+            import xllm_moe
+        except ImportError:
+            xllm_moe = None
+    use_xllm_moe = (xllm_moe is not None
+                     and env_bool("BI100_MOE_XLLM", True))
+
+    return {
+        "gemm_grouped": gemm_grouped,
+        "use_gemm_grouped": use_gemm_grouped,
+        "corex_moe_index_combine": corex_moe_index_combine,
+        "use_corex_index": use_corex_index,
+        "xllm_moe": xllm_moe,
+        "use_xllm_moe": use_xllm_moe,
+    }
 
 
 def _is_ep_requested():
@@ -65,6 +121,110 @@ def _get_ep_runtime_config():
     return 1, 0
 
 
+def _bi100_local_expert_compute(
+    recv_hidden: torch.Tensor,     # (N, H) — received tokens
+    local_ids: torch.Tensor,       # (N,)   — local expert ids (0..num_local-1)
+    recv_weights: torch.Tensor,    # (N,)   — topk weights per token
+    w13: torch.Tensor,             # (num_local_experts, 2*I, H)
+    w2: torch.Tensor,              # (num_local_experts, H, I)
+    num_local_experts: int,
+    kernels: dict,
+) -> torch.Tensor:
+    """Compute local expert outputs using BI-V100 native kernels.
+
+    This replaces the vllm fused_experts() call which depends on
+    ixformer.functions.vllm_moe_align_block_size (unavailable on BI-V100).
+
+    Uses the same kernel stack as Qwen3_5MoeSparseBlock._pure_pytorch_experts:
+    - Tier 1: CUTLASS grouped GEMM (gemm_grouped) for batches
+    - Tier 2: per-expert F.linear loop as fallback
+
+    Each recv item is a (token, expert) pair with top_k=1, already weighted.
+    """
+    N, H = recv_hidden.shape
+    device = recv_hidden.device
+
+    _gemm_grouped = kernels["gemm_grouped"]
+    _use_gemm_grouped = kernels["use_gemm_grouped"]
+    _corex_moe_index_combine = kernels["corex_moe_index_combine"]
+    _use_corex_index = kernels["use_corex_index"]
+    _xllm_moe = kernels["xllm_moe"]
+    _use_xllm_moe = kernels["use_xllm_moe"]
+
+    # Each received item is already a single (token, expert) pair.
+    # local_ids is (N,) with values in 0..num_local_experts-1.
+    # We need to group tokens by expert, run expert computation, then
+    # re-weight and return in the original order.
+
+    flat_eids = local_ids.to(torch.int64)
+
+    # --- Sort tokens by expert id ---
+    if _use_corex_index:
+        src_dst, dst_src, expert_sizes = \
+            _corex_moe_index_combine.moe_compute_index(
+                flat_eids, num_local_experts)
+        sorted_tok_ids = dst_src.long()
+        expert_counts = expert_sizes.tolist()
+    elif _use_xllm_moe:
+        src_dst, dst_src, expert_sizes = \
+            _xllm_moe.moe_compute_index(flat_eids, num_local_experts)
+        sorted_tok_ids = dst_src.long()
+        expert_counts = expert_sizes.tolist()
+    else:
+        order = torch.argsort(flat_eids, stable=True)
+        sorted_tok_ids = order
+        expert_counts = torch.bincount(
+            flat_eids, minlength=num_local_experts).tolist()
+
+    sorted_hidden = recv_hidden[sorted_tok_ids]    # (N, H)
+    sorted_weights = recv_weights[sorted_tok_ids]  # (N,)
+
+    # --- Expert computation ---
+    if _use_gemm_grouped and recv_hidden.dtype == torch.float16:
+        # CUTLASS grouped GEMM path
+        expert_counts_t = torch.tensor(
+            expert_counts, dtype=torch.int32, device=device) \
+            if not isinstance(expert_counts, torch.Tensor) \
+            else expert_counts.to(dtype=torch.int32, device=device)
+
+        # FC1: w13 (gate_proj + up_proj)  → (N, 2*I)
+        gemm1_out = _gemm_grouped.moe_group_gemm(
+            sorted_hidden, w13, expert_counts_t)
+        gate, up = gemm1_out.chunk(2, dim=-1)
+        act_out = F.silu(gate) * up  # (N, I)
+
+        # FC2: w2 (down_proj) → (N, H)
+        gemm2_out = _gemm_grouped.moe_group_gemm(
+            act_out, w2, expert_counts_t)
+
+        # Apply topk weights and unsort back to original order
+        weighted = (gemm2_out * sorted_weights.unsqueeze(-1)).to(recv_hidden.dtype)
+        output = torch.empty_like(recv_hidden)
+        output[sorted_tok_ids] = weighted
+    else:
+        # Per-expert F.linear loop (always works, no ixformer dependency)
+        output = torch.zeros(N, H, dtype=recv_hidden.dtype, device=device)
+        start = 0
+        for eid, count in enumerate(expert_counts):
+            end = start + count
+            if count == 0:
+                start = end
+                continue
+            tok_ids = sorted_tok_ids[start:end]
+            tokens = recv_hidden[tok_ids]                  # (n, H)
+            w = sorted_weights[start:end].unsqueeze(-1)    # (n, 1)
+
+            gate_up = F.linear(tokens, w13[eid])           # (n, 2*I)
+            gate, up_val = gate_up.chunk(2, dim=-1)
+            act = F.silu(gate) * up_val                    # (n, I)
+            down = F.linear(act, w2[eid])                  # (n, H)
+
+            output[tok_ids] = (down * w).to(recv_hidden.dtype)
+            start = end
+
+    return output
+
+
 def patch_fused_moe_for_ep():
     """Monkey-patch FusedMoE.__init__, weight_loader, and forward to support EP.
 
@@ -84,6 +244,14 @@ def patch_fused_moe_for_ep():
 
     logger.info("[PR #2269] EP requested via env var, installing FusedMoE monkey-patches "
                 "(ep_size/ep_rank will be resolved at runtime)")
+
+    # Probe BI-V100 kernels once at patch time
+    _kernels = _probe_bi100_kernels()
+    logger.info("[PR #2269] BI-V100 kernel probe: gemm_grouped=%s, "
+                "corex_index=%s, xllm_moe=%s",
+                _kernels["use_gemm_grouped"],
+                _kernels["use_corex_index"],
+                _kernels["use_xllm_moe"])
 
     _orig_init = FusedMoE.__init__
 
@@ -196,41 +364,24 @@ def patch_fused_moe_for_ep():
         1. Route all tokens globally (all ranks see all expert logits)
         2. All-to-all dispatch: send each token to the rank that owns its expert
         3. Local expert computation on owned experts only
+           (uses BI-V100 native kernels: grouped GEMM / corex / xllm,
+            NOT vllm fused_experts which requires ixformer ops)
         4. All-to-all combine: gather results back to original token positions
         """
         if not getattr(self, '_ep_enabled', False):
             return _orig_forward(self, hidden_states, router_logits)
 
         # Step 1: Global routing — every rank computes topk over ALL experts
-        # Use the same kernel priority as _pure_pytorch_experts in qwen3_5.py:
-        # corex_moe_topk_softmax → xllm_moe → PyTorch fallback
-        try:
-            from vllm import corex_moe_topk_softmax as _corex_topk
-        except ImportError:
-            _corex_topk = None
-        try:
-            from vllm import xllm_moe as _xllm
-        except ImportError:
-            try:
-                import xllm_moe as _xllm
-            except ImportError:
-                _xllm = None
-
-        if _xllm is not None:
-            topk_weights, topk_ids = _xllm.moe_fused_topk(
-                router_logits, self.top_k, True, None, "softmax")
-            topk_ids = topk_ids.to(torch.int64)
-            topk_weights = topk_weights.to(hidden_states.dtype)
-        elif _corex_topk is not None:
-            topk_weights, topk_ids = _corex_topk.moe_topk_softmax(
-                router_logits.float(), self.top_k, True)
-            topk_ids = topk_ids.to(torch.int64)
-            topk_weights = topk_weights.to(hidden_states.dtype)
-        else:
-            topk_logits, topk_ids = torch.topk(
-                router_logits.float(), self.top_k, dim=-1)
-            topk_weights = torch.softmax(topk_logits, dim=-1)
-            topk_weights = topk_weights.to(hidden_states.dtype)
+        topk_weights, topk_ids = FusedMoE.select_experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            use_grouped_topk=self.use_grouped_topk,
+            top_k=self.top_k,
+            renormalize=self.renormalize,
+            topk_group=self.topk_group,
+            num_expert_group=self.num_expert_group,
+            custom_routing_function=self.custom_routing_function,
+        )
 
         ep_size = self._ep_size
         ep_rank = self._ep_rank
@@ -241,8 +392,6 @@ def patch_fused_moe_for_ep():
         device = hidden_states.device
 
         # Step 2: Determine which tokens go to which EP rank.
-        # expert_to_rank: expert_id → ep_rank
-        # For each (token, top_k_slot), find the destination rank.
         dest_ranks = topk_ids.div(self._num_experts_per_rank, rounding_mode='trunc')  # (T, K)
 
         # Count tokens to send to each rank
@@ -261,10 +410,6 @@ def patch_fused_moe_for_ep():
         total_send = send_counts.sum().item()
         total_recv = recv_counts.sum().item()
 
-        # Build dispatch buffers: for each (token, k) pair routed to each rank,
-        # pack (hidden_state, topk_weight, local_expert_id, original_position)
-        # Sort by destination rank for contiguous all-to-all.
-
         # Flatten topk dimension: each (token, k_slot) is a "work item"
         flat_ids = topk_ids.view(-1)           # (T*K,)
         flat_weights = topk_weights.view(-1)   # (T*K,)
@@ -276,9 +421,8 @@ def patch_fused_moe_for_ep():
         sorted_hidden = hidden_states[flat_token_idx[sort_idx]]   # (T*K, H)
         sorted_weights = flat_weights[sort_idx]                   # (T*K,)
         sorted_ids = flat_ids[sort_idx]                           # (T*K,) global expert ids
-        sorted_token_idx = flat_token_idx[sort_idx]               # (T*K,) for scatter-back
 
-        # All-to-all send/recv counts (in elements, each element = one work item)
+        # All-to-all send/recv counts
         send_splits = send_counts.tolist()
         recv_splits = recv_counts.tolist()
 
@@ -295,8 +439,8 @@ def patch_fused_moe_for_ep():
                                input_split_sizes=send_splits)
 
         # All-to-all: exchange topk weights
-        recv_weights = torch.empty(total_recv, dtype=sorted_weights.dtype, device=device)
-        dist.all_to_all_single(recv_weights, sorted_weights,
+        recv_weights_buf = torch.empty(total_recv, dtype=sorted_weights.dtype, device=device)
+        dist.all_to_all_single(recv_weights_buf, sorted_weights,
                                output_split_sizes=recv_splits,
                                input_split_sizes=send_splits)
 
@@ -305,54 +449,31 @@ def patch_fused_moe_for_ep():
         local_ids = recv_ids - start_expert  # now 0..num_experts_per_rank-1
 
         if total_recv > 0:
-            # Compute using the existing fused_experts kernel (or Python fallback)
-            from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
-            # Build per-token topk format expected by fused_experts:
-            # It expects (num_tokens, top_k) but here each recv item is
-            # a single (token, expert) pair. We reshape to (total_recv, 1).
-            local_topk_ids = local_ids.unsqueeze(1)        # (total_recv, 1)
-            local_topk_weights = recv_weights.unsqueeze(1)  # (total_recv, 1)
-
-            local_output = fused_experts(
-                hidden_states=recv_hidden,
-                w1=self.w13_weight,
-                w2=self.w2_weight,
-                topk_weights=local_topk_weights,
-                topk_ids=local_topk_ids.to(torch.int32),
-                inplace=False,
-            )
+            local_output = _bi100_local_expert_compute(
+                recv_hidden, local_ids, recv_weights_buf,
+                self.w13_weight, self.w2_weight,
+                self._num_experts_per_rank, _kernels)
         else:
             local_output = torch.empty(0, H, dtype=hidden_states.dtype, device=device)
 
         # Step 4: All-to-all combine — send results back
-        # Reverse the all-to-all: recv_splits becomes send, send_splits becomes recv
         combine_output = torch.empty(total_send, H, dtype=hidden_states.dtype, device=device)
         dist.all_to_all_single(combine_output, local_output,
                                output_split_sizes=send_splits,
                                input_split_sizes=recv_splits)
 
         # Unsort and scatter-add back to original token positions
-        # combine_output is in the same order as sorted_* (sorted by dest rank)
-        # We need to unsort and accumulate weighted results per token.
         final_output = torch.zeros(T, H, dtype=hidden_states.dtype, device=device)
-        # Unsort: combine_output[i] corresponds to sorted_token_idx[i]
         unsorted_output = torch.zeros_like(combine_output)
         unsorted_output[sort_idx] = combine_output
 
-        # Reshape back to (T, K, H) and sum over K dimension
-        # Each (token, k_slot) pair has already been weighted by topk_weight
-        # inside fused_experts. We just need to sum over k.
-        # Actually fused_experts with top_k=1 per item already applies the weight.
-        # scatter_add by token index:
+        # scatter_add by token index
         token_indices = flat_token_idx.unsqueeze(1).expand(-1, H)  # (T*K, H)
         final_output.scatter_add_(0, token_indices, unsorted_output)
 
-        # EP reduce (if the caller requested reduce_results, e.g. for shared experts)
+        # EP reduce
         if self._reduce_results_ep:
-            # No TP reduce needed (tp_size=1 for EP), but if the model
-            # expects an all-reduce for the MoE output (e.g. to combine
-            # with shared experts), we do it here over the EP group.
-            pass  # EP output is already complete — each token got results from its experts
+            pass  # EP output is already complete
 
         return final_output
 
