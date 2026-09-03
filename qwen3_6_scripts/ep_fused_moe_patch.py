@@ -563,6 +563,28 @@ def patch_fused_moe_for_ep():
         # Each rank computed a partial result (only its local experts contribute
         # non-zero values). Sum across all EP ranks to get the full output.
         # Since all ranks have the SAME token set (TP=EP), use all_reduce.
+
+        # One-shot diagnostic
+        if not hasattr(_ep_forward, '_diag_done'):
+            _ep_forward._diag_done = True
+            if ep_rank == 0:
+                logger.info("[EP_DIAG] T=%d K=%d H=%d experts=%d local=%d "
+                            "start=%d use_grouped_topk=%s "
+                            "topk_ids range=[%d,%d] "
+                            "local_count=%d "
+                            "token_output norm=%.6f "
+                            "token_output[:2,:4]=%s "
+                            "hidden_states norm=%.6f",
+                            T_global, K, H, self.num_experts,
+                            num_local_experts, start_expert,
+                            self.use_grouped_topk,
+                            all_topk_ids.min().item(),
+                            all_topk_ids.max().item(),
+                            local_count,
+                            token_output.float().norm().item(),
+                            token_output[:2, :4].float().tolist(),
+                            hidden_states.float().norm().item())
+
         if ep_size > 1:
             dist.all_reduce(token_output)
 
