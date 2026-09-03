@@ -406,37 +406,60 @@ def patch_fused_moe_for_ep():
 
         # ----- Step 1: Global routing -----
         # Every rank computes topk over ALL experts.
-        # Use the same kernel priority as _pure_pytorch_experts in qwen3_5.py:
-        # xllm_moe → corex_moe_topk_softmax → PyTorch fallback
-        # (BI-V100 lacks ixformer.functions.vllm_moe_topk_softmax used by
-        #  FusedMoE.select_experts, so we must bypass it.)
-        try:
-            from vllm import xllm_moe as _xllm
-        except ImportError:
-            try:
-                import xllm_moe as _xllm
-            except ImportError:
-                _xllm = None
-        try:
-            from vllm import corex_moe_topk_softmax as _corex_topk
-        except ImportError:
-            _corex_topk = None
-
-        if _xllm is not None:
-            topk_weights, topk_ids = _xllm.moe_fused_topk(
-                router_logits, self.top_k, True, None, "softmax")
+        #
+        # Qwen3.5 uses grouped_topk (128 experts / 8 groups, topk_group=2).
+        # grouped_topk is pure PyTorch — no ixformer dependency — so we call
+        # it directly.  For non-grouped models, fall back to kernel-accelerated
+        # topk (xllm_moe → corex → PyTorch).
+        if self.use_grouped_topk:
+            from vllm.model_executor.layers.fused_moe.fused_moe import (
+                grouped_topk)
+            topk_weights, topk_ids = grouped_topk(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=self.top_k,
+                renormalize=self.renormalize,
+                num_expert_group=self.num_expert_group,
+                topk_group=self.topk_group)
             topk_ids = topk_ids.to(torch.int64)
             topk_weights = topk_weights.to(hidden_states.dtype)
-        elif _corex_topk is not None:
-            topk_weights, topk_ids = _corex_topk.moe_topk_softmax(
-                router_logits.float(), self.top_k, True)
+        elif self.custom_routing_function is not None:
+            topk_weights, topk_ids = self.custom_routing_function(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=self.top_k,
+                renormalize=self.renormalize)
             topk_ids = topk_ids.to(torch.int64)
             topk_weights = topk_weights.to(hidden_states.dtype)
         else:
-            topk_logits, topk_ids = torch.topk(
-                router_logits.float(), self.top_k, dim=-1)
-            topk_weights = torch.softmax(topk_logits, dim=-1)
-            topk_weights = topk_weights.to(hidden_states.dtype)
+            # Non-grouped: use BI-V100 kernel-accelerated topk if available
+            try:
+                from vllm import xllm_moe as _xllm
+            except ImportError:
+                try:
+                    import xllm_moe as _xllm
+                except ImportError:
+                    _xllm = None
+            try:
+                from vllm import corex_moe_topk_softmax as _corex_topk
+            except ImportError:
+                _corex_topk = None
+
+            if _xllm is not None:
+                topk_weights, topk_ids = _xllm.moe_fused_topk(
+                    router_logits, self.top_k, True, None, "softmax")
+                topk_ids = topk_ids.to(torch.int64)
+                topk_weights = topk_weights.to(hidden_states.dtype)
+            elif _corex_topk is not None:
+                topk_weights, topk_ids = _corex_topk.moe_topk_softmax(
+                    router_logits.float(), self.top_k, True)
+                topk_ids = topk_ids.to(torch.int64)
+                topk_weights = topk_weights.to(hidden_states.dtype)
+            else:
+                topk_logits, topk_ids = torch.topk(
+                    router_logits.float(), self.top_k, dim=-1)
+                topk_weights = torch.softmax(topk_logits, dim=-1)
+                topk_weights = topk_weights.to(hidden_states.dtype)
         # topk_ids: (T_local, K) with values in [0, num_experts)
         # topk_weights: (T_local, K)
 
