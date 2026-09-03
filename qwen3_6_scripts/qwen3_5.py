@@ -2214,7 +2214,12 @@ class Qwen3_5MoeSparseBlock(nn.Module):
             router_logits = router_and_shared_gate[..., :self.num_experts]
             gate_score = router_and_shared_gate[..., self.num_experts:]
         with bi100_timer("moe.routed"):
-            routed_out = self._pure_pytorch_experts(hidden_states, router_logits)
+            if getattr(self.experts, '_ep_enabled', False):
+                # EP mode: FusedMoE.forward (_ep_forward) handles
+                # global→local expert mapping + all-to-all dispatch
+                routed_out = self.experts(hidden_states, router_logits)
+            else:
+                routed_out = self._pure_pytorch_experts(hidden_states, router_logits)
 
         with bi100_timer("moe.shared"):
             gate_up, _ = self.shared_expert_gate_up(hidden_states)
