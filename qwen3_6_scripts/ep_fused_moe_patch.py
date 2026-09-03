@@ -372,16 +372,37 @@ def patch_fused_moe_for_ep():
             return _orig_forward(self, hidden_states, router_logits)
 
         # Step 1: Global routing — every rank computes topk over ALL experts
-        topk_weights, topk_ids = FusedMoE.select_experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            use_grouped_topk=self.use_grouped_topk,
-            top_k=self.top_k,
-            renormalize=self.renormalize,
-            topk_group=self.topk_group,
-            num_expert_group=self.num_expert_group,
-            custom_routing_function=self.custom_routing_function,
-        )
+        # Use the same kernel priority as _pure_pytorch_experts in qwen3_5.py:
+        # xllm_moe → corex_moe_topk_softmax → PyTorch fallback
+        # (BI-V100 lacks ixformer.functions.vllm_moe_topk_softmax used by
+        #  FusedMoE.select_experts, so we must bypass it.)
+        try:
+            from vllm import xllm_moe as _xllm
+        except ImportError:
+            try:
+                import xllm_moe as _xllm
+            except ImportError:
+                _xllm = None
+        try:
+            from vllm import corex_moe_topk_softmax as _corex_topk
+        except ImportError:
+            _corex_topk = None
+
+        if _xllm is not None:
+            topk_weights, topk_ids = _xllm.moe_fused_topk(
+                router_logits, self.top_k, True, None, "softmax")
+            topk_ids = topk_ids.to(torch.int64)
+            topk_weights = topk_weights.to(hidden_states.dtype)
+        elif _corex_topk is not None:
+            topk_weights, topk_ids = _corex_topk.moe_topk_softmax(
+                router_logits.float(), self.top_k, True)
+            topk_ids = topk_ids.to(torch.int64)
+            topk_weights = topk_weights.to(hidden_states.dtype)
+        else:
+            topk_logits, topk_ids = torch.topk(
+                router_logits.float(), self.top_k, dim=-1)
+            topk_weights = torch.softmax(topk_logits, dim=-1)
+            topk_weights = topk_weights.to(hidden_states.dtype)
 
         ep_size = self._ep_size
         ep_rank = self._ep_rank
