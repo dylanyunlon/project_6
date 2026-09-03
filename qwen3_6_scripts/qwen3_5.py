@@ -1894,8 +1894,9 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         self.router_shared_gate.weight.weight_loader = \
             self._router_shared_gate_weight_loader
 
-        # FusedMoE: only used for weight storage + weight_loader.
-        # Forward is bypassed — see _pure_pytorch_experts().
+        # FusedMoE: weight storage + weight_loader.
+        # Forward is bypassed in non-EP mode (see _pure_pytorch_experts()).
+        # In EP mode (_ep_enabled), FusedMoE.forward (_ep_forward) IS called.
         self.experts = FusedMoE(
             num_experts=text_cfg.num_experts,
             top_k=text_cfg.num_experts_per_tok,

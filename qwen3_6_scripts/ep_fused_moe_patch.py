@@ -571,19 +571,47 @@ def patch_fused_moe_for_ep():
                 logger.info("[EP_DIAG] T=%d K=%d H=%d experts=%d local=%d "
                             "start=%d use_grouped_topk=%s "
                             "topk_ids range=[%d,%d] "
+                            "topk_weights range=[%.4f,%.4f] "
                             "local_count=%d "
-                            "token_output norm=%.6f "
-                            "token_output[:2,:4]=%s "
-                            "hidden_states norm=%.6f",
+                            "token_output_pre_ar norm=%.6f "
+                            "hidden_states norm=%.6f "
+                            "w13 shape=%s norm=%.4f "
+                            "w2 shape=%s norm=%.4f",
                             T_global, K, H, self.num_experts,
                             num_local_experts, start_expert,
                             self.use_grouped_topk,
                             all_topk_ids.min().item(),
                             all_topk_ids.max().item(),
+                            all_topk_weights.min().item(),
+                            all_topk_weights.max().item(),
                             local_count,
                             token_output.float().norm().item(),
-                            token_output[:2, :4].float().tolist(),
-                            hidden_states.float().norm().item())
+                            hidden_states.float().norm().item(),
+                            list(self.w13_weight.shape),
+                            self.w13_weight.float().norm().item(),
+                            list(self.w2_weight.shape),
+                            self.w2_weight.float().norm().item())
+                # Check a single expert computation manually
+                if local_count > 0:
+                    test_h = local_hidden[:1]  # (1, H)
+                    test_eid = local_expert_ids[0].item()
+                    test_w = local_weights_slice[0].item()
+                    gu = torch.nn.functional.linear(
+                        test_h, self.w13_weight[test_eid])
+                    g, u = gu.chunk(2, dim=-1)
+                    a = torch.nn.functional.silu(g) * u
+                    d = torch.nn.functional.linear(a, self.w2_weight[test_eid])
+                    logger.info("[EP_DIAG] manual expert %d: "
+                                "input norm=%.4f gate_up norm=%.4f "
+                                "act norm=%.4f down norm=%.4f "
+                                "weight=%.4f weighted_down norm=%.4f",
+                                test_eid,
+                                test_h.float().norm().item(),
+                                gu.float().norm().item(),
+                                a.float().norm().item(),
+                                d.float().norm().item(),
+                                test_w,
+                                (d * test_w).float().norm().item())
 
         if ep_size > 1:
             dist.all_reduce(token_output)
