@@ -11,8 +11,18 @@ Problem:
 Solution:
   When enable_expert_parallel=True, each card holds only
   num_experts/ep_size experts with FULL intermediate_size (no TP split
-  on MoE). Forward uses all-to-all to dispatch tokens to the correct
-  expert-holding rank, compute locally, and combine results back.
+  on MoE). Forward uses Option B (All-Gather + Local Compute +
+  Reduce-Scatter) following Google's tpu-inference implementation
+  (PR #2577 / Qwen3.5-397B blog post):
+
+  1. All-Gather: replicate all tokens on every rank
+  2. Local compute: each rank sorts tokens by expert, computes only
+     its local expert range, zeros the rest
+  3. Reduce-Scatter: sum partial results across ranks, each rank
+     gets back its local token slice
+
+  This replaces the previous Option A (3× All-to-All) approach which
+  had unpredictable communication patterns and was harder to debug.
 
   EP=4: each card holds 64/256 experts → MoE weights ~5.6 GiB/card
   (savings: 16.9 GiB/card vs TP=2)
@@ -20,6 +30,13 @@ Solution:
 Memory layout comparison (per card, 30 MoE layers, fp16):
   TP=2:  256 experts × (2×256×2048 + 2048×256) × 2B × 30 = 22.5 GiB
   EP=4:   64 experts × (2×512×2048 + 2048×512) × 2B × 30 =  5.6 GiB
+
+Reference implementation:
+  Google tpu-inference: tpu_inference/layers/common/fused_moe_gmm.py
+    - fused_moe_func() → expert_parallel_gmm() → moe_gmm_local()
+    - PR #2577 (Attention DP + EP sharding)
+    - PR #2836 (3-to-2 All-Gather packing optimization)
+    - PR #2679 (Hierarchical Reduce-Scatter)
 
 xllm equivalent: core/layers/cuda/fused_moe.cpp
   ep_size_ = parallel_args.ep_size();
@@ -357,25 +374,38 @@ def patch_fused_moe_for_ep():
 
     _orig_forward = FusedMoE.forward
 
-    _diag_counter = [0]  # mutable counter for one-shot diagnostics
-
     def _ep_forward(self, hidden_states, router_logits):
-        """EP-aware forward: all-to-all dispatch, local compute, all-to-all combine.
+        """EP-aware forward: All-Gather + Local Compute + Reduce-Scatter.
 
-        Flow:
+        Migrated from Google's tpu-inference/layers/common/fused_moe_gmm.py
+        (Option B in Google's Qwen3.5-397B blog post), adapted for PyTorch
+        on BI-V100.
+
+        Flow (Option B — no All-to-All):
         1. Route all tokens globally (all ranks see all expert logits)
-        2. All-to-all dispatch: send each token to the rank that owns its expert
-        3. Local expert computation on owned experts only
-           (uses BI-V100 native kernels: grouped GEMM / corex / xllm,
-            NOT vllm fused_experts which requires ixformer ops)
-        4. All-to-all combine: gather results back to original token positions
+        2. All-Gather hidden states so every rank has all tokens
+        3. Each rank permutes tokens by expert, computes ONLY its local
+           experts (start_expert..end_expert), zeros the rest
+        4. Reduce-Scatter (or All-Reduce) to sum partial results across ranks
+
+        Why Option B over Option A (All-to-All):
+        - Deterministic communication pattern (no variable-length splits)
+        - Simpler logic: no sort/unsort, no send/recv count exchange
+        - Google validated this at scale on Qwen3.5-397B (PR #2577)
         """
         if not getattr(self, '_ep_enabled', False):
             return _orig_forward(self, hidden_states, router_logits)
 
-        _do_diag = (_diag_counter[0] < 3 and self._ep_rank == 0)
+        ep_size = self._ep_size
+        ep_rank = self._ep_rank
+        start_expert = self._start_expert_id
+        num_local_experts = self._num_experts_per_rank
+        T_local, H = hidden_states.shape
+        K = self.top_k
+        device = hidden_states.device
 
-        # Step 1: Global routing — every rank computes topk over ALL experts
+        # ----- Step 1: Global routing -----
+        # Every rank computes topk over ALL experts.
         # Use the same kernel priority as _pure_pytorch_experts in qwen3_5.py:
         # xllm_moe → corex_moe_topk_softmax → PyTorch fallback
         # (BI-V100 lacks ixformer.functions.vllm_moe_topk_softmax used by
@@ -407,149 +437,131 @@ def patch_fused_moe_for_ep():
                 router_logits.float(), self.top_k, dim=-1)
             topk_weights = torch.softmax(topk_logits, dim=-1)
             topk_weights = topk_weights.to(hidden_states.dtype)
+        # topk_ids: (T_local, K) with values in [0, num_experts)
+        # topk_weights: (T_local, K)
 
-        ep_size = self._ep_size
-        ep_rank = self._ep_rank
-        start_expert = self._start_expert_id
-        end_expert = start_expert + self._num_experts_per_rank
-        T, H = hidden_states.shape
-        K = self.top_k
-        device = hidden_states.device
+        # ----- Step 2: All-Gather hidden states + routing info -----
+        # Replicate all tokens on every rank so each rank can compute its
+        # local experts on the full token set.
+        if ep_size > 1:
+            gathered_hidden_list = [torch.empty_like(hidden_states)
+                                    for _ in range(ep_size)]
+            dist.all_gather(gathered_hidden_list, hidden_states.contiguous())
+            all_hidden = torch.cat(gathered_hidden_list, dim=0)  # (T_global, H)
 
-        if _do_diag:
-            logger.info("[EP_DIAG] fwd#%d rank=%d T=%d K=%d H=%d "
-                        "num_experts=%d local=%d start=%d end=%d "
-                        "topk_ids range=[%d,%d] topk_weights range=[%.4f,%.4f] "
-                        "w13_shape=%s w2_shape=%s "
-                        "hidden_states norm=%.4f",
-                        _diag_counter[0], ep_rank, T, K, H,
-                        self.num_experts, self._num_experts_per_rank,
-                        start_expert, end_expert,
-                        topk_ids.min().item(), topk_ids.max().item(),
-                        topk_weights.min().item(), topk_weights.max().item(),
-                        list(self.w13_weight.shape), list(self.w2_weight.shape),
-                        hidden_states.float().norm().item())
-
-        # Step 2: Determine which tokens go to which EP rank.
-        dest_ranks = topk_ids.div(self._num_experts_per_rank, rounding_mode='trunc')  # (T, K)
-
-        # Count tokens to send to each rank
-        send_counts = torch.zeros(ep_size, dtype=torch.int64, device=device)
-        for r in range(ep_size):
-            send_counts[r] = (dest_ranks == r).sum()
-
-        # Gather all ranks' send counts so we know receive counts
-        all_counts = torch.zeros(ep_size, ep_size, dtype=torch.int64, device=device)
-        dist.all_gather_into_tensor(
-            all_counts.view(-1),
-            send_counts,
-        )
-        recv_counts = all_counts[:, ep_rank]  # what each rank sends to us
-
-        total_send = send_counts.sum().item()
-        total_recv = recv_counts.sum().item()
-
-        if _do_diag:
-            logger.info("[EP_DIAG] fwd#%d send_counts=%s recv_counts=%s "
-                        "total_send=%d total_recv=%d dest_ranks range=[%d,%d]",
-                        _diag_counter[0],
-                        send_counts.tolist(), recv_counts.tolist(),
-                        total_send, total_recv,
-                        dest_ranks.min().item(), dest_ranks.max().item())
-
-        # Flatten topk dimension: each (token, k_slot) is a "work item"
-        flat_ids = topk_ids.view(-1)           # (T*K,)
-        flat_weights = topk_weights.view(-1)   # (T*K,)
-        flat_dest = dest_ranks.view(-1)        # (T*K,)
-        flat_token_idx = torch.arange(T, device=device).unsqueeze(1).expand(T, K).reshape(-1)  # (T*K,)
-
-        # Sort by destination rank for all-to-all
-        sort_idx = flat_dest.argsort()
-        sorted_hidden = hidden_states[flat_token_idx[sort_idx]]   # (T*K, H)
-        sorted_weights = flat_weights[sort_idx]                   # (T*K,)
-        sorted_ids = flat_ids[sort_idx]                           # (T*K,) global expert ids
-
-        # All-to-all send/recv counts
-        send_splits = send_counts.tolist()
-        recv_splits = recv_counts.tolist()
-
-        # All-to-all: exchange hidden states
-        recv_hidden = torch.empty(total_recv, H, dtype=hidden_states.dtype, device=device)
-        dist.all_to_all_single(recv_hidden, sorted_hidden,
-                               output_split_sizes=recv_splits,
-                               input_split_sizes=send_splits)
-
-        # All-to-all: exchange expert ids
-        recv_ids = torch.empty(total_recv, dtype=sorted_ids.dtype, device=device)
-        dist.all_to_all_single(recv_ids, sorted_ids,
-                               output_split_sizes=recv_splits,
-                               input_split_sizes=send_splits)
-
-        # All-to-all: exchange topk weights
-        recv_weights_buf = torch.empty(total_recv, dtype=sorted_weights.dtype, device=device)
-        dist.all_to_all_single(recv_weights_buf, sorted_weights,
-                               output_split_sizes=recv_splits,
-                               input_split_sizes=send_splits)
-
-        # Step 3: Local expert computation on received tokens
-        # Remap global expert ids to local
-        local_ids = recv_ids - start_expert  # now 0..num_experts_per_rank-1
-
-        if _do_diag:
-            logger.info("[EP_DIAG] fwd#%d recv_ids range=[%d,%d] "
-                        "local_ids range=[%d,%d] (expect 0..%d) "
-                        "recv_hidden norm=%.4f recv_weights range=[%.4f,%.4f]",
-                        _diag_counter[0],
-                        recv_ids.min().item() if total_recv > 0 else -1,
-                        recv_ids.max().item() if total_recv > 0 else -1,
-                        local_ids.min().item() if total_recv > 0 else -1,
-                        local_ids.max().item() if total_recv > 0 else -1,
-                        self._num_experts_per_rank - 1,
-                        recv_hidden.float().norm().item() if total_recv > 0 else 0,
-                        recv_weights_buf.min().item() if total_recv > 0 else 0,
-                        recv_weights_buf.max().item() if total_recv > 0 else 0)
-
-        if total_recv > 0:
-            local_output = _bi100_local_expert_compute(
-                recv_hidden, local_ids, recv_weights_buf,
-                self.w13_weight, self.w2_weight,
-                self._num_experts_per_rank, _kernels)
+            # Pack topk_ids and topk_weights into one tensor for a single
+            # all_gather (Google's 3-to-2 optimization, PR #2836).
+            # topk_ids is int64, topk_weights is fp16/fp32 — cast weights
+            # to int and stack.
+            topk_ids_i32 = topk_ids.to(torch.int32).contiguous()
+            topk_weights_i32 = topk_weights.to(torch.float32).view(
+                torch.int32).contiguous()
+            # blob shape: (T_local, K, 2) — pack ids and weights
+            blob = torch.stack([topk_ids_i32, topk_weights_i32], dim=-1)
+            gathered_blob_list = [torch.empty_like(blob) for _ in range(ep_size)]
+            dist.all_gather(gathered_blob_list, blob)
+            all_blob = torch.cat(gathered_blob_list, dim=0)  # (T_global, K, 2)
+            all_topk_ids = all_blob[:, :, 0].long()
+            all_topk_weights = all_blob[:, :, 1].view(torch.float32).to(
+                topk_weights.dtype)
         else:
-            local_output = torch.empty(0, H, dtype=hidden_states.dtype, device=device)
+            all_hidden = hidden_states
+            all_topk_ids = topk_ids
+            all_topk_weights = topk_weights
 
-        if _do_diag:
-            logger.info("[EP_DIAG] fwd#%d local_output norm=%.4f",
-                        _diag_counter[0],
-                        local_output.float().norm().item() if total_recv > 0 else 0)
+        T_global = all_hidden.shape[0]
 
-        # Step 4: All-to-all combine — send results back
-        combine_output = torch.empty(total_send, H, dtype=hidden_states.dtype, device=device)
-        dist.all_to_all_single(combine_output, local_output,
-                               output_split_sizes=send_splits,
-                               input_split_sizes=recv_splits)
+        # ----- Step 3: Local expert computation -----
+        # Sort all tokens by expert id, then compute only our local experts.
+        # This mirrors Google's _process_tokens_locally + moe_gmm_local.
+        flat_ids = all_topk_ids.view(-1)            # (T_global * K,)
+        flat_weights = all_topk_weights.view(-1)    # (T_global * K,)
+        flat_token_idx = torch.arange(
+            T_global, device=device
+        ).unsqueeze(1).expand(T_global, K).reshape(-1)  # (T_global * K,)
 
-        # Unsort and scatter-add back to original token positions
-        final_output = torch.zeros(T, H, dtype=hidden_states.dtype, device=device)
-        unsorted_output = torch.zeros_like(combine_output)
-        unsorted_output[sort_idx] = combine_output
+        # Sort by expert id (same as Google's argsort)
+        sorted_order = flat_ids.argsort(stable=True)
+        sorted_ids = flat_ids[sorted_order]
+        sorted_token_idx = flat_token_idx[sorted_order]
+        sorted_weights = flat_weights[sorted_order]
 
-        # scatter_add by token index
-        token_indices = flat_token_idx.unsqueeze(1).expand(-1, H)  # (T*K, H)
-        final_output.scatter_add_(0, token_indices, unsorted_output)
+        # Group sizes: how many tokens assigned to each global expert
+        num_experts_global = self.num_experts
+        expert_counts = torch.bincount(
+            sorted_ids, minlength=num_experts_global).tolist()
 
-        if _do_diag:
-            logger.info("[EP_DIAG] fwd#%d final_output norm=%.4f "
-                        "combine_output norm=%.4f",
-                        _diag_counter[0],
-                        final_output.float().norm().item(),
-                        combine_output.float().norm().item())
-            _diag_counter[0] += 1
+        # Gather sorted hidden states
+        sorted_hidden = all_hidden[sorted_token_idx]  # (T_global * K, H)
 
-        # EP reduce
-        if self._reduce_results_ep:
-            pass  # EP output is already complete
+        # Compute only local experts [start_expert, start_expert + num_local)
+        # For expert ids outside our range, output is zero (same as Google's
+        # valid_rows_mask approach).
+        end_expert = start_expert + num_local_experts
 
-        return final_output
+        # Find the range in the sorted array that belongs to our experts
+        cumsum = 0
+        local_start_idx = 0
+        local_end_idx = 0
+        for eid in range(num_experts_global):
+            if eid == start_expert:
+                local_start_idx = cumsum
+            if eid == end_expert:
+                local_end_idx = cumsum
+                break
+            cumsum += expert_counts[eid]
+        else:
+            # end_expert == num_experts_global
+            local_end_idx = cumsum + (expert_counts[end_expert - 1]
+                                       if end_expert > start_expert else 0)
+            # Recalculate properly
+            local_end_idx = sum(expert_counts[:end_expert])
+
+        # Recompute cleanly
+        local_start_idx = sum(expert_counts[:start_expert])
+        local_end_idx = sum(expert_counts[:end_expert])
+        local_count = local_end_idx - local_start_idx
+
+        # Expert computation on our local slice
+        expert_output = torch.zeros(
+            T_global * K, H, dtype=hidden_states.dtype, device=device)
+
+        if local_count > 0:
+            local_hidden = sorted_hidden[local_start_idx:local_end_idx]
+            local_expert_ids = sorted_ids[local_start_idx:local_end_idx] \
+                - start_expert  # remap to 0..num_local-1
+            local_weights_slice = sorted_weights[local_start_idx:local_end_idx]
+
+            local_result = _bi100_local_expert_compute(
+                local_hidden, local_expert_ids, local_weights_slice,
+                self.w13_weight, self.w2_weight,
+                num_local_experts, _kernels)
+
+            expert_output[local_start_idx:local_end_idx] = local_result
+
+        # ----- Unpermute: scatter results back to token positions -----
+        # Reverse the argsort to get results back in original (T_global*K) order
+        unsorted_output = torch.zeros_like(expert_output)
+        unsorted_output[sorted_order] = expert_output
+
+        # Reduce topk dimension: sum over K experts per token
+        # unsorted_output is (T_global * K, H), reshape to (T_global, K, H)
+        token_output = unsorted_output.view(T_global, K, H).sum(dim=1)
+
+        # ----- Step 4: Reduce-Scatter (or All-Reduce) -----
+        # Each rank computed a partial result (only its local experts contribute
+        # non-zero values). Sum across all EP ranks to get the full output.
+        if ep_size > 1:
+            # Reduce-scatter: each rank gets its local T_local tokens back
+            # token_output is (T_global, H) = (T_local * ep_size, H)
+            # After reduce_scatter, result is (T_local, H)
+            output = torch.empty(
+                T_local, H, dtype=hidden_states.dtype, device=device)
+            dist.reduce_scatter_tensor(output, token_output)
+        else:
+            output = token_output
+
+        return output
 
     # Apply patches
     FusedMoE.__init__ = _ep_init
