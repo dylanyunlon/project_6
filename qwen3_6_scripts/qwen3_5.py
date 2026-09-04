@@ -2038,6 +2038,14 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         # 3. Clamp remapped ids to [0, E_local-1] so indexing doesn't OOB
         #    (the zeroed weights ensure clamped entries don't contribute)
         _ep = getattr(self.experts, '_ep_enabled', False)
+        if not hasattr(self, '_ep_check_done'):
+            self._ep_check_done = True
+            logger.info("[EP_CHECK] _ep_enabled=%s type(experts)=%s "
+                        "has_attr=%s ep_rank=%s start=%s",
+                        _ep, type(self.experts).__name__,
+                        hasattr(self.experts, '_ep_enabled'),
+                        getattr(self.experts, '_ep_rank', 'N/A'),
+                        getattr(self.experts, '_start_expert_id', 'N/A'))
         if _ep:
             start_eid = self.experts._start_expert_id
             end_eid = start_eid + self.experts._num_experts_per_rank
