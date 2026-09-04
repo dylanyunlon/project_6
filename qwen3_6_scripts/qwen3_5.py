@@ -2045,6 +2045,15 @@ class Qwen3_5MoeSparseBlock(nn.Module):
             topk_weights = topk_weights * local_mask.to(topk_weights.dtype)
             topk_ids = (topk_ids - start_eid).clamp(
                 0, self.experts._num_experts_per_rank - 1)
+            if not hasattr(self, '_ep_diag_done'):
+                self._ep_diag_done = True
+                logger.info("[EP_MASK] rank=%d start=%d end=%d "
+                            "orig_mask_sum=%d/%d "
+                            "remapped_ids=%s weights=%s",
+                            self.experts._ep_rank, start_eid, end_eid,
+                            local_mask.sum().item(), local_mask.numel(),
+                            topk_ids[:1].tolist() if topk_ids.dim() > 1 else topk_ids.tolist(),
+                            topk_weights[:1].tolist() if topk_weights.dim() > 1 else topk_weights.tolist())
 
         T = hidden_states.shape[0]
         if T == 1:
