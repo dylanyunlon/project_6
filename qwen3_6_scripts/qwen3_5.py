@@ -2027,8 +2027,24 @@ class Qwen3_5MoeSparseBlock(nn.Module):
             topk_weights = torch.softmax(topk_logits, dim=-1)
             topk_weights = topk_weights.to(hidden_states.dtype)
 
-        w13 = self.experts.w13_weight  # (E, 2*I, H)
-        w2  = self.experts.w2_weight   # (E, H, I)
+        w13 = self.experts.w13_weight  # (E_local, 2*I_tp, H) or (E_global, 2*I_tp, H)
+        w2  = self.experts.w2_weight   # (E_local, H, I_tp) or (E_global, H, I_tp)
+
+        # --- EP: mask non-local experts, remap ids to local index ---
+        # In EP mode, w13/w2 only contain local experts (0..E_local-1).
+        # topk_ids are global (0..E_global-1). We must:
+        # 1. Zero the weight of any expert not on this rank
+        # 2. Remap global ids to local (subtract start_expert_id)
+        # 3. Clamp remapped ids to [0, E_local-1] so indexing doesn't OOB
+        #    (the zeroed weights ensure clamped entries don't contribute)
+        _ep = getattr(self.experts, '_ep_enabled', False)
+        if _ep:
+            start_eid = self.experts._start_expert_id
+            end_eid = start_eid + self.experts._num_experts_per_rank
+            local_mask = (topk_ids >= start_eid) & (topk_ids < end_eid)
+            topk_weights = topk_weights * local_mask.to(topk_weights.dtype)
+            topk_ids = (topk_ids - start_eid).clamp(
+                0, self.experts._num_experts_per_rank - 1)
 
         T = hidden_states.shape[0]
         if T == 1:
@@ -2215,12 +2231,7 @@ class Qwen3_5MoeSparseBlock(nn.Module):
             router_logits = router_and_shared_gate[..., :self.num_experts]
             gate_score = router_and_shared_gate[..., self.num_experts:]
         with bi100_timer("moe.routed"):
-            if getattr(self.experts, '_ep_enabled', False):
-                # EP mode: FusedMoE.forward (_ep_forward) handles
-                # global→local expert mapping + all-to-all dispatch
-                routed_out = self.experts(hidden_states, router_logits)
-            else:
-                routed_out = self._pure_pytorch_experts(hidden_states, router_logits)
+            routed_out = self._pure_pytorch_experts(hidden_states, router_logits)
 
         with bi100_timer("moe.shared"):
             gate_up, _ = self.shared_expert_gate_up(hidden_states)
@@ -2230,9 +2241,11 @@ class Qwen3_5MoeSparseBlock(nn.Module):
 
         with bi100_timer("moe.combine"):
             out = routed_out + shared_out
-        if self.experts.tp_size > 1:
-            with bi100_timer("moe.all_reduce"):
-                out = tensor_model_parallel_all_reduce(out)
+        # Always all_reduce: in TP mode this sums the TP-sharded partials;
+        # in EP mode it also sums across ranks (each rank only computed its
+        # local experts).  Both are a sum over the same process group.
+        with bi100_timer("moe.all_reduce"):
+            out = tensor_model_parallel_all_reduce(out)
         return out
 
 
