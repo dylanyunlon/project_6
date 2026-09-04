@@ -68,28 +68,25 @@ def patch_fused_moe_for_ep():
 
         ep_size, ep_rank = _get_ep_runtime_config()
 
-        self._ep_enabled = True
-        self._ep_size = ep_size
-        self._ep_rank = ep_rank
-        self._global_num_experts = num_experts
+        num_experts_per_rank = num_experts // ep_size
+        start_expert_id = ep_rank * num_experts_per_rank
         assert num_experts % ep_size == 0
-        self._num_experts_per_rank = num_experts // ep_size
-        self._start_expert_id = ep_rank * self._num_experts_per_rank
 
         logger.info(
             "[PR #2269] FusedMoE EP init: global=%d ep_size=%d ep_rank=%d "
             "local=%d (ids %d..%d) tp_size=%s",
             num_experts, ep_size, ep_rank,
-            self._num_experts_per_rank,
-            self._start_expert_id,
-            self._start_expert_id + self._num_experts_per_rank - 1,
+            num_experts_per_rank,
+            start_expert_id,
+            start_expert_id + num_experts_per_rank - 1,
             tp_size)
 
         # Call original __init__ with LOCAL expert count but SAME tp_size.
-        # Weights: (num_local_experts, 2*inter//tp, H) — both EP and TP sharded.
+        # NOTE: _orig_init calls super().__init__() which wipes self.__dict__,
+        # so ALL EP attributes must be set AFTER this call.
         _orig_init(
             self,
-            num_experts=self._num_experts_per_rank,
+            num_experts=num_experts_per_rank,
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -100,7 +97,15 @@ def patch_fused_moe_for_ep():
             num_expert_group=num_expert_group,
             topk_group=topk_group,
             quant_config=quant_config,
-            tp_size=tp_size,  # keep TP sharding as-is
+            tp_size=1,  # EP replaces TP for MoE: full intermediate per expert
+            # Why tp_size=1: With EP+TP on the same group, a single all_reduce
+            # sums across all ranks. If weights are TP-sharded (I/tp), each
+            # expert only exists on 1 rank with 1/tp of intermediate — the
+            # all_reduce adds contributions from DIFFERENT experts (EP) but
+            # does NOT sum TP shards of the SAME expert. Result: 1/tp too small.
+            # With tp_size=1: each rank holds full intermediate for its local
+            # experts. all_reduce sums 4 ranks × 64 experts = 256 experts,
+            # each with full intermediate. Correct.
             prefix=prefix,
             custom_routing_function=custom_routing_function,
         )
@@ -108,11 +113,27 @@ def patch_fused_moe_for_ep():
         # Override num_experts back to global for routing
         self.num_experts = num_experts
 
+        # Set EP attributes AFTER _orig_init. The call above invokes
+        # super().__init__() which resets self.__dict__, so anything
+        # set before it gets wiped.
+        self._ep_enabled = True
+        self._ep_size = ep_size
+        self._ep_rank = ep_rank
+        self._global_num_experts = num_experts
+        self._num_experts_per_rank = num_experts_per_rank
+        self._start_expert_id = start_expert_id
+
     _orig_weight_loader = FusedMoE.weight_loader
 
     def _ep_weight_loader(self, param, loaded_weight, weight_name,
                           shard_id, expert_id):
-        """EP-aware weight_loader: skip non-local experts, remap id."""
+        """EP-aware weight_loader: skip non-local experts, remap id.
+        
+        Since we pass tp_size=1 to FusedMoE (each rank holds full intermediate),
+        we must also force tp_rank=0 during loading. Otherwise ranks 1/2/3
+        call narrow(dim, shard_size*tp_rank, shard_size) which goes out of bounds
+        because the weight is already full-size (no TP split to index into).
+        """
         if not getattr(self, '_ep_enabled', False):
             return _orig_weight_loader(self, param, loaded_weight,
                                        weight_name, shard_id, expert_id)
@@ -124,9 +145,17 @@ def patch_fused_moe_for_ep():
             return
 
         local_expert_id = expert_id - start
-        # tp_rank is correct (TP sharding is normal), no monkey-patch needed
-        _orig_weight_loader(self, param, loaded_weight, weight_name,
-                            shard_id, local_expert_id)
+        # Temporarily force tp_rank=0 so narrow() doesn't go OOB.
+        # With tp_size=1 the weight is full-size, so every rank loads
+        # the same full slice (offset 0).
+        import vllm.distributed as _dist
+        _real_tp_rank = _dist.get_tensor_model_parallel_rank
+        _dist.get_tensor_model_parallel_rank = lambda: 0
+        try:
+            _orig_weight_loader(self, param, loaded_weight, weight_name,
+                                shard_id, local_expert_id)
+        finally:
+            _dist.get_tensor_model_parallel_rank = _real_tp_rank
 
     FusedMoE.__init__ = _ep_init
     FusedMoE.weight_loader = _ep_weight_loader

@@ -1894,9 +1894,11 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         self.router_shared_gate.weight.weight_loader = \
             self._router_shared_gate_weight_loader
 
-        # FusedMoE: weight storage + weight_loader.
-        # Forward is bypassed in non-EP mode (see _pure_pytorch_experts()).
-        # In EP mode (_ep_enabled), FusedMoE.forward (_ep_forward) IS called.
+        # FusedMoE: weight storage + weight_loader ONLY.
+        # Forward is NEVER called — _pure_pytorch_experts() handles everything.
+        # In EP mode, _ep_enabled/start_expert_id/num_experts_per_rank attrs
+        # are set by ep_fused_moe_patch.py, used by _pure_pytorch_experts()
+        # to mask non-local experts and remap ids.
         self.experts = FusedMoE(
             num_experts=text_cfg.num_experts,
             top_k=text_cfg.num_experts_per_tok,
@@ -2038,14 +2040,6 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         # 3. Clamp remapped ids to [0, E_local-1] so indexing doesn't OOB
         #    (the zeroed weights ensure clamped entries don't contribute)
         _ep = getattr(self.experts, '_ep_enabled', False)
-        if not hasattr(self, '_ep_check_done'):
-            self._ep_check_done = True
-            logger.info("[EP_CHECK] _ep_enabled=%s type(experts)=%s "
-                        "has_attr=%s ep_rank=%s start=%s",
-                        _ep, type(self.experts).__name__,
-                        hasattr(self.experts, '_ep_enabled'),
-                        getattr(self.experts, '_ep_rank', 'N/A'),
-                        getattr(self.experts, '_start_expert_id', 'N/A'))
         if _ep:
             start_eid = self.experts._start_expert_id
             end_eid = start_eid + self.experts._num_experts_per_rank
@@ -2055,13 +2049,23 @@ class Qwen3_5MoeSparseBlock(nn.Module):
                 0, self.experts._num_experts_per_rank - 1)
             if not hasattr(self, '_ep_diag_done'):
                 self._ep_diag_done = True
-                logger.info("[EP_MASK] rank=%d start=%d end=%d "
-                            "orig_mask_sum=%d/%d "
-                            "remapped_ids=%s weights=%s",
-                            self.experts._ep_rank, start_eid, end_eid,
-                            local_mask.sum().item(), local_mask.numel(),
-                            topk_ids[:1].tolist() if topk_ids.dim() > 1 else topk_ids.tolist(),
-                            topk_weights[:1].tolist() if topk_weights.dim() > 1 else topk_weights.tolist())
+                logger.info(
+                    "[EP_DEBUG] rank=%d start=%d end=%d "
+                    "w13=%s w2=%s "
+                    "local_mask_sum=%d/%d "
+                    "topk_ids_range=[%d,%d] "
+                    "topk_weights_nonzero=%d/%d "
+                    "hidden_norm=%.4f w13_norm=%.4f w2_norm=%.4f "
+                    "topk_weights_sum=%.6f",
+                    self.experts._ep_rank, start_eid, end_eid,
+                    list(w13.shape), list(w2.shape),
+                    local_mask.sum().item(), local_mask.numel(),
+                    topk_ids.min().item(), topk_ids.max().item(),
+                    (topk_weights > 0).sum().item(), topk_weights.numel(),
+                    hidden_states.float().norm().item(),
+                    w13.float().norm().item(),
+                    w2.float().norm().item(),
+                    topk_weights.float().sum().item())
 
         T = hidden_states.shape[0]
         if T == 1:
@@ -2240,6 +2244,17 @@ class Qwen3_5MoeSparseBlock(nn.Module):
                     out.index_add_(0, tok_ids, (expert_out * weights).to(out.dtype))
                     start = end
 
+        # One-shot diagnostic: log routed output norm after first forward
+        if not hasattr(self, '_routed_diag_done'):
+            self._routed_diag_done = True
+            _ep = getattr(self.experts, '_ep_enabled', False)
+            logger.info(
+                "[MoE_OUT] EP=%s T=%d out_shape=%s out_norm=%.6f "
+                "out_abs_max=%.6f out_has_nan=%s out_has_inf=%s",
+                _ep, hidden_states.shape[0], list(out.shape),
+                out.float().norm().item(),
+                out.float().abs().max().item(),
+                bool(out.isnan().any()), bool(out.isinf().any()))
         return out  # partial, all-reduce done in forward()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -2263,6 +2278,19 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         # local experts).  Both are a sum over the same process group.
         with bi100_timer("moe.all_reduce"):
             out = tensor_model_parallel_all_reduce(out)
+        _fwd_cnt = getattr(self, '_fwd_diag_cnt', 0)
+        if _fwd_cnt < 5:
+            self._fwd_diag_cnt = _fwd_cnt + 1
+            logger.info(
+                "[MoE_FWD] call=%d T=%d routed_norm=%.4f shared_norm=%.4f "
+                "combined_pre_ar=%.4f final_norm=%.4f "
+                "has_nan=%s has_inf=%s",
+                _fwd_cnt, hidden_states.shape[0],
+                routed_out.float().norm().item(),
+                shared_out.float().norm().item(),
+                (routed_out + shared_out).float().norm().item(),
+                out.float().norm().item(),
+                bool(out.isnan().any()), bool(out.isinf().any()))
         return out
 
 
@@ -2856,6 +2884,23 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
         # logits_processor.py (patched by patch_xformers_sdpa_seq.py).
         logits = self.logits_processor(self.lm_head, hidden_states,
                                        sampling_metadata)
+        if logits is not None:
+            _cnt = getattr(self, '_logits_diag_cnt', 0)
+            if _cnt < 5:
+                self._logits_diag_cnt = _cnt + 1
+                try:
+                    top5_vals, top5_ids = logits[-1].topk(5)
+                    logger.info(
+                        "[LOGITS] call=%d shape=%s last_row_norm=%.4f "
+                        "top5_ids=%s top5_vals=%s "
+                        "has_nan=%s min=%.4f max=%.4f",
+                        _cnt, list(logits.shape),
+                        logits[-1].float().norm().item(),
+                        top5_ids.tolist(), top5_vals.tolist(),
+                        bool(logits.isnan().any()),
+                        logits.min().item(), logits.max().item())
+                except Exception as e:
+                    logger.info("[LOGITS] call=%d diag failed: %s", _cnt, e)
         return logits
 
     def sample(
