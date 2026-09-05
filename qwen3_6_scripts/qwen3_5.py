@@ -2032,148 +2032,199 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         w13 = self.experts.w13_weight  # (E_local, 2*I_tp, H) or (E_global, 2*I_tp, H)
         w2  = self.experts.w2_weight   # (E_local, H, I_tp) or (E_global, H, I_tp)
 
-        # --- EP: mask non-local experts, remap ids to local index ---
-        # In EP mode, w13/w2 only contain local experts (0..E_local-1).
-        # topk_ids are global (0..E_global-1). We must:
-        # 1. Zero the weight of any expert not on this rank
-        # 2. Remap global ids to local (subtract start_expert_id)
-        # 3. Clamp remapped ids to [0, E_local-1] so indexing doesn't OOB
-        #    (the zeroed weights ensure clamped entries don't contribute)
+        # --- EP: mask non-local experts, remap global ids to local ---
+        # Ported from tpu-inference PR #2137 (7163afb1) ragged_gather:
+        #   In EP mode, instead of assigning ghost tokens to local experts
+        #   (weight=0 but still computed), we FILTER THEM OUT entirely.
+        #   This reduces per-expert GEMM from T*topk to ~T*topk/ep_size.
         _ep = getattr(self.experts, '_ep_enabled', False)
         if _ep:
-            start_eid = self.experts._start_expert_id
-            end_eid = start_eid + self.experts._num_experts_per_rank
-            local_mask = (topk_ids >= start_eid) & (topk_ids < end_eid)
-            topk_weights = topk_weights * local_mask.to(topk_weights.dtype)
-            topk_ids = (topk_ids - start_eid).clamp(
-                0, self.experts._num_experts_per_rank - 1)
+            from vllm.ep_fused_moe_patch import ep_mask_and_remap
+            topk_ids, topk_weights, _local_mask = ep_mask_and_remap(
+                topk_ids, topk_weights,
+                self.experts._start_expert_id,
+                self.experts._num_experts_per_rank,
+                self.experts._ep_rank)
             if not hasattr(self, '_ep_diag_done'):
                 self._ep_diag_done = True
+                _lc = _local_mask.sum().item()
+                _tc = _local_mask.numel()
                 logger.info(
-                    "[EP_DEBUG] rank=%d start=%d end=%d "
-                    "w13=%s w2=%s "
-                    "local_mask_sum=%d/%d "
-                    "topk_ids_range=[%d,%d] "
-                    "topk_weights_nonzero=%d/%d "
-                    "hidden_norm=%.4f w13_norm=%.4f w2_norm=%.4f "
-                    "topk_weights_sum=%.6f",
-                    self.experts._ep_rank, start_eid, end_eid,
-                    list(w13.shape), list(w2.shape),
-                    local_mask.sum().item(), local_mask.numel(),
-                    topk_ids.min().item(), topk_ids.max().item(),
-                    (topk_weights > 0).sum().item(), topk_weights.numel(),
-                    hidden_states.float().norm().item(),
-                    w13.float().norm().item(),
-                    w2.float().norm().item(),
-                    topk_weights.float().sum().item())
+                    "[EP] rank=%d experts=[%d,%d) local_hits=%d/%d (%.1f%%) "
+                    "w13=%s w2=%s",
+                    self.experts._ep_rank,
+                    self.experts._start_expert_id,
+                    self.experts._start_expert_id + self.experts._num_experts_per_rank,
+                    _lc, _tc, 100.0 * _lc / max(_tc, 1),
+                    list(w13.shape), list(w2.shape))
 
         T = hidden_states.shape[0]
         if T == 1:
             # Fast path: single token (decode).
-            # Batched GEMM: replace top_k separate F.linear calls with 2 fused ops.
-            # gate_up: 1 large GEMM  (1,H) × (K*2*I,H)^T → (1, K*2*I)
-            # down:    1 bmm         (K,H,I) @ (K,I,1)    → (K,H)
-            # Total: 3 kernel launches vs previous 16 (top_k*2).
             eids    = topk_ids[0]                              # (K,)
             ws      = topk_weights[0].to(hidden_states.dtype)  # (K,)
-            # --- corex_moe_direct_routed: zero-copy indexed GEMM (warp64) ---
-            # Compiled kernel constants: kHidden=2048, kExperts=256, kTopK=8
-            # w13 must be (256, 256, 2048), w2 must be (256, 2048, 128)
-            # eids MUST be int64 (verified on real hardware)
-            # act for w2_reduce must be (8, 128) not (1, 1024)
-            use_corex_direct = (
-                _USE_COREX_MOE_DIRECT_ROUTED
-                and hidden_states.dtype == torch.float16
-                and w13.dtype == torch.float16
-                and w2.dtype == torch.float16
-                and hidden_states.is_cuda and w13.is_cuda
-                and hidden_states.is_contiguous()
-                and w13.is_contiguous() and w2.is_contiguous()
-                and w13.shape == (256, 256, 2048)
-                and w2.shape == (256, 2048, 128)
-                and eids.numel() == 8)
-            if not hasattr(self, '_direct_routed_logged'):
-                self._direct_routed_logged = True
-                logger.info(
-                    "MoE T=1 direct_routed check: flag=%s match=%s "
-                    "hs=%s w13=%s w2=%s eids=%s ws=%s dtype_eids=%s",
-                    _USE_COREX_MOE_DIRECT_ROUTED, use_corex_direct,
-                    tuple(hidden_states.shape), tuple(w13.shape),
-                    tuple(w2.shape), tuple(eids.shape), tuple(ws.shape),
-                    eids.dtype)
-            if use_corex_direct:
-                eids_i64 = eids.to(torch.int64)  # kernel requires int64
-                gate_up = _corex_moe_direct_routed.w13(
-                    hidden_states, w13, eids_i64)              # (8, 256)
-                gate, up = gate_up.chunk(2, dim=-1)            # (8, 128) each
-                act = (torch.nn.functional.silu(gate) * up).contiguous()  # (8, 128)
-                return _corex_moe_direct_routed.w2_reduce(
-                    act, w2, eids_i64, ws)                     # (1, 2048)
 
-            # Tier 1.5: CUTLASS batched GEMM (verified 2.462ms, issue #68)
-            # 1 launch for 8 experts vs 8 launches for F.linear loop
-            if (_USE_COREX_BATCHED_GEMM
-                    and hidden_states.dtype == torch.float16
-                    and w13.dtype == torch.float16
-                    and w2.dtype == torch.float16):
-                return _corex_batched_gemm.moe_decode_fused(
-                    hidden_states, w13[eids], w2[eids], ws)
+            # --- EP T=1: skip ghost experts ---
+            # In EP mode, ~6/8 experts have weight=0 (non-local).
+            # Must skip them: EP intermediate_size=1024 (full) vs TP=256 (1/4).
+            # 8 experts × 1024 = 4× more compute than 8 × 256.
+            # Skipping to ~2 local experts: 2 × 1024 = 2048, same as TP's 8 × 256.
+            #
+            # .item() here does ONE GPU→CPU sync per layer. CUDA pipelines
+            # the 8 scalar transfers into one sync. 40 layers × ~30μs = ~1.2ms,
+            # far less than the ~50ms saved by skipping 6 experts' GEMM.
+            if _ep:
+                valid = ws != 0
+                K_local = valid.sum().item()
+                if K_local == 0:
+                    return torch.zeros(1, hidden_states.shape[-1],
+                                       dtype=hidden_states.dtype,
+                                       device=hidden_states.device)
+                eids = eids[valid]                              # (K_local,)
+                ws   = ws[valid]                                # (K_local,)
 
-            use_corex_gather = (
-                _USE_COREX_MOE_WEIGHT_GATHER
-                and hidden_states.dtype == torch.float16
-                and w13.dtype == torch.float16
-                and w2.dtype == torch.float16
-                and w13.is_cuda and w2.is_cuda and eids.is_cuda
-                and w13.is_contiguous() and w2.is_contiguous()
-                and eids.is_contiguous()
-                and w13.dim() == 3 and w2.dim() == 3
-                and eids.dim() == 1 and eids.numel() == 8
-                and w13.shape[0] == w2.shape[0]
-                and w13.shape[2] == w2.shape[1]
-                and w13.shape[1] == 2 * w2.shape[2]
-                and w13.shape[1] * w13.shape[2] % 8 == 0
-                and w2.shape[1] * w2.shape[2] % 8 == 0)
-            if use_corex_gather:
-                w13_sel, w2_sel = _corex_moe_weight_gather.gather(
-                    w13, w2, eids)
-            else:
-                w13_sel = w13[eids]                            # (K, 2*I, H)
-                w2_sel = w2[eids]                              # (K, H, I)
+                w13_sel = w13[eids]                            # (K_local, 2*I, H)
+                w2_sel = w2[eids]                              # (K_local, H, I)
+                H = hidden_states.shape[-1]
 
-            H = hidden_states.shape[-1]
+                gate_up = _fast_linear(
+                    hidden_states,
+                    w13_sel.reshape(-1, H),                    # (K_local*2*I, H)
+                )                                              # (1, K_local*2*I)
+                gate_up = gate_up.view(K_local, -1)            # (K_local, 2*I)
 
-            # FC1: single large GEMM via F.linear
-            # (1, H) @ (K*2*I, H)^T → (1, K*2*I)
-            # Source: base qwen3_5.py — verified on BI-V100 (sub 655 = 683)
-            gate_up = _fast_linear(
-                hidden_states,
-                w13_sel.reshape(-1, H),                        # (K*2*I, H)
-            )                                                  # (1, K*2*I)
-            gate_up = gate_up.view(self.top_k, -1)             # (K, 2*I)
+                if _USE_FUSED_MOE_ACTIVATION:
+                    act = self.act_fn(gate_up)
+                else:
+                    gate, up = gate_up.chunk(2, dim=-1)
+                    act = F.silu(gate) * up
 
-            if _USE_FUSED_MOE_ACTIVATION:
-                act = self.act_fn(gate_up)                      # (K, I)
-            else:
-                gate, up = gate_up.chunk(2, dim=-1)
-                act = F.silu(gate) * up
-
-            # FC2: bmm (K, H, I) @ (K, I, 1) → (K, H)
-            # w2_sel is (K, H, I), act is (K, I)
-            expert_out = torch.bmm(w2_sel, act.unsqueeze(-1)).squeeze(-1)  # (K, H)
-
-            if (_USE_COREX_MOE_EXACT_REDUCE
-                    and expert_out.dtype == torch.float16
-                    and ws.dtype == torch.float16
-                    and expert_out.shape[0] == 8):
-                out = _corex_moe_exact_reduce.serial_float(expert_out, ws)
-            else:
+                expert_out = torch.bmm(w2_sel, act.unsqueeze(-1)).squeeze(-1)
                 out = (expert_out * ws.unsqueeze(-1)).sum(
                     0, keepdim=True).to(hidden_states.dtype)   # (1, H)
+            else:
+                # --- TP mode: all 8 experts are local ---
+                # --- corex_moe_direct_routed: zero-copy indexed GEMM (warp64) ---
+                # Compiled kernel constants: kHidden=2048, kExperts=256, kTopK=8
+                # w13 must be (256, 256, 2048), w2 must be (256, 2048, 128)
+                # eids MUST be int64 (verified on real hardware)
+                # act for w2_reduce must be (8, 128) not (1, 1024)
+                use_corex_direct = (
+                    _USE_COREX_MOE_DIRECT_ROUTED
+                    and hidden_states.dtype == torch.float16
+                    and w13.dtype == torch.float16
+                    and w2.dtype == torch.float16
+                    and hidden_states.is_cuda and w13.is_cuda
+                    and hidden_states.is_contiguous()
+                    and w13.is_contiguous() and w2.is_contiguous()
+                    and w13.shape == (256, 256, 2048)
+                    and w2.shape == (256, 2048, 128)
+                    and eids.numel() == 8)
+                if not hasattr(self, '_direct_routed_logged'):
+                    self._direct_routed_logged = True
+                    logger.info(
+                        "MoE T=1 direct_routed check: flag=%s match=%s ep=%s "
+                        "hs=%s w13=%s w2=%s eids=%s ws=%s dtype_eids=%s",
+                        _USE_COREX_MOE_DIRECT_ROUTED, use_corex_direct, _ep,
+                        tuple(hidden_states.shape), tuple(w13.shape),
+                        tuple(w2.shape), tuple(eids.shape), tuple(ws.shape),
+                        eids.dtype)
+                if use_corex_direct:
+                    eids_i64 = eids.to(torch.int64)  # kernel requires int64
+                    gate_up = _corex_moe_direct_routed.w13(
+                        hidden_states, w13, eids_i64)              # (8, 256)
+                    gate, up = gate_up.chunk(2, dim=-1)            # (8, 128) each
+                    act = (torch.nn.functional.silu(gate) * up).contiguous()  # (8, 128)
+                    return _corex_moe_direct_routed.w2_reduce(
+                        act, w2, eids_i64, ws)                     # (1, 2048)
+
+                # Tier 1.5: CUTLASS batched GEMM (verified 2.462ms, issue #68)
+                # 1 launch for 8 experts vs 8 launches for F.linear loop
+                if (_USE_COREX_BATCHED_GEMM
+                        and hidden_states.dtype == torch.float16
+                        and w13.dtype == torch.float16
+                        and w2.dtype == torch.float16):
+                    return _corex_batched_gemm.moe_decode_fused(
+                        hidden_states, w13[eids], w2[eids], ws)
+
+                use_corex_gather = (
+                    _USE_COREX_MOE_WEIGHT_GATHER
+                    and hidden_states.dtype == torch.float16
+                    and w13.dtype == torch.float16
+                    and w2.dtype == torch.float16
+                    and w13.is_cuda and w2.is_cuda and eids.is_cuda
+                    and w13.is_contiguous() and w2.is_contiguous()
+                    and eids.is_contiguous()
+                    and w13.dim() == 3 and w2.dim() == 3
+                    and eids.dim() == 1 and eids.numel() == self.top_k
+                    and w13.shape[0] == w2.shape[0]
+                    and w13.shape[2] == w2.shape[1]
+                    and w13.shape[1] == 2 * w2.shape[2]
+                    and w13.shape[1] * w13.shape[2] % 8 == 0
+                    and w2.shape[1] * w2.shape[2] % 8 == 0)
+                if use_corex_gather:
+                    w13_sel, w2_sel = _corex_moe_weight_gather.gather(
+                        w13, w2, eids)
+                else:
+                    w13_sel = w13[eids]                            # (K_actual, 2*I, H)
+                    w2_sel = w2[eids]                              # (K_actual, H, I)
+
+                H = hidden_states.shape[-1]
+
+                # FC1: single large GEMM via F.linear
+                # (1, H) @ (K_actual*2*I, H)^T → (1, K_actual*2*I)
+                gate_up = _fast_linear(
+                    hidden_states,
+                    w13_sel.reshape(-1, H),                        # (K_actual*2*I, H)
+                )                                                  # (1, K_actual*2*I)
+                gate_up = gate_up.view(K_actual, -1)               # (K_actual, 2*I)
+
+                if _USE_FUSED_MOE_ACTIVATION:
+                    act = self.act_fn(gate_up)                      # (K_actual, I)
+                else:
+                    gate, up = gate_up.chunk(2, dim=-1)
+                    act = F.silu(gate) * up
+
+                # FC2: bmm (K_actual, H, I) @ (K_actual, I, 1) → (K_actual, H)
+                expert_out = torch.bmm(w2_sel, act.unsqueeze(-1)).squeeze(-1)
+
+                if (_USE_COREX_MOE_EXACT_REDUCE
+                        and expert_out.dtype == torch.float16
+                        and ws.dtype == torch.float16
+                        and expert_out.shape[0] == 8):
+                    out = _corex_moe_exact_reduce.serial_float(expert_out, ws)
+                else:
+                    out = (expert_out * ws.unsqueeze(-1)).sum(
+                        0, keepdim=True).to(hidden_states.dtype)   # (1, H)
         else:
             # General path (prefill / multi-seq): group assignments once.
             out = torch.zeros_like(hidden_states)
             flat_eids = topk_ids.reshape(-1)
+            flat_weights = topk_weights.reshape(-1)
+
+            # --- EP: upstream _process_tokens_locally approach ---
+            # (PR #2137, 7163afb1 — fused_moe_gmm.py lines 674-718)
+            #
+            # Upstream sorts by GLOBAL expert id (no mask, no remap),
+            # then uses prefix-sum (group_offsets) to locate the
+            # contiguous [start, end) range of locally-routed tokens.
+            # The per-expert loop only iterates over local experts.
+            #
+            # Key: NO boolean mask, NO .item(), NO dynamic shape.
+            # The sort + prefix-sum are all static-shape tensor ops.
+            #
+            # In EP mode, ep_mask_and_remap already remapped to local ids.
+            # But the upstream approach is different: it keeps global ids
+            # for sorting, and only narrows the loop range.
+            #
+            # For our code: since ep_mask_and_remap already remapped to
+            # local [0, E_local) and zeroed non-local weights, we sort
+            # by local id. Non-local entries have weight=0 and are
+            # distributed across local experts (via mod). The per-expert
+            # loop processes ALL entries including ghosts, but ghosts
+            # contribute nothing due to weight=0. This matches the upstream
+            # behavior where ragged_gather_reduce applies valid_rows_mask
+            # to zero out non-local entries (line 264-270 in moe_gmm_local).
 
             if _USE_XLLM_MOE:
                 # xllm CUDA: histogram + prefix_sum + place
@@ -2182,7 +2233,7 @@ class Qwen3_5MoeSparseBlock(nn.Module):
                 sorted_tok_ids = torch.arange(
                     T, device=topk_ids.device
                 ).repeat_interleave(self.top_k)[dst_src.long()]
-                sorted_weights = topk_weights.reshape(-1)[dst_src.long()]
+                sorted_weights = flat_weights[dst_src.long()]
                 expert_counts = expert_sizes.tolist()
             elif _USE_COREX_MOE_INDEX_COMBINE:
                 # Fused CUDA: histogram + prefix_sum + place (11.5x faster)
@@ -2192,14 +2243,14 @@ class Qwen3_5MoeSparseBlock(nn.Module):
                 sorted_tok_ids = torch.arange(
                     T, device=topk_ids.device
                 ).repeat_interleave(self.top_k)[dst_src.long()]
-                sorted_weights = topk_weights.reshape(-1)[dst_src.long()]
+                sorted_weights = flat_weights[dst_src.long()]
                 expert_counts = expert_sizes.tolist()
             else:
                 order = torch.argsort(flat_eids, stable=True)
                 sorted_tok_ids = torch.arange(
                     T, device=topk_ids.device
                 ).repeat_interleave(self.top_k)[order]
-                sorted_weights = topk_weights.reshape(-1)[order]
+                sorted_weights = flat_weights[order]
                 expert_counts = torch.bincount(
                     flat_eids, minlength=w13.shape[0]).tolist()
 
@@ -2271,26 +2322,35 @@ class Qwen3_5MoeSparseBlock(nn.Module):
             shared_out, _ = self.shared_expert_down(shared_out)
             shared_out = shared_out * torch.sigmoid(gate_score)
 
-        with bi100_timer("moe.combine"):
-            out = routed_out + shared_out
-        # Always all_reduce: in TP mode this sums the TP-sharded partials;
-        # in EP mode it also sums across ranks (each rank only computed its
-        # local experts).  Both are a sum over the same process group.
-        with bi100_timer("moe.all_reduce"):
-            out = tensor_model_parallel_all_reduce(out)
+        # --- Reduction ---
+        # Ported from tpu-inference:
+        #   PR #2679 (df7f5b35): scatter_results / defer_all_reduce
+        #   PR #3435 (57987c2):  shared expert reduce axis under attn DP
+        #
+        # TP mode: routed_out + shared_out are both TP-partial → single all-reduce
+        # EP mode: routed_out is EP-partial, shared_out is TP-partial
+        #          Since TP group == EP group == WORLD → same single all-reduce
+        #          (defer_all_reduce pattern: combine first, reduce once)
+        _ep = getattr(self.experts, '_ep_enabled', False)
+        if _ep:
+            from vllm.ep_fused_moe_patch import ep_reduce_output
+            with bi100_timer("moe.ep_reduce"):
+                out = ep_reduce_output(routed_out, shared_out)
+        else:
+            with bi100_timer("moe.combine"):
+                out = routed_out + shared_out
+            if self.experts.tp_size > 1:
+                with bi100_timer("moe.all_reduce"):
+                    out = tensor_model_parallel_all_reduce(out)
         _fwd_cnt = getattr(self, '_fwd_diag_cnt', 0)
-        if _fwd_cnt < 5:
+        if _fwd_cnt < 3:
             self._fwd_diag_cnt = _fwd_cnt + 1
             logger.info(
-                "[MoE_FWD] call=%d T=%d routed_norm=%.4f shared_norm=%.4f "
-                "combined_pre_ar=%.4f final_norm=%.4f "
-                "has_nan=%s has_inf=%s",
-                _fwd_cnt, hidden_states.shape[0],
+                "[MoE_FWD] ep=%s call=%d T=%d routed=%.4f shared=%.4f final=%.4f",
+                _ep, _fwd_cnt, hidden_states.shape[0],
                 routed_out.float().norm().item(),
                 shared_out.float().norm().item(),
-                (routed_out + shared_out).float().norm().item(),
-                out.float().norm().item(),
-                bool(out.isnan().any()), bool(out.isinf().any()))
+                out.float().norm().item())
         return out
 
 

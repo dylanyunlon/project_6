@@ -43,12 +43,22 @@ def dp_forward_moe_wrapper(
 ) -> torch.Tensor:
     """Wrap a MoeSparseBlock.forward call with DP all-gather / scatter.
 
-    This implements the same pattern as DeepseekV3MoE.forward in xLLM:
+    Ported from tpu-inference (xLLM upstream):
+      - PR #2577 (04077875): DP attention for hybrid models
+      - PR #2679 (df7f5b35): Optimize attn DP + MoE EP ReduceScatter
 
-      1. Read dp_token_counts from metadata
-      2. Pad + all_gather (graph/prefill) or all_gather_variable (eager decode)
-      3. Call the original MoE forward on the gathered global batch
-      4. Slice the output back to this replica's local tokens
+    Pattern:
+      1. All-gather hidden states across DP ranks → each rank sees full batch
+      2. Run MoE forward on the gathered global batch
+      3. Slice output back to this rank's local tokens
+
+    The forward() in qwen3_5.py handles EP reduction internally
+    (all-reduce over WORLD). When DP > 1, a future optimization can
+    replace steps 2+3 with:
+      2'. Run MoE experts + shared expert WITHOUT reduction
+      3'. reduce-scatter the combined output (fuses EP sum + DP scatter)
+    This would halve the communication volume (upstream PR #2679's
+    psum_scatter optimization). For now we use the safe all-reduce + slice.
 
     Args:
         moe_block: The Qwen3_5MoeSparseBlock instance.
@@ -100,7 +110,8 @@ def dp_forward_moe_wrapper(
             hidden_states, token_counts, dp_rank, "dp"
         )
 
-    # Run MoE on the globally-gathered batch
+    # Run MoE on the globally-gathered batch.
+    # forward() handles EP all-reduce internally, output is fully reduced.
     output = original_forward(hidden_states)
 
     # Slice back to local tokens
