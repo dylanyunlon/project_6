@@ -14,6 +14,7 @@ from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
                               set_custom_all_reduce)
+from vllm.block_major_kv_cache import reserve_block_major_gpu_blocks
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
@@ -225,9 +226,38 @@ class Worker(LocalOrDistributedWorkerBase):
             return int(_ovr), int(_cpu)
         torch.cuda.empty_cache()
 
+        # BI100: Qwen3.6 batched dummy profile_run can trip GDN non-finite
+        # checks before the server starts. If the operator explicitly provides
+        # --num-gpu-blocks-override, trust that conservative capacity value and
+        # skip only the synthetic profile pass. Real inference still uses the
+        # normal GDN fail-fast path.
+        if self.cache_config.num_gpu_blocks_override is not None:
+            cache_block_size = self.get_cache_block_size_bytes()
+            if cache_block_size == 0:
+                num_cpu_blocks = 0
+            else:
+                num_cpu_blocks = int(self.cache_config.swap_space_bytes //
+                                     cache_block_size)
+            logger.warning(
+                "[BI100] skipping worker.profile_run because "
+                "num_gpu_blocks_override=%d was explicitly set",
+                self.cache_config.num_gpu_blocks_override)
+            gc.collect()
+            torch.cuda.empty_cache()
+            return self.cache_config.num_gpu_blocks_override, max(num_cpu_blocks, 0)
+
         # Execute a forward pass with dummy inputs to profile the memory usage
-        # of the model.
-        self.model_runner.profile_run()
+        # of the model. Mark this synthetic pass so BI100_PROFILE can skip
+        # timing it by default; profiling real requests is the useful signal.
+        _bi100_prev_startup_profile = os.environ.get("BI100_IN_STARTUP_PROFILE")
+        os.environ["BI100_IN_STARTUP_PROFILE"] = "1"
+        try:
+            self.model_runner.profile_run()
+        finally:
+            if _bi100_prev_startup_profile is None:
+                os.environ.pop("BI100_IN_STARTUP_PROFILE", None)
+            else:
+                os.environ["BI100_IN_STARTUP_PROFILE"] = _bi100_prev_startup_profile
 
         # Calculate the number of blocks that can be allocated with the
         # profiled peak memory.
@@ -252,6 +282,8 @@ class Worker(LocalOrDistributedWorkerBase):
                  peak_memory) // cache_block_size)
             num_cpu_blocks = int(self.cache_config.swap_space_bytes //
                                  cache_block_size)
+        num_gpu_blocks = reserve_block_major_gpu_blocks(
+            num_gpu_blocks, cache_block_size)
         num_gpu_blocks = max(num_gpu_blocks, 0)
         num_cpu_blocks = max(num_cpu_blocks, 0)
         if self.model_runner.lora_manager:
@@ -338,14 +370,16 @@ class Worker(LocalOrDistributedWorkerBase):
     def execute_worker(self, worker_input: WorkerInput) -> None:
         virtual_engine = worker_input.virtual_engine
         # Issue cache operations.
-        if (worker_input.blocks_to_swap_in is not None
-                and worker_input.blocks_to_swap_in.numel() > 0):
-            self.cache_engine[virtual_engine].swap_in(
-                worker_input.blocks_to_swap_in)
+        # BI100 content-addressed CPU KV tier may preserve a victim and reuse
+        # that same GPU slot in one step. Complete every D2H before any H2D.
         if (worker_input.blocks_to_swap_out is not None
                 and worker_input.blocks_to_swap_out.numel() > 0):
             self.cache_engine[virtual_engine].swap_out(
                 worker_input.blocks_to_swap_out)
+        if (worker_input.blocks_to_swap_in is not None
+                and worker_input.blocks_to_swap_in.numel() > 0):
+            self.cache_engine[virtual_engine].swap_in(
+                worker_input.blocks_to_swap_in)
         if (worker_input.blocks_to_copy is not None
                 and worker_input.blocks_to_copy.numel() > 0):
             self.cache_engine[virtual_engine].copy(worker_input.blocks_to_copy)

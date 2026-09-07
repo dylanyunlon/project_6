@@ -175,9 +175,10 @@ cp ./gdn_prefix.py "${VLLM_ROOT}/gdn_prefix.py"
 cp ./ep_fused_moe_patch.py "${VLLM_ROOT}/ep_fused_moe_patch.py"
 
 build_stage "installing CoreX paged-KV swap compatibility"
-python3 ./patch_corex_swap_blocks.py
-python3 ./patch_block_major_cache_engine.py
-python3 ./patch_worker_cache_transfer_order.py
+cp ./_custom_ops.py "${VLLM_ROOT}/_custom_ops.py"
+cp ./cache_engine.py "${VLLM_ROOT}/worker/cache_engine.py"
+# worker swap order + block_major capacity + startup profile guard
+# are pre-merged into vendor_overrides/vllm/worker/worker.py
 
 # --- paged_attn.py: replace forward_prefix with pure-PyTorch fallback -------
 # The Triton context_attention_fwd kernel hangs BI-V100 GPUs permanently
@@ -194,12 +195,12 @@ cp ./paged_attn.py "${VLLM_ROOT}/attention/ops/paged_attn.py"
 # _forward_prefix_pytorch then gets an undersized block_tables and crashes with
 # "amax(): Expected reduction dim -1 to have non-zero size" on the 2nd tile.
 # Fix: set prefix_cache_hit=False for Case 1 so the full block_tables is used.
-python3 ./patch_model_runner.py
+cp ./model_runner.py "${VLLM_ROOT}/worker/model_runner.py"
 
 build_stage "installing executor startup diagnostics"
-python3 ./patch_executor_startup_debug.py
-python3 ./patch_worker_startup_profile_guard.py
-python3 ./patch_block_major_worker_capacity.py
+# executor startup debug + worker startup profile guard + block_major capacity
+# are pre-merged into vendor_overrides and whole-file copies
+cp ./multiproc_worker_utils.py "${VLLM_ROOT}/executor/multiproc_worker_utils.py"
 
 build_stage "installing transformers Qwen3.5 model support"
 cp -r ./qwen3_5 "${TRANSFORMERS_ROOT}/models/"
@@ -210,7 +211,7 @@ build_stage "installing vLLM Qwen3.6 model implementation"
 # --- vllm model: Qwen3.6-35B-A3B (Qwen3_5 MoE arch) -------------------------
 cp ./mamba_cache.py "${VLLM_ROOT}/model_executor/models/"
 cp ./qwen3_5.py "${VLLM_ROOT}/model_executor/models/qwen3_5.py"
-python3 ./patch_vllm_qwen3_5.py
+cp ./registry.py "${VLLM_ROOT}/model_executor/models/registry.py"
 
 # --- sequence.py: fix completion_tokens inflation under chunked prefill ------
 # Bug: get_output_token_ids_to_return(delta=True) with num_new_tokens=0
@@ -227,7 +228,8 @@ cp ./sequence.py "${VLLM_ROOT}/sequence.py"
 cp ./scheduler.py "${VLLM_ROOT}/core/scheduler.py"
 
 build_stage "installing diagnostic initial allocation trace"
-python3 ./patch_block_manager_cache_trace.py
+# block_manager_cache_trace is pre-merged into vendor_overrides/vllm/core/block_manager_v2.py
+cp ./outputs.py "${VLLM_ROOT}/outputs.py"
 
 build_stage "installing scheduler and attention patches"
 # --- xformers: bypass cudnnFlashAttnForward (head_dim=256 > 128 limit) ------
@@ -237,8 +239,11 @@ build_stage "installing scheduler and attention patches"
 # The fallback uses query_start_loc to derive actual query lengths, so it
 # works correctly during profiling runs with chunked-prefill-style batches.
 # also bypasses auto chunked prefill on
-python3 ./patch_xformers_sdpa_seq.py
-python3 ./patch_xformers_profile.py
+cp ./xformers.py "${VLLM_ROOT}/attention/backends/xformers.py"
+cp ./logits_processor.py "${VLLM_ROOT}/model_executor/layers/logits_processor.py"
+cp ./outlines_decoding.py "${VLLM_ROOT}/model_executor/guided_decoding/outlines_decoding.py"
+# arg_utils.py xformers patches are pre-merged into vendor_overrides/vllm/engine/arg_utils.py
+# bi100_timer profile instrumentation is pre-merged into xformers.py
 
 build_stage "installing API parsers and serving modules"
 # --- tool parser: Qwen3 XML tool call format ---------------------------------
@@ -246,7 +251,7 @@ build_stage "installing API parsers and serving modules"
 #   <tool_call><function=name><parameter=key>\nvalue\n</parameter></function></tool_call>
 # Use at server start: --tool-call-parser qwen3_coder --enable-auto-tool-choice
 cp ./qwen3coder_tool_parser.py "${VLLM_ROOT}/entrypoints/openai/tool_parsers/"
-python3 ./patch_vllm_tool_parser.py
+cp ./tool_parsers__init__.py "${VLLM_ROOT}/entrypoints/openai/tool_parsers/__init__.py"
 
 # --- reasoning parser: Qwen3 <think>...</think> split ------------------------
 # Adds --reasoning-parser qwen3 support.

@@ -917,11 +917,9 @@ class EngineArgs:
         model_config = self.create_model_config()
 
         if model_config.is_multimodal_model:
-            if self.enable_prefix_caching:
-                logger.warning(
-                    "--enable-prefix-caching is currently not "
-                    "supported for multimodal models and has been disabled.")
-            self.enable_prefix_caching = False
+            # Keeping prefix caching enabled for the Qwen3.6 BI100 deploy.
+            # The scheduler's GDN digest already handles non-text tokens.
+            pass
             
         maybe_register_config_serialize_by_value(self.trust_remote_code)
         
@@ -973,13 +971,8 @@ class EngineArgs:
                 if (is_gpu and not use_sliding_window and not use_spec_decode
                         and not self.enable_lora
                         and not self.enable_prompt_adapter):
-                    self.enable_chunked_prefill = True
-                    logger.warning(
-                        "Chunked prefill is enabled by default for models with "
-                        "max_model_len > 32K. Currently, chunked prefill might "
-                        "not work with some features or models. If you "
-                        "encounter any issues, please disable chunked prefill "
-                        "by setting --enable-chunked-prefill=False.")
+                    pass  # skip auto-enable: Q-tiling in _run_sdpa_fallback
+                          # handles long-context memory without chunked prefill
             if self.enable_chunked_prefill is None:
                 self.enable_chunked_prefill = False
 

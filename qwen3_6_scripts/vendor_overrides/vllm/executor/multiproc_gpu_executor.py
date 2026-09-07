@@ -22,6 +22,11 @@ from vllm.utils import (_run_task_with_lock, cuda_device_count_stateless,
 logger = init_logger(__name__)
 
 
+def _bi100_startup_debug(message: str, *args) -> None:
+    if os.getenv("BI100_EXECUTOR_STARTUP_DEBUG") == "1":
+        logger.info("[BI100 startup] " + message, *args)
+
+
 class MultiprocessingGPUExecutor(DistributedGPUExecutor):
     """Python multiprocessing-based multi-GPU executor"""
 
@@ -122,12 +127,18 @@ class MultiprocessingGPUExecutor(DistributedGPUExecutor):
         # Set up signal handlers to shutdown the executor cleanly
         # sometimes gc does not work well
 
+        _bi100_startup_debug("creating driver worker")
         self.driver_worker = self._create_worker(
             distributed_init_method=distributed_init_method)
+        _bi100_startup_debug("created driver worker")
+        _bi100_startup_debug("starting init_device")
         self._run_workers("init_device")
+        _bi100_startup_debug("finished init_device")
+        _bi100_startup_debug("starting load_model")
         self._run_workers("load_model",
                           max_concurrent_workers=self.parallel_config.
                           max_parallel_loading_workers)
+        _bi100_startup_debug("finished load_model")
 
     def _check_executor_parameters(self):
         world_size = self.parallel_config.world_size
@@ -199,18 +210,25 @@ class MultiprocessingGPUExecutor(DistributedGPUExecutor):
                 for worker in self.non_driver_workers
             ]
 
+        _bi100_startup_debug("enqueue remote method=%s workers=%d", method,
+                              len(self.workers))
         # Start all remote workers first.
         worker_outputs = [
             worker.execute_method(method, *args, **kwargs)
             for worker in self.workers
         ]
+        _bi100_startup_debug("remote enqueued method=%s", method)
 
         driver_worker_method = getattr(self.driver_worker, method)
+        _bi100_startup_debug("driver start method=%s", method)
         driver_worker_output = driver_worker_method(*args, **kwargs)
+        _bi100_startup_debug("driver done method=%s", method)
 
         # Get the results of the workers.
-        return [driver_worker_output
-                ] + [output.get() for output in worker_outputs]
+        _bi100_startup_debug("waiting remote results method=%s", method)
+        remote_outputs = [output.get() for output in worker_outputs]
+        _bi100_startup_debug("remote done method=%s", method)
+        return [driver_worker_output] + remote_outputs
 
     def check_health(self) -> None:
         """Raises an error if engine is unhealthy."""
