@@ -66,6 +66,12 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+def print_warning_once(msg: str) -> None:
+    # Set the stacklevel to 2 to print the caller's line info
+    logger.warning(msg, stacklevel=2)
+
+
 # Exception strings for non-implemented encoder/decoder scenarios
 
 # Reminder: Please update docs/source/features/compatibility_matrix.md

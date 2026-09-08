@@ -109,6 +109,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
 
         # Evitor used to maintain how we want to handle those computed blocks
         # if we find memory pressure is high.
+        self.eviction_policy = eviction_policy
         self.evictor: Evictor = make_evictor(eviction_policy)
 
         # We share the refcounter between allocators. This allows us to promote
@@ -163,6 +164,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         allocator: BlockAllocator,
         block_id: Optional[int] = None,
         computed: bool = False,
+        extra_hash: Optional[int] = None,
     ) -> Block:
         # Bind block to self.
         allocator = self
@@ -176,6 +178,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
             allocator=allocator,
             computed=computed,
             cache_namespace=cache_namespace,
+            extra_hash=extra_hash,
         )
 
     def _init_block(
@@ -333,6 +336,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
     def allocate_immutable_block(self,
                                  prev_block: Optional[Block],
                                  token_ids: List[int],
+                                 extra_hash: Optional[int] = None,
                                  device: Optional[Device] = None) -> Block:
         """Allocates an immutable block with the given token IDs, reusing cached
         blocks if possible.
@@ -340,6 +344,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         Args:
             prev_block (Optional[Block]): The previous block in the sequence.
             token_ids (List[int]): The token IDs to be stored in the block.
+            extra_hash (Optional[int]): Ignored; kept for interface compat.
 
         Returns:
             Block: The allocated immutable block.
@@ -354,6 +359,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
             self,
             prev_block: Optional[Block],
             block_token_ids: List[List[int]],
+            extra_hash: Optional[int] = None,
             device: Optional[Device] = None) -> List[Block]:
         blocks = []
         for token_ids in block_token_ids:
@@ -365,6 +371,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
 
     def allocate_mutable_block(self,
                                prev_block: Optional[Block],
+                               extra_hash: Optional[int] = None,
                                device: Optional[Device] = None) -> Block:
         """Allocates a mutable block. If there are no free blocks, this will
         evict unused cached blocks.
@@ -595,6 +602,40 @@ class PrefixCachingBlockAllocator(BlockAllocator):
 
     def get_prefix_cache_hit_rate(self) -> float:
         return self.metric_data.get_hit_rate()
+
+    def reset_prefix_cache(self) -> bool:
+        """Reset prefix cache. Used in RLHF flows or benchmarking."""
+        num_used_blocks = (self.get_num_total_blocks() -
+                           self.get_num_free_blocks())
+        if num_used_blocks > 0:
+            return False
+
+        while (block_id :=
+               self._maybe_allocate_evicted_block_id()) is not None:
+            self._hashless_allocator._free_block_id(block_id)
+
+        assert not self._cached_blocks
+        self.evictor = make_evictor(self.eviction_policy)
+
+        for block_id in self._block_tracker:
+            self._block_tracker[block_id] = BlockTracker()
+
+        self.metric_data = CacheMetricData()
+        return True
+
+    def find_cached_blocks_prefix(self, block_hashes: List[int]) -> List[int]:
+        """Return the prefix of block_hashes that are all cached.
+        Uses binary search since block hashes form a chain."""
+        from bisect import bisect_left
+
+        def _block_is_cached(bh):
+            if bh not in self._cached_blocks:
+                return False
+            return self.block_is_computed(self._cached_blocks[bh])
+
+        idx = bisect_left(
+            [not _block_is_cached(h) for h in block_hashes], True)
+        return block_hashes[:idx]
 
     def is_block_cached(self, block: Block) -> bool:
         assert block.content_hash is not None
@@ -852,6 +893,7 @@ class PrefixCachingBlock(Block):
         block_id: Optional[int] = None,
         computed: bool = False,
         cache_namespace: Optional[bytes] = None,
+        extra_hash: Optional[int] = None,
     ):
         assert isinstance(allocator, PrefixCachingBlockAllocator), (
             "Currently this class is only tested with "
@@ -976,6 +1018,10 @@ class PrefixCachingBlock(Block):
     @property
     def prev_block(self) -> Optional[Block]:
         return self._prev_block
+
+    @property
+    def extra_hash(self) -> Optional[int]:
+        return None
 
     @property
     def cache_namespace(self) -> bytes:
