@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 import hashlib
@@ -1037,8 +1039,8 @@ def _is_supported_corex_fused_paged_prefill_request(
     total_query_len: int,
     alibi_slopes: Optional[torch.Tensor],
     sliding_window: Optional[int],
-    k_scale: float,
-    v_scale: float,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
     is_causal_decoder: bool,
 ) -> bool:
     """Check request-wide properties that are outside the native ABI."""
@@ -1049,8 +1051,8 @@ def _is_supported_corex_fused_paged_prefill_request(
         and max_query_len == total_query_len
         and alibi_slopes is None
         and sliding_window is None
-        and k_scale == 1.0
-        and v_scale == 1.0
+        and float(k_scale.item() if isinstance(k_scale, torch.Tensor) else k_scale) == 1.0
+        and float(v_scale.item() if isinstance(v_scale, torch.Tensor) else v_scale) == 1.0
     )
 
 
@@ -1060,8 +1062,8 @@ def _can_enable_corex_fused_paged_prefill_request(
     total_query_len: int,
     alibi_slopes: Optional[torch.Tensor],
     sliding_window: Optional[int],
-    k_scale: float,
-    v_scale: float,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
     is_causal_decoder: bool,
 ) -> bool:
     return bool(
@@ -1267,7 +1269,7 @@ class PagedAttention:
 
     @staticmethod
     def get_supported_head_sizes() -> List[int]:
-        return [64, 80, 96, 112, 120, 128, 192, 256]
+        return [32, 64, 80, 96, 112, 120, 128, 192, 256]
 
     @staticmethod
     def get_kv_cache_shape(
@@ -1302,8 +1304,8 @@ class PagedAttention:
         value_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
         kv_cache_dtype: str,
-        k_scale: float,
-        v_scale: float,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
     ) -> None:
         global _CACHE_WRITE_LOGGED
         flat_slots = slot_mapping.flatten()
@@ -1504,17 +1506,22 @@ class PagedAttention:
         seq_lens: torch.Tensor,
         max_seq_len: int,
         kv_cache_dtype: str,
-        head_mapping: torch.Tensor,
+        num_kv_heads: int,
         scale: float,
         alibi_slopes: Optional[torch.Tensor],
-        k_scale: float,
-        v_scale: float,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
         tp_rank: int = 0,
         blocksparse_local_blocks: int = 0,
         blocksparse_vert_stride: int = 0,
         blocksparse_block_size: int = 64,
         blocksparse_head_sliding_step: int = 0,
     ) -> torch.Tensor:
+        # Build head_mapping from num_kv_heads for BI-V100 native kernels
+        num_queries_per_kv = query.shape[1] // num_kv_heads
+        head_mapping = torch.repeat_interleave(
+            torch.arange(num_kv_heads, dtype=torch.int32, device=query.device),
+            num_queries_per_kv)
         actual_max = int(seq_lens.max().item()) if seq_lens.numel() > 0 else max_seq_len
         # Guard against uninitialized seq_lens entries (0x7FFF7FFF pattern)
         # from chunked prefill + GDN capture boundary metadata race.
@@ -1532,10 +1539,6 @@ class PagedAttention:
             raise RuntimeError(
                 "key/value cache KV-head counts differ: "
                 f"{key_cache.shape[1]} != {value_cache.shape[1]}")
-        if head_mapping.numel() != num_heads:
-            raise RuntimeError(
-                f"head_mapping has {head_mapping.numel()} entries for "
-                f"{num_heads} query heads")
         required_blocks = _validate_decode_layout(
             num_seqs=num_seqs,
             seq_lens_count=seq_lens.numel(),
@@ -1713,17 +1716,24 @@ class PagedAttention:
         block_tables: torch.Tensor,
         query_start_loc: torch.Tensor,
         seq_lens_tensor: torch.Tensor,
-        context_lens: torch.Tensor,
         max_query_len: int,
         alibi_slopes: Optional[torch.Tensor],
         sliding_window: Optional[int],
-        k_scale: float,
-        v_scale: float,
-        is_causal_decoder: bool = False,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
     ) -> torch.Tensor:
         # NOTE: The Triton context_attention_fwd kernel hangs on Iluvatar
         # BI-V100 hardware (same class of issue as cudnnFlashAttnForward).
         # Use a pure-PyTorch fallback that reads the paged KV cache directly.
+
+        # Derive context_lens from seq_lens and query_start_loc.
+        # context_len[i] = seq_len[i] - query_len[i]
+        # query_len[i] = query_start_loc[i+1] - query_start_loc[i]
+        batch_size = seq_lens_tensor.shape[0]
+        query_lens = query_start_loc[1:batch_size + 1] - query_start_loc[:batch_size]
+        context_lens = seq_lens_tensor - query_lens
+
+        is_causal_decoder = True  # BI-V100 always decoder-only
         supported_request = bool(
             (_USE_COREX_FUSED_PAGED_PREFILL
              or _ACTIVATION_CAPTURE_ENABLED)
