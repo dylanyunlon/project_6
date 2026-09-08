@@ -9,7 +9,10 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType
 
-import ixformer.inference.functions as ops
+try:
+    import ixformer.inference.functions as ops
+except ModuleNotFoundError:
+    import ixformer.functions as ops
 from ixformer.distributed import _distributed as cdist
 
 
