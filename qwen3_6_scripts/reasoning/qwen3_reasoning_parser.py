@@ -1,77 +1,61 @@
-"""
-Reasoning parser for Qwen3 / Qwen3.5 / Qwen3.6 model family.
-Adapted from vllm-original/vllm/reasoning/qwen3_reasoning_parser.py.
+# SPDX-License-Identifier: Apache-2.0
 
-The model uses <think>...</think> to wrap chain-of-thought output.
-For Qwen3.5+ the chat template injects <think> into the prompt, so only
-</think> appears in the generated tokens; older templates generate <think>
-themselves.  Both styles are handled.
-"""
+from collections.abc import Sequence
+from typing import Optional, Union
 
-from typing import Optional, Sequence, Any
+from transformers import PreTrainedTokenizerBase
 
-from vllm.reasoning.abs_reasoning_parsers import (
-    BaseThinkingReasoningParser,
-    ReasoningParserManager,
-)
+from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
+                                              DeltaMessage)
+from vllm.logger import init_logger
+from vllm.reasoning import ReasoningParser, ReasoningParserManager
+
+logger = init_logger(__name__)
 
 
-class Qwen3ReasoningParser(BaseThinkingReasoningParser):
+@ReasoningParserManager.register_module("qwen3")
+class Qwen3ReasoningParser(ReasoningParser):
+    """
+    Reasoning parser for the Qwen3 model.
 
-    def __init__(self, tokenizer: Any, *args, **kwargs):
-        super().__init__(tokenizer, *args, **kwargs)
-        chat_kwargs = kwargs.get("chat_template_kwargs", {}) or {}
-        self.thinking_enabled = chat_kwargs.get("enable_thinking", True)
+    The Qwen3 model uses <think>...</think> tokens to denote reasoning text
+    within its output. The model provides a strict switch to disable reasoning
+    output via the 'enable_thinking=False' parameter. This parser extracts the
+    reasoning content enclosed by <think> and </think> tokens from the model's
+    output.
+    """
 
-    @property
-    def start_token(self) -> str:
-        return "<think>"
+    def __init__(self, tokenizer: PreTrainedTokenizerBase):
+        super().__init__(tokenizer)
+        self.think_start_token = "<think>"
+        self.think_end_token = "</think>"
 
-    @property
-    def end_token(self) -> str:
-        return "</think>"
+        if not self.model_tokenizer:
+            raise ValueError(
+                "The model tokenizer must be passed to the ReasoningParser "
+                "constructor during construction.")
 
-    def extract_reasoning(
-        self, model_output: str, request: Any
-    ) -> "tuple[Optional[str], Optional[str]]":
-        # Strip <think> if the model generated it (old template / edge case).
-        parts = model_output.partition(self.start_token)
-        model_output = parts[2] if parts[1] else parts[0]
+        self.think_start_token_id = self.vocab.get(self.think_start_token)
+        self.think_end_token_id = self.vocab.get(self.think_end_token)
+        if (self.think_start_token_id is None
+                or self.think_end_token_id is None):
+            raise RuntimeError(
+                "Qwen3 reasoning parser could not locate think start/end "
+                "tokens in the tokenizer!")
 
-        if not self.thinking_enabled:
-            if self.end_token in model_output:
-                _, _, content = model_output.partition(self.end_token)
-                return None, content or ""
-            return None, model_output
+    def is_reasoning_end(self, input_ids: list[int]) -> bool:
+        return self.think_end_token_id in input_ids
 
-        if self.end_token not in model_output:
-            # Thinking enabled but output truncated before </think>.
-            return model_output or None, None
-
-        reasoning, _, content = model_output.partition(self.end_token)
-        # Normalize empty strings to None.  When the model skips thinking
-        # (outputs </think> immediately), reasoning is "" — returning None
-        # keeps reasoning_content out of the JSON response so the test
-        # framework sees "no reasoning" rather than "empty reasoning".
-        return reasoning or None, content or None
-
-    def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
-        token_ids = list(token_ids)
-        if self.start_token_id in token_ids:
-            # Old-style template: model generates <think> itself.
-            # Use depth-counting from the base class.
-            return super().count_reasoning_tokens(token_ids)
-        elif self.end_token_id in token_ids:
-            # New-style template (Qwen3.5+): <think> is injected into the
-            # prompt, so output starts already inside the thinking block.
-            # Every token before </think> is a reasoning token.
-            return token_ids.index(self.end_token_id)
+    def extract_content_ids(self, input_ids: list[int]) -> list[int]:
+        """
+        Extract the content after the end tokens
+        """
+        if self.think_end_token_id not in input_ids[:-1]:
+            return []
         else:
-            # No </think> in output: either truncated (all reasoning)
-            # or thinking disabled (none).
-            return len(token_ids) if self.thinking_enabled else 0
+            return input_ids[input_ids.index(self.think_end_token_id) + 1:]
 
-    def extract_reasoning_streaming(
+    def extract_reasoning_content_streaming(
         self,
         previous_text: str,
         current_text: str,
@@ -79,38 +63,88 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         previous_token_ids: Sequence[int],
         current_token_ids: Sequence[int],
         delta_token_ids: Sequence[int],
-    ):
-        from vllm.entrypoints.openai.protocol import DeltaMessage
-
-        if not self.thinking_enabled:
-            return DeltaMessage(content=delta_text) if delta_text else None
-
-        # Strip <think> from delta if the model generates it itself.
-        if self.start_token_id in delta_token_ids:
-            start_idx = delta_text.find(self.start_token)
-            if start_idx >= 0:
-                delta_text = delta_text[start_idx + len(self.start_token):]
-
-        if self.end_token_id in delta_token_ids:
-            end_idx = delta_text.find(self.end_token)
-            if end_idx >= 0:
-                reasoning = delta_text[:end_idx]
-                content = delta_text[end_idx + len(self.end_token):]
-                if not reasoning and not content:
-                    return None
-                return DeltaMessage(
-                    reasoning_content=reasoning or None,
-                    content=content or None,
-                )
+    ) -> Union[DeltaMessage, None]:
+        """
+        Extract reasoning content from a delta message.
+        Handles streaming output where previous + delta = current.
+        Uses token IDs for faster processing.
+        For text <think>abc</think>xyz:
+        - 'abc' goes to reasoning_content
+        - 'xyz' goes to content
+        """
+        # Skip single special tokens
+        if len(delta_token_ids) == 1 and (delta_token_ids[0] in [
+                self.think_start_token_id, self.think_end_token_id
+        ]):
             return None
 
-        if not delta_text:
-            return None
-        elif self.end_token_id in previous_token_ids:
-            return DeltaMessage(content=delta_text)
+        if self.think_start_token_id in previous_token_ids:
+            if self.think_end_token_id in delta_token_ids:
+                # <think> in previous, </think> in delta,
+                # extract reasoning content
+                end_index = delta_text.find(self.think_end_token)
+                reasoning_content = delta_text[:end_index]
+                content = delta_text[end_index + len(self.think_end_token):]
+                return DeltaMessage(reasoning_content=reasoning_content,
+                                    content=content if content else None)
+            elif self.think_end_token_id in previous_token_ids:
+                # <think> in previous, </think> in previous,
+                # reasoning content continues
+                return DeltaMessage(content=delta_text)
+            else:
+                # <think> in previous, no </think> in previous or delta,
+                # reasoning content continues
+                return DeltaMessage(reasoning_content=delta_text)
+        elif self.think_start_token_id in delta_token_ids:
+            if self.think_end_token_id in delta_token_ids:
+                # <think> in delta, </think> in delta, extract reasoning content
+                start_index = delta_text.find(self.think_start_token)
+                end_index = delta_text.find(self.think_end_token)
+                reasoning_content = delta_text[start_index +
+                                               len(self.think_start_token
+                                                   ):end_index]
+                content = delta_text[end_index + len(self.think_end_token):]
+                return DeltaMessage(reasoning_content=reasoning_content,
+                                    content=content if content else None)
+            else:
+                # <think> in delta, no </think> in delta,
+                # reasoning content continues
+                return DeltaMessage(reasoning_content=delta_text)
         else:
-            return DeltaMessage(reasoning_content=delta_text)
+            # thinking is disabled, just content
+            return DeltaMessage(content=delta_text)
 
+    def extract_reasoning_content(
+            self, model_output: str, request: ChatCompletionRequest
+    ) -> tuple[Optional[str], Optional[str]]:
+        """
+        Extract reasoning content from the model output.
 
-# Register immediately when this module is imported.
-ReasoningParserManager.register_module("qwen3", Qwen3ReasoningParser)
+        For text <think>abc</think>xyz:
+        - 'abc' goes to reasoning_content
+        - 'xyz' goes to content
+
+        Returns:
+            tuple[Optional[str], Optional[str]]: reasoning content and content
+        """
+
+        # Check if the model output contains the <think> and </think> tokens.
+        if (self.think_start_token not in model_output
+                or self.think_end_token not in model_output):
+            return None, model_output
+        # Check if the <think> is present in the model output, remove it
+        # if it is present.
+        model_output_parts = model_output.partition(self.think_start_token)
+        model_output = model_output_parts[2] if model_output_parts[
+            1] else model_output_parts[0]
+        # Check if the model output contains the </think> tokens.
+        # If the end token is not found, return the model output as is.
+        if self.think_end_token not in model_output:
+            return None, model_output
+
+        # Extract reasoning content from the model output.
+        reasoning_content, _, content = model_output.partition(
+            self.think_end_token)
+
+        final_content = content or None
+        return reasoning_content, final_content

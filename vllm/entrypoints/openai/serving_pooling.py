@@ -6,6 +6,7 @@ import time
 from collections.abc import AsyncGenerator
 from typing import Final, Literal, Optional, Union, cast
 
+import jinja2
 import numpy as np
 from fastapi import Request
 from typing_extensions import assert_never
@@ -14,37 +15,35 @@ from vllm.config import ModelConfig
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import ChatTemplateContentFormatOption
 from vllm.entrypoints.logger import RequestLogger
-from vllm.entrypoints.openai.protocol import (EmbeddingChatRequest,
-                                              EmbeddingRequest,
-                                              EmbeddingResponse,
-                                              EmbeddingResponseData,
-                                              ErrorResponse, UsageInfo)
+from vllm.entrypoints.openai.protocol import (ErrorResponse,
+                                              PoolingChatRequest,
+                                              PoolingRequest, PoolingResponse,
+                                              PoolingResponseData, UsageInfo)
 from vllm.entrypoints.openai.serving_engine import OpenAIServing
 from vllm.entrypoints.openai.serving_models import OpenAIServingModels
 from vllm.logger import init_logger
-from vllm.outputs import (EmbeddingOutput, EmbeddingRequestOutput,
-                          PoolingRequestOutput)
+from vllm.outputs import PoolingOutput, PoolingRequestOutput
 from vllm.utils import merge_async_iterators
 
 logger = init_logger(__name__)
 
 
-def _get_embedding(
-    output: EmbeddingOutput,
+def _get_data(
+    output: PoolingOutput,
     encoding_format: Literal["float", "base64"],
 ) -> Union[list[float], str]:
     if encoding_format == "float":
-        return output.embedding
+        return output.data.tolist()
     elif encoding_format == "base64":
         # Force to use float32 for base64 encoding
         # to match the OpenAI python client behavior
-        embedding_bytes = np.array(output.embedding, dtype="float32").tobytes()
-        return base64.b64encode(embedding_bytes).decode("utf-8")
+        pooling_bytes = np.array(output.data, dtype="float32").tobytes()
+        return base64.b64encode(pooling_bytes).decode("utf-8")
 
     assert_never(encoding_format)
 
 
-class OpenAIServingEmbedding(OpenAIServing):
+class OpenAIServingPooling(OpenAIServing):
 
     def __init__(
         self,
@@ -64,14 +63,12 @@ class OpenAIServingEmbedding(OpenAIServing):
         self.chat_template = chat_template
         self.chat_template_content_format: Final = chat_template_content_format
 
-    async def create_embedding(
+    async def create_pooling(
         self,
-        request: EmbeddingRequest,
+        request: PoolingRequest,
         raw_request: Optional[Request] = None,
-    ) -> Union[EmbeddingResponse, ErrorResponse]:
+    ) -> Union[PoolingResponse, ErrorResponse]:
         """
-        Embedding API similar to OpenAI's API.
-
         See https://platform.openai.com/docs/api-reference/embeddings/create
         for the API specification. This API mimics the OpenAI Embedding API.
         """
@@ -85,7 +82,7 @@ class OpenAIServingEmbedding(OpenAIServing):
                 "dimensions is currently not supported")
 
         model_name = self._get_model_name(request.model)
-        request_id = f"embd-{self._base_request_id(raw_request)}"
+        request_id = f"pool-{self._base_request_id(raw_request)}"
         created_time = int(time.time())
 
         truncate_prompt_tokens = None
@@ -109,9 +106,9 @@ class OpenAIServingEmbedding(OpenAIServing):
 
             if prompt_adapter_request is not None:
                 raise NotImplementedError("Prompt adapter is not supported "
-                                          "for embedding models")
+                                          "for pooling models")
 
-            if isinstance(request, EmbeddingChatRequest):
+            if isinstance(request, PoolingChatRequest):
                 (
                     _,
                     request_prompts,
@@ -123,7 +120,7 @@ class OpenAIServingEmbedding(OpenAIServing):
                     chat_template=request.chat_template or self.chat_template,
                     chat_template_content_format=self.
                     chat_template_content_format,
-                    # In embedding requests, we are not generating tokens,
+                    # In pooling requests, we are not generating tokens,
                     # so there is no need to append extra tokens to the input
                     add_generation_prompt=False,
                     continue_final_message=False,
@@ -139,7 +136,7 @@ class OpenAIServingEmbedding(OpenAIServing):
                      truncate_prompt_tokens=truncate_prompt_tokens,
                      add_special_tokens=request.add_special_tokens,
                  )
-        except (ValueError, TypeError) as e:
+        except (ValueError, TypeError, jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(str(e))
 
@@ -190,7 +187,7 @@ class OpenAIServingEmbedding(OpenAIServing):
             final_res_batch_checked = cast(list[PoolingRequestOutput],
                                            final_res_batch)
 
-            response = self.request_output_to_embedding_response(
+            response = self.request_output_to_pooling_response(
                 final_res_batch_checked,
                 request_id,
                 created_time,
@@ -205,24 +202,21 @@ class OpenAIServingEmbedding(OpenAIServing):
 
         return response
 
-    def request_output_to_embedding_response(
+    def request_output_to_pooling_response(
         self,
         final_res_batch: list[PoolingRequestOutput],
         request_id: str,
         created_time: int,
         model_name: str,
         encoding_format: Literal["float", "base64"],
-    ) -> EmbeddingResponse:
-        items: list[EmbeddingResponseData] = []
+    ) -> PoolingResponse:
+        items: list[PoolingResponseData] = []
         num_prompt_tokens = 0
 
         for idx, final_res in enumerate(final_res_batch):
-            embedding_res = EmbeddingRequestOutput.from_base(final_res)
-
-            item = EmbeddingResponseData(
+            item = PoolingResponseData(
                 index=idx,
-                embedding=_get_embedding(embedding_res.outputs,
-                                         encoding_format),
+                data=_get_data(final_res.outputs, encoding_format),
             )
             prompt_token_ids = final_res.prompt_token_ids
 
@@ -234,7 +228,7 @@ class OpenAIServingEmbedding(OpenAIServing):
             total_tokens=num_prompt_tokens,
         )
 
-        return EmbeddingResponse(
+        return PoolingResponse(
             id=request_id,
             created=created_time,
             model=model_name,

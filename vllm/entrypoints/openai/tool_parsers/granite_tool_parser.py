@@ -1,14 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
-import re
 from collections.abc import Sequence
-from json import JSONDecoder
 from typing import Union
 
 import partial_json_parser
 from partial_json_parser.core.options import Allow
-from transformers import PreTrainedTokenizerBase
 
 from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
                                               DeltaFunctionCall, DeltaMessage,
@@ -17,89 +14,72 @@ from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
                                               FunctionCall, ToolCall)
 from vllm.entrypoints.openai.tool_parsers.abstract_tool_parser import (
     ToolParser, ToolParserManager)
-from vllm.entrypoints.openai.tool_parsers.utils import (find_common_prefix,
+from vllm.entrypoints.openai.tool_parsers.utils import (consume_space,
+                                                        find_common_prefix,
                                                         is_complete_json,
                                                         partial_json_loads)
 from vllm.logger import init_logger
+from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.utils import random_uuid
 
 logger = init_logger(__name__)
 
 
-@ToolParserManager.register_module("llama3_json")
-class Llama3JsonToolParser(ToolParser):
+@ToolParserManager.register_module("granite")
+class GraniteToolParser(ToolParser):
     """
-    Tool call parser for Llama 3.1 models intended for use with the
-    examples/tool_chat_template_llama.jinja template.
+    Tool call parser for the granite 3.0 models. Intended
+    for use with the examples/tool_chat_template_granite.jinja
+    template.
 
-    Used when --enable-auto-tool-choice --tool-call-parser llama3_json 
+    Used when --enable-auto-tool-choice --tool-call-parser granite
     are all set
     """
 
-    def __init__(self, tokenizer: PreTrainedTokenizerBase):
+    def __init__(self, tokenizer: AnyTokenizer):
         super().__init__(tokenizer)
-
-        # initialize properties used for state when parsing tool calls in
-        # streaming mode
-        self.prev_tool_call_arr: list[dict] = []
-        self.current_tool_id: int = -1
-        self.current_tool_name_sent: bool = False
-        self.streamed_args_for_tool: list[str] = [
-        ]  # map what has been streamed for each tool so far to a list
-        self.bot_token = "<|python_tag|>"
-        self.bot_token_id = tokenizer.encode(self.bot_token,
-                                             add_special_tokens=False)[0]
-        self.tool_call_regex = re.compile(r"\[{.*?}\]", re.DOTALL)
+        # for granite 3.0, the token `<|tool_call|>`
+        self.bot_token = "<|tool_call|>"
+        # for granite 3.1, the string `<tool_call>`
+        self.bot_string = "<tool_call>"
 
     def extract_tool_calls(
             self, model_output: str,
             request: ChatCompletionRequest) -> ExtractedToolCallInformation:
-        """
-        Extract the tool calls from a complete model response.
-        """
-        # case -- if a tool call token is not present, return a text response
-        if not (model_output.startswith(self.bot_token)
-                or model_output.startswith('{')):
+        stripped = model_output.strip()\
+                    .removeprefix(self.bot_token)\
+                    .removeprefix(self.bot_string)\
+                    .lstrip()
+        if not stripped or stripped[0] != '[':
             return ExtractedToolCallInformation(tools_called=False,
                                                 tool_calls=[],
                                                 content=model_output)
-
         try:
-            # load the JSON, and then use it to build the Function and
-            # Tool Call
-            dec = JSONDecoder()
-            function_call_arr = []
+            raw_function_calls = json.loads(stripped)
+            if not isinstance(raw_function_calls, list):
+                raise Exception(
+                    f"Expected dict or list, got {type(raw_function_calls)}")
 
-            # depending on the prompt format the Llama model may or may not
-            # prefix the output with the <|python_tag|> token
-            start_idx = len(self.bot_token) if model_output.startswith(
-                self.bot_token) else 0
-            while start_idx < len(model_output):
-                (obj, end_idx) = dec.raw_decode(model_output[start_idx:])
-                start_idx += end_idx + len('; ')
-                function_call_arr.append(obj)
-
-            tool_calls: list[ToolCall] = [
+            logger.debug("Extracted %d tool calls", len(raw_function_calls))
+            tool_calls = [
                 ToolCall(
                     type="function",
                     function=FunctionCall(
-                        name=raw_function_call["name"],
+                        name=function_call["name"],
                         # function call args are JSON but as a string
-                        arguments=json.dumps(raw_function_call["arguments"] \
-                                if "arguments" in raw_function_call \
-                                else raw_function_call["parameters"])))
-                for raw_function_call in function_call_arr
+                        arguments=json.dumps(function_call["arguments"]),
+                    ),
+                ) for function_call in raw_function_calls
             ]
 
-            # get any content before  the tool call
-            ret = ExtractedToolCallInformation(tools_called=True,
-                                               tool_calls=tool_calls,
-                                               content=None)
-            return ret
+            return ExtractedToolCallInformation(
+                tools_called=True,
+                tool_calls=tool_calls,
+                content=None,
+            )
 
-        except Exception:
-            logger.exception("Error in extracting tool call from response.")
-            # return information to just treat the tool call as regular JSON
+        except Exception as e:
+            logger.error("Error in extracting tool call from response %s", e)
             return ExtractedToolCallInformation(tools_called=False,
                                                 tool_calls=[],
                                                 content=model_output)
@@ -115,8 +95,15 @@ class Llama3JsonToolParser(ToolParser):
         request: ChatCompletionRequest,
     ) -> Union[DeltaMessage, None]:
 
-        if not (current_text.startswith(self.bot_token)
-                or current_text.startswith('{')):
+        start_idx = consume_space(0, current_text)
+        if current_text[start_idx:].startswith(self.bot_token):
+            start_idx = consume_space(start_idx + len(self.bot_token),
+                                      current_text)
+        if current_text[start_idx:].startswith(self.bot_string):
+            start_idx = consume_space(start_idx + len(self.bot_string),
+                                      current_text)
+        if not current_text or start_idx >= len(current_text)\
+            or current_text[start_idx] != '[':
             return DeltaMessage(content=delta_text)
 
         # bit mask flags for partial JSON parsing. If the name hasn't been
@@ -126,45 +113,36 @@ class Llama3JsonToolParser(ToolParser):
         flags = Allow.ALL if self.current_tool_name_sent \
             else Allow.ALL & ~Allow.STR
         try:
-            tool_call_arr = []
-            is_complete = []
+            tool_call_arr = None
+            is_complete = None
             try:
-                # depending on the prompt format the Llama model may or may not
-                # prefix the output with the <|python_tag|> token
-                start_idx = len(self.bot_token) if current_text.startswith(
-                    self.bot_token) else 0
-                while start_idx < len(current_text):
-                    (obj,
-                     end_idx) = partial_json_loads(current_text[start_idx:],
-                                                   flags)
-                    is_complete.append(
-                        is_complete_json(current_text[start_idx:start_idx +
-                                                      end_idx]))
-                    start_idx += end_idx + len('; ')
-                    # depending on the prompt Llama can use
-                    # either arguments or parameters
-                    if "parameters" in obj:
-                        assert "arguments" not in obj, \
-                            "model generated both parameters and arguments"
-                        obj["arguments"] = obj["parameters"]
-                    tool_call_arr.append(obj)
+                tool_calls, end_idx = partial_json_loads(
+                    current_text[start_idx:], flags)
+                if type(tool_calls) is list:
+                    tool_call_arr = tool_calls
+                else:
+                    return DeltaMessage(content=delta_text)
+
+                is_complete = [True] * len(tool_calls)
+                if not is_complete_json(
+                        current_text[start_idx:start_idx + end_idx]):
+                    is_complete[-1] = False
             except partial_json_parser.core.exceptions.MalformedJSON:
                 logger.debug('not enough tokens to parse into JSON yet')
                 return None
 
-            # select as the current tool call the one we're on the state at
-            current_tool_call: dict = tool_call_arr[self.current_tool_id] \
-                if len(tool_call_arr) > 0 else {}
-
             # case -- if no tokens have been streamed for the tool, e.g.
             #   only the array brackets, stream nothing
-            if len(tool_call_arr) == 0:
+            if not tool_call_arr:
                 return None
 
+            # select as the current tool call the one we're on the state at
+            current_tool_call: dict = tool_call_arr[self.current_tool_id]
+
+            delta = None
             # case: we are starting a new tool in the array
             #   -> array has > 0 length AND length has moved past cursor
-            elif (len(tool_call_arr) > 0
-                  and len(tool_call_arr) > self.current_tool_id + 1):
+            if len(tool_call_arr) > self.current_tool_id + 1:
 
                 # if we're moving on to a new call, first make sure we
                 # haven't missed anything in the previous one that was
@@ -187,10 +165,7 @@ class Llama3JsonToolParser(ToolParser):
                         ])
                         self.streamed_args_for_tool[
                             self.current_tool_id] += argument_diff
-                    else:
-                        delta = None
-                else:
-                    delta = None
+
                 # re-set stuff pertaining to progress in the current tool
                 self.current_tool_id = len(tool_call_arr) - 1
                 self.current_tool_name_sent = False
@@ -213,14 +188,11 @@ class Llama3JsonToolParser(ToolParser):
                                               exclude_none=True))
                     ])
                     self.current_tool_name_sent = True
-                else:
-                    delta = None
 
             # now we know we're on the same tool call and we're streaming
             # arguments
             else:
                 cur_arguments = current_tool_call.get("arguments")
-                delta = None
 
                 if cur_arguments:
                     sent = len(
@@ -235,7 +207,6 @@ class Llama3JsonToolParser(ToolParser):
                     elif prev_arguments:
                         prev_args_json = json.dumps(prev_arguments)
                         if cur_args_json != prev_args_json:
-
                             prefix = find_common_prefix(
                                 prev_args_json, cur_args_json)
                             argument_diff = prefix[sent:]
@@ -253,8 +224,8 @@ class Llama3JsonToolParser(ToolParser):
             self.prev_tool_call_arr = tool_call_arr
             return delta
 
-        except Exception:
-            logger.exception("Error trying to handle streaming tool call.")
+        except Exception as e:
+            logger.error("Error trying to handle streaming tool call: %s", e)
             logger.debug(
                 "Skipping chunk as a result of tool streaming extraction "
                 "error")

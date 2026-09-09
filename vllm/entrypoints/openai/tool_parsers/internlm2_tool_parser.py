@@ -1,5 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import json
-from typing import Dict, Sequence, Union
+from collections.abc import Sequence
+from typing import Union
 
 import partial_json_parser
 from partial_json_parser.core.options import Allow
@@ -88,7 +91,7 @@ class Internlm2ToolParser(ToolParser):
             # tool calls are generated in an object in inernlm2
             # it's not support parallel tool calls
             try:
-                tool_call_arr: Dict = partial_json_parser.loads(
+                tool_call_arr: dict = partial_json_parser.loads(
                     parsable_arr, flags)
             except partial_json_parser.core.exceptions.MalformedJSON:
                 logger.debug('not enough tokens to parse into JSON yet')
@@ -166,8 +169,8 @@ class Internlm2ToolParser(ToolParser):
             tool_call_arr["arguments"] = self.get_argments(tool_call_arr)
             self.prev_tool_call_arr = [tool_call_arr]
             return delta
-        except Exception as e:
-            logger.error("Error trying to handle streaming tool call: %s", e)
+        except Exception:
+            logger.exception("Error trying to handle streaming tool call.")
             logger.debug(
                 "Skipping chunk as a result of tool streaming extraction "
                 "error")

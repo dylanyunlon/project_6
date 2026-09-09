@@ -3,132 +3,117 @@
 import json
 import re
 from collections.abc import Sequence
-from random import choices
-from string import ascii_letters, digits
 from typing import Union
 
 import partial_json_parser
 from partial_json_parser.core.options import Allow
-from pydantic import Field
 
 from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
                                               DeltaFunctionCall, DeltaMessage,
                                               DeltaToolCall,
                                               ExtractedToolCallInformation,
                                               FunctionCall, ToolCall)
-from vllm.entrypoints.openai.tool_parsers.abstract_tool_parser import (
-    ToolParser, ToolParserManager)
+from vllm.entrypoints.openai.tool_parsers import ToolParser, ToolParserManager
 from vllm.entrypoints.openai.tool_parsers.utils import (
     extract_intermediate_diff)
 from vllm.logger import init_logger
-from vllm.transformers_utils.tokenizer import AnyTokenizer, MistralTokenizer
+from vllm.transformers_utils.tokenizer import AnyTokenizer
+from vllm.transformers_utils.tokenizers import MistralTokenizer
+from vllm.utils import random_uuid
 
 logger = init_logger(__name__)
 
-ALPHANUMERIC = ascii_letters + digits
 
-
-class MistralToolCall(ToolCall):
-    id: str = Field(
-        default_factory=lambda: MistralToolCall.generate_random_id())
-
-    @staticmethod
-    def generate_random_id():
-        # Mistral Tool Call Ids must be alphanumeric with a length of 9.
-        # https://github.com/mistralai/mistral-common/blob/21ee9f6cee3441e9bb1e6ed2d10173f90bd9b94b/src/mistral_common/protocol/instruct/validator.py#L299
-        return "".join(choices(ALPHANUMERIC, k=9))
-
-
-@ToolParserManager.register_module("mistral")
-class MistralToolParser(ToolParser):
-    """
-    Tool call parser for Mistral 7B Instruct v0.3, intended for use with the
-    examples/tool_chat_template_mistral.jinja template.
-
-    Used when --enable-auto-tool-choice --tool-call-parser mistral are all set
-    """
+@ToolParserManager.register_module("jamba")
+class JambaToolParser(ToolParser):
 
     def __init__(self, tokenizer: AnyTokenizer):
         super().__init__(tokenizer)
 
-        if not isinstance(self.model_tokenizer, MistralTokenizer):
-            logger.info("Non-Mistral tokenizer detected when using a Mistral "
-                        "model...")
+        if isinstance(self.model_tokenizer, MistralTokenizer):
+            raise ValueError(
+                "Detected a MistralTokenizer tokenizer when using a Jamba model"
+            )
 
-        # initialize properties used for state when parsing tool calls in
-        # streaming mode
+        self.current_tool_name_sent: bool = False
         self.prev_tool_call_arr: list[dict] = []
         self.current_tool_id: int = -1
-        self.current_tool_name_sent: bool = False
         self.streamed_args_for_tool: list[str] = [
         ]  # map what has been streamed for each tool so far to a list
-        self.bot_token = "[TOOL_CALLS]"
-        self.bot_token_id = self.vocab.get(self.bot_token)
-        self.tool_call_regex = re.compile(r"\[{.*}\]", re.DOTALL)
-        if self.bot_token_id is None:
+
+        self.tool_calls_start_token: str = "<tool_calls>"
+        self.tool_calls_end_token: str = "</tool_calls>"
+
+        self.tool_calls_regex = re.compile(
+            rf"{self.tool_calls_start_token}(.*?){self.tool_calls_end_token}",
+            re.DOTALL)
+
+        if not self.model_tokenizer:
+            raise ValueError(
+                "The model tokenizer must be passed to the ToolParser "
+                "constructor during construction.")
+        self.tool_calls_start_token_id = self.vocab.get(
+            self.tool_calls_start_token)
+        self.tool_calls_end_token_id = self.vocab.get(
+            self.tool_calls_end_token)
+        if (self.tool_calls_start_token_id is None
+                or self.tool_calls_end_token_id is None):
             raise RuntimeError(
-                "Mistral Tool Parser could not locate the tool call token in "
-                "the tokenizer!")
+                "Jamba Tool parser could not locate tool calls start/end "
+                "tokens in the tokenizer!")
+
+    def adjust_request(
+            self, request: ChatCompletionRequest) -> ChatCompletionRequest:
+        if request.tools and request.tool_choice != 'none':
+            # do not skip special tokens because jamba use the special
+            # tokens to indicate the start and end of the tool calls
+            # information.
+            request.skip_special_tokens = False
+        return request
 
     def extract_tool_calls(
-        self,
-        model_output: str,
-        request: ChatCompletionRequest,
-    ) -> ExtractedToolCallInformation:
-        """
-        Extract the tool calls from a complete model response. Requires
-        find-and-replacing single quotes with double quotes for JSON parsing,
-        make sure your tool call arguments don't ever include quotes!
-        """
+            self, model_output: str,
+            request: ChatCompletionRequest) -> ExtractedToolCallInformation:
 
-        # case -- if a tool call token is not present, return a text response
-        if self.bot_token not in model_output:
+        # sanity check; avoid unnecessary processing
+        if self.tool_calls_start_token not in model_output:
             return ExtractedToolCallInformation(tools_called=False,
                                                 tool_calls=[],
                                                 content=model_output)
 
-        # first remove the BOT token
-        tool_content = model_output.replace(self.bot_token, "").strip()
+        else:
 
-        try:
-
-            # we first try to directly load the json as parsing very nested
-            # jsons is difficult
             try:
-                function_call_arr = json.loads(tool_content)
-            except json.JSONDecodeError:
-                # use a regex to find the part corresponding to the tool call.
-                # NOTE: This use case should not happen if the model is trained
-                # correctly. It's a easy possible fix so it's included, but
-                # can be brittle for very complex / highly nested tool calls
-                raw_tool_call = self.tool_call_regex.findall(tool_content)[0]
-                function_call_arr = json.loads(raw_tool_call)
+                # use a regex to find the tool call between the tags
+                function_calls = self.tool_calls_regex.findall(model_output)[0]
 
-            # Tool Call
-            tool_calls: list[MistralToolCall] = [
-                MistralToolCall(
-                    type="function",
-                    function=FunctionCall(
-                        name=raw_function_call["name"],
-                        # function call args are JSON but as a string
-                        arguments=json.dumps(raw_function_call["arguments"],
-                                             ensure_ascii=False)))
-                for raw_function_call in function_call_arr
-            ]
+                # load the JSON, and then use it to build the Function and
+                # Tool Call
+                raw_function_calls = json.loads(function_calls)
+                tool_calls = [
+                    ToolCall(
+                        type="function",
+                        function=FunctionCall(
+                            name=function_call["name"],
+                            # function call args are JSON but as a string
+                            arguments=json.dumps(function_call["arguments"])))
+                    for function_call in raw_function_calls
+                ]
 
-            # get any content before  the tool call
-            content = model_output.split(self.bot_token)[0]
-            return ExtractedToolCallInformation(
-                tools_called=True,
-                tool_calls=tool_calls,
-                content=content if len(content) > 0 else None)
+                content = model_output[:model_output.
+                                       find(self.tool_calls_start_token)]
+                return ExtractedToolCallInformation(
+                    tools_called=True,
+                    tool_calls=tool_calls,
+                    content=content if
+                    (len(content) > 0 and content != " ") else None)
 
-        except Exception:
-            logger.exception("Error in extracting tool call from response.")
-            # return information to just treat the tool call as regular JSON
-            return ExtractedToolCallInformation(tools_called=False,
-                                                tool_calls=[],
-                                                content=tool_content)
+            except Exception:
+                logger.exception(
+                    "Error in extracting tool call from response.")
+                return ExtractedToolCallInformation(tools_called=False,
+                                                    tool_calls=[],
+                                                    content=model_output)
 
     def extract_tool_calls_streaming(
         self,
@@ -143,18 +128,18 @@ class MistralToolParser(ToolParser):
 
         # if the tool call token is not in the tokens generated so far, append
         # output to contents since it's not a tool
-        if self.bot_token not in current_text:
+        if self.tool_calls_start_token not in current_text:
             return DeltaMessage(content=delta_text)
 
         # if the tool call token ID IS in the tokens generated so far, that
         # means we're parsing as tool calls now
 
-        # handle if we detected the BOT token which means the start of tool
-        # calling
-        if (self.bot_token_id in delta_token_ids
+        # handle if we detected the start of tool calls token which means
+        # the start of tool calling
+        if (self.tool_calls_start_token_id in delta_token_ids
                 and len(delta_token_ids) == 1):
             # if it's the only token, return None, so we don't send a chat
-            # completion any don't send a control token
+            # completion and don't send a control token
             return None
 
         # bit mask flags for partial JSON parsing. If the name hasn't been
@@ -165,10 +150,10 @@ class MistralToolParser(ToolParser):
             else Allow.ALL & ~Allow.STR
         try:
 
-            # replace BOT token with empty string, and convert single quotes
-            # to double to allow parsing as JSON since mistral uses single
-            # quotes instead of double for tool calls
-            parsable_arr = current_text.split(self.bot_token)[-1]
+            # Extract the tool calls between the special tool call tokens
+            parsable_arr = current_text.split(
+                self.tool_calls_start_token)[-1].split(
+                    self.tool_calls_end_token)[0]
 
             # tool calls are generated in an array, so do partial JSON
             # parsing on the entire array
@@ -202,7 +187,7 @@ class MistralToolParser(ToolParser):
                     diff: Union[str, None] = current_tool_call.get("arguments")
 
                     if diff:
-                        diff = json.dumps(diff, ensure_ascii=False).replace(
+                        diff = json.dumps(diff).replace(
                             self.streamed_args_for_tool[self.current_tool_id],
                             "")
                         delta = DeltaMessage(tool_calls=[
@@ -235,7 +220,7 @@ class MistralToolParser(ToolParser):
                     delta = DeltaMessage(tool_calls=[
                         DeltaToolCall(index=self.current_tool_id,
                                       type="function",
-                                      id=MistralToolCall.generate_random_id(),
+                                      id=f"chatcmpl-tool-{random_uuid()}",
                                       function=DeltaFunctionCall(
                                           name=function_name).model_dump(
                                               exclude_none=True))
@@ -253,8 +238,6 @@ class MistralToolParser(ToolParser):
                 cur_arguments = current_tool_call.get("arguments")
 
                 new_text = delta_text.replace("\'", "\"")
-                if ('"}' in new_text):
-                    new_text = new_text[:new_text.rindex('"}')]
 
                 if not cur_arguments and not prev_arguments:
 
@@ -265,15 +248,12 @@ class MistralToolParser(ToolParser):
                         "mid-arguments")
                     delta = None
                 elif cur_arguments and not prev_arguments:
-                    cur_arguments_json = json.dumps(cur_arguments,
-                                                    ensure_ascii=False)[:-2]
+                    cur_arguments_json = json.dumps(cur_arguments)
                     logger.debug("finding %s in %s", new_text,
                                  cur_arguments_json)
 
-                    if (new_text not in cur_arguments_json):
-                        return None
                     arguments_delta = cur_arguments_json[:cur_arguments_json.
-                                                         rindex(new_text) +
+                                                         index(new_text) +
                                                          len(new_text)]
                     logger.debug("First tokens in arguments received: %s",
                                  arguments_delta)
@@ -287,10 +267,8 @@ class MistralToolParser(ToolParser):
                         self.current_tool_id] += arguments_delta
 
                 elif cur_arguments and prev_arguments:
-                    cur_args_json = json.dumps(cur_arguments,
-                                               ensure_ascii=False)
-                    prev_args_json = json.dumps(prev_arguments,
-                                                ensure_ascii=False)
+                    cur_args_json = json.dumps(cur_arguments)
+                    prev_args_json = json.dumps(prev_arguments)
                     logger.debug("Searching for diff between \n%s\n%s",
                                  cur_args_json, prev_args_json)
 
