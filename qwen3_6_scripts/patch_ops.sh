@@ -274,7 +274,8 @@ build_stage "installing scheduler and attention patches"
 # also bypasses auto chunked prefill on
 cp ./xformers.py "${VLLM_ROOT}/attention/backends/xformers.py"
 cp ./logits_processor.py "${VLLM_ROOT}/model_executor/layers/logits_processor.py"
-cp ./outlines_decoding.py "${VLLM_ROOT}/model_executor/guided_decoding/outlines_decoding.py"
+# outlines_decoding.py is now managed by task 15/20 vendor_overrides/guided_decoding
+# cp ./outlines_decoding.py "${VLLM_ROOT}/model_executor/guided_decoding/outlines_decoding.py"
 # arg_utils.py xformers patches are pre-merged into vendor_overrides/vllm/engine/arg_utils.py
 # bi100_timer profile instrumentation is pre-merged into xformers.py
 
@@ -347,6 +348,61 @@ if [[ -d "$MOE_OVERRIDE_ROOT" ]]; then
             install_patch_file "${MOE_OVERRIDE_ROOT}/${f}" \
                 "${VLLM_ROOT}/model_executor/layers/fused_moe/${f}"
     done
+fi
+
+build_stage "installing model_executor overrides (task 15/20)"
+# --- model_executor root files: custom_op (register/enabled), utils (platform seed) ---
+install_patch_file \
+    "${VLLM_OVERRIDE_ROOT}/model_executor/custom_op.py" \
+    "${VLLM_ROOT}/model_executor/custom_op.py"
+install_patch_file \
+    "${VLLM_OVERRIDE_ROOT}/model_executor/utils.py" \
+    "${VLLM_ROOT}/model_executor/utils.py"
+
+# --- guided_decoding: full subtree override (new backends + reasoner support) ---
+GUIDED_OVERRIDE_ROOT="${VLLM_OVERRIDE_ROOT}/model_executor/guided_decoding"
+if [[ -d "$GUIDED_OVERRIDE_ROOT" ]]; then
+    find "${VLLM_ROOT}/model_executor/guided_decoding" \
+         -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+    # Modified files
+    for f in __init__.py guided_fields.py lm_format_enforcer_decoding.py \
+             outlines_decoding.py outlines_logits_processors.py; do
+        install_patch_file "${GUIDED_OVERRIDE_ROOT}/${f}" \
+            "${VLLM_ROOT}/model_executor/guided_decoding/${f}"
+    done
+    # New files
+    for f in guidance_decoding.py guidance_logits_processors.py \
+             utils.py xgrammar_decoding.py; do
+        [[ -f "${GUIDED_OVERRIDE_ROOT}/${f}" ]] && \
+            install_patch_file "${GUIDED_OVERRIDE_ROOT}/${f}" \
+                "${VLLM_ROOT}/model_executor/guided_decoding/${f}"
+    done
+    # reasoner subdir
+    if [[ -d "${GUIDED_OVERRIDE_ROOT}/reasoner" ]]; then
+        mkdir -p "${VLLM_ROOT}/model_executor/guided_decoding/reasoner"
+        cp -r "${GUIDED_OVERRIDE_ROOT}/reasoner/." \
+              "${VLLM_ROOT}/model_executor/guided_decoding/reasoner/"
+    fi
+fi
+
+# --- model_loader: VllmConfig API + new loaders ---
+LOADER_OVERRIDE_ROOT="${VLLM_OVERRIDE_ROOT}/model_executor/model_loader"
+if [[ -d "$LOADER_OVERRIDE_ROOT" ]]; then
+    find "${VLLM_ROOT}/model_executor/model_loader" \
+         -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+    for f in __init__.py loader.py utils.py weight_utils.py; do
+        install_patch_file "${LOADER_OVERRIDE_ROOT}/${f}" \
+            "${VLLM_ROOT}/model_executor/model_loader/${f}"
+    done
+fi
+
+# --- transformers_utils: dependencies for loader.py (s3_utils, is_s3) ---
+TFU_OVERRIDE_ROOT="${VLLM_OVERRIDE_ROOT}/transformers_utils"
+if [[ -d "$TFU_OVERRIDE_ROOT" ]]; then
+    install_patch_file "${TFU_OVERRIDE_ROOT}/utils.py" \
+        "${VLLM_ROOT}/transformers_utils/utils.py"
+    install_patch_file "${TFU_OVERRIDE_ROOT}/s3_utils.py" \
+        "${VLLM_ROOT}/transformers_utils/s3_utils.py"
 fi
 
 # PRD #69: Clear ALL __pycache__ under VLLM_ROOT after every cp/patch is done.
