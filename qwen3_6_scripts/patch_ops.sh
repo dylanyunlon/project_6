@@ -338,6 +338,9 @@ fi
 install_patch_file \
     "${VLLM_OVERRIDE_ROOT}/model_executor/parameter.py" \
     "${VLLM_ROOT}/model_executor/parameter.py"
+install_patch_file \
+    "${VLLM_OVERRIDE_ROOT}/model_executor/utils.py" \
+    "${VLLM_ROOT}/model_executor/utils.py"
 
 # --- quantization dependency: fused_moe (BLOCK enum, EP create_weights) -----
 MOE_OVERRIDE_ROOT="${VLLM_OVERRIDE_ROOT}/model_executor/layers/fused_moe"
@@ -486,6 +489,18 @@ fi
 # py_compile below only compiles ./qwen3_6_scripts, not VLLM_ROOT, so this
 # ensures the docker snapshot has no stale .pyc for any patched vllm module.
 find "${VLLM_ROOT}" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+# --- catch-all: deploy remaining vendor_overrides files -----------------------
+# Root-level files (utils.py, jsontree.py, envs.py, etc.) and sub-modules
+# (multimodal, compilation, inputs, guided_decoding, model_loader) that were
+# prepared in vendor_overrides but not deployed by earlier explicit stages.
+build_stage "deploying remaining vendor_overrides files"
+(cd "${VLLM_OVERRIDE_ROOT}" && find . -name '*.py' -type f) | while read -r rel; do
+    rel="${rel#./}"
+    dst="${VLLM_ROOT}/${rel}"
+    mkdir -p "$(dirname "$dst")"
+    cp -f "${VLLM_OVERRIDE_ROOT}/${rel}" "$dst"
+done
 
 build_stage "compiling submission Python sources"
 find . -path './wheels' -prune -o -name '*.py' -print0 | xargs -0 python3 -m py_compile

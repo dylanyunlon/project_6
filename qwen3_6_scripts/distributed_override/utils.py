@@ -14,9 +14,19 @@ from typing import Any, Deque, Dict, Optional, Sequence, Tuple
 import torch
 from torch.distributed import ProcessGroup, TCPStore
 from torch.distributed.distributed_c10d import (Backend, PrefixStore,
-                                                _get_default_timeout,
-                                                _unregister_process_group,
                                                 is_nccl_available)
+# CoreX PyTorch 2.1.0 does not expose _get_default_timeout (a later
+# upstream addition that splits timeout by backend).  The platform uses a
+# single 30-minute default_pg_timeout for all backends, so the fallback
+# simply returns that constant regardless of backend.
+try:
+    from torch.distributed.distributed_c10d import _get_default_timeout
+except ImportError:
+    from torch.distributed.constants import default_pg_timeout as _pg_timeout
+
+    def _get_default_timeout(backend: Backend) -> datetime.timedelta:
+        return _pg_timeout
+
 from torch.distributed.rendezvous import rendezvous
 
 import vllm.envs as envs
@@ -341,7 +351,4 @@ def stateless_destroy_torch_distributed_process_group(
     Destroy ProcessGroup returned by
         stateless_init_torch_distributed_process_group().
     """
-    # Lazy import for non-CUDA backends.
-    from torch.distributed.distributed_c10d import _shutdown_backend
-    _shutdown_backend(pg)
-    _unregister_process_group(pg.group_name)
+    torch.distributed.destroy_process_group(pg)
