@@ -230,6 +230,19 @@ if [[ -d "$DIST_OVERRIDE_ROOT" ]]; then
     fi
 fi
 
+build_stage "installing compilation module overrides (task 07/20)"
+COMP_OVERRIDE_ROOT="${VLLM_OVERRIDE_ROOT}/compilation"
+if [[ -d "$COMP_OVERRIDE_ROOT" ]]; then
+    mkdir -p "${VLLM_ROOT}/compilation"
+    for f in __init__.py backends.py compile_context.py compiler_interface.py \
+             counter.py decorators.py fix_functionalization.py fusion.py \
+             fx_utils.py inductor_pass.py levels.py monitor.py \
+             multi_output_match.py noop_elimination.py pass_manager.py \
+             torch25_custom_graph_pass.py vllm_inductor_pass.py wrapper.py; do
+        install_patch_file "${COMP_OVERRIDE_ROOT}/${f}" "${VLLM_ROOT}/compilation/${f}"
+    done
+fi
+
 build_stage "installing executor startup diagnostics"
 # executor startup debug + worker startup profile guard + block_major capacity
 # are pre-merged into vendor_overrides and whole-file copies
