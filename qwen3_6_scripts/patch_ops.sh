@@ -161,8 +161,8 @@ install_patch_file \
     "${VLLM_OVERRIDE_ROOT}/engine/llm_engine.py" \
     "${VLLM_ROOT}/engine/llm_engine.py"
 install_patch_file \
-    "${VLLM_OVERRIDE_ROOT}/executor/multiproc_gpu_executor.py" \
-    "${VLLM_ROOT}/executor/multiproc_gpu_executor.py"
+    "${VLLM_OVERRIDE_ROOT}/executor/mp_distributed_executor.py" \
+    "${VLLM_ROOT}/executor/mp_distributed_executor.py"
 install_patch_file \
     "${VLLM_OVERRIDE_ROOT}/worker/worker.py" \
     "${VLLM_ROOT}/worker/worker.py"
@@ -228,19 +228,6 @@ if [[ -d "$DIST_OVERRIDE_ROOT" ]]; then
                 install_patch_file "${DIST_OVERRIDE_ROOT}/platforms/${f}" "${VLLM_ROOT}/platforms/${f}"
         done
     fi
-fi
-
-build_stage "installing compilation module overrides (task 07/20)"
-COMP_OVERRIDE_ROOT="${VLLM_OVERRIDE_ROOT}/compilation"
-if [[ -d "$COMP_OVERRIDE_ROOT" ]]; then
-    mkdir -p "${VLLM_ROOT}/compilation"
-    for f in __init__.py backends.py compile_context.py compiler_interface.py \
-             counter.py decorators.py fix_functionalization.py fusion.py \
-             fx_utils.py inductor_pass.py levels.py monitor.py \
-             multi_output_match.py noop_elimination.py pass_manager.py \
-             torch25_custom_graph_pass.py vllm_inductor_pass.py wrapper.py; do
-        install_patch_file "${COMP_OVERRIDE_ROOT}/${f}" "${VLLM_ROOT}/compilation/${f}"
-    done
 fi
 
 build_stage "installing executor startup diagnostics"

@@ -1,66 +1,79 @@
+# SPDX-License-Identifier: Apache-2.0
+# BI100-DP adapted multiprocessing distributed executor
+# Based on new vllm mp_distributed_executor.py + BI100 data-parallel support
+
 import asyncio
 import os
-from functools import partial
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional, Union
 
-import torch
+import cloudpickle
 
-from vllm.executor.distributed_gpu_executor import (  # yapf: disable
-    DistributedGPUExecutor, DistributedGPUExecutorAsync)
-from vllm.executor.gpu_executor import create_worker
-from vllm.executor.multiproc_worker_utils import (ProcessWorkerWrapper,
-                                                  ResultHandler, WorkerMonitor)
+from vllm.executor.executor_base import DistributedExecutorBase
+from vllm.executor.multiproc_worker_utils import (
+    ProcessWorkerWrapper, ResultHandler, WorkerMonitor,
+    set_multiprocessing_worker_envs)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.sequence import ExecuteModelRequest
-from vllm.triton_utils import maybe_set_triton_cache_manager
 from vllm.utils import (_run_task_with_lock, cuda_device_count_stateless,
-                        cuda_is_initialized, get_distributed_init_method,
-                        get_open_port, get_vllm_instance_id, make_async,
-                        update_environment_variables)
+                        get_distributed_init_method, get_ip, get_open_port,
+                        make_async, run_method, update_environment_variables)
+from vllm.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
 
 
-class MultiprocessingGPUExecutor(DistributedGPUExecutor):
-    """Python multiprocessing-based multi-GPU executor"""
+def _bi100_startup_debug(message: str, *args) -> None:
+    if os.getenv("BI100_EXECUTOR_STARTUP_DEBUG") == "1":
+        logger.info("[BI100 startup] " + message, *args)
+
+
+print("=================patch_ok: mp_distributed_executor.py loaded===========")
+
+
+class MultiprocessingDistributedExecutor(DistributedExecutorBase):
+    """Python multiprocessing-based distributed executor with BI100-DP support"""
 
     uses_ray: bool = False
 
+    def _check_cuda(self) -> None:
+        """Check that the number of GPUs is sufficient for the parallel
+        configuration."""
+        parallel_config = self.parallel_config
+        world_size = parallel_config.world_size
+        tensor_parallel_size = parallel_config.tensor_parallel_size
+
+        cuda_device_count = cuda_device_count_stateless()
+        if tensor_parallel_size > cuda_device_count:
+            raise RuntimeError(
+                f"please set tensor_parallel_size ({tensor_parallel_size}) "
+                f"to less than max local gpu count ({cuda_device_count})")
+
+        if world_size > cuda_device_count:
+            raise RuntimeError(
+                f"please ensure that world_size ({world_size}) "
+                f"is less than than max local gpu count ({cuda_device_count})")
+
+        # Set CUDA_VISIBLE_DEVICES for the driver, inherited by workers
+        if "CUDA_VISIBLE_DEVICES" not in os.environ:
+            update_environment_variables({
+                "CUDA_VISIBLE_DEVICES": (",".join(map(str, range(world_size))))
+            })
+
     def _init_executor(self) -> None:
-        self._check_executor_parameters()
+
+        from vllm.platforms import current_platform
+        if current_platform.is_cuda_alike():
+            self._check_cuda()
 
         # Create the parallel GPU workers.
         world_size = self.parallel_config.world_size
         tensor_parallel_size = self.parallel_config.tensor_parallel_size
+        data_parallel_size = getattr(self.parallel_config,
+                                     'data_parallel_size', 1)
 
-        # Ensure that VLLM_INSTANCE_ID is set, to be inherited by workers
-        os.environ["VLLM_INSTANCE_ID"] = get_vllm_instance_id()
-
-        # Disable torch async compiling which won't work with daemonic processes
-        os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
-
-        # Configure thread parallelism if OMP_NUM_THREADS isn't set
-        #
-        # Helps to avoid CPU contention. The default of spawning a thread per
-        # core combined with multiprocessing for each GPU can have a negative
-        # impact on performance. The contention is amplified when running in a
-        # container where CPU limits can cause throttling.
-        default_omp_num_threads = 1
-        if "OMP_NUM_THREADS" not in os.environ and (
-                current_parallelism :=
-                torch.get_num_threads()) > default_omp_num_threads:
-            logger.warning(
-                "Reducing Torch parallelism from %d threads to %d to avoid "
-                "unnecessary CPU contention. Set OMP_NUM_THREADS in the "
-                "external environment to tune this value as needed.",
-                current_parallelism, default_omp_num_threads)
-            os.environ["OMP_NUM_THREADS"] = str(default_omp_num_threads)
-            torch.set_num_threads(default_omp_num_threads)
-
-        # workaround for https://github.com/vllm-project/vllm/issues/6103
-        if world_size > 1:
-            maybe_set_triton_cache_manager()
+        # Set multiprocessing envs that are common to V0 and V1
+        set_multiprocessing_worker_envs(self.parallel_config)
 
         # Multiprocessing-based executor does not support multi-node setting.
         # Since it only works for single node, we can use the loopback address
@@ -78,23 +91,26 @@ class MultiprocessingGPUExecutor(DistributedGPUExecutor):
         # broadcasted to.
         self.non_driver_workers: List[ProcessWorkerWrapper] = []
 
+        # [BI100-DP] Track DP group driver workers for request dispatching.
+        # Layout: [dp0_tp0, dp0_tp1, ..., dp1_tp0, dp1_tp1, ...]
+        # DP driver = rank 0 of each DP group (i.e. rank % tp_size == 0)
+        self.dp_driver_workers: List[ProcessWorkerWrapper] = []
+        self.data_parallel_size = data_parallel_size
+
         if world_size == 1:
             self.worker_monitor = None
         else:
             result_handler = ResultHandler()
             for rank in range(1, world_size):
-                worker = ProcessWorkerWrapper(
-                    result_handler,
-                    partial(
-                        create_worker,
-                        **self._get_create_worker_kwargs(
-                            rank=rank,
-                            local_rank=rank,
-                            distributed_init_method=distributed_init_method,
-                        )))
+                worker = ProcessWorkerWrapper(result_handler,
+                                              WorkerWrapperBase,
+                                              self.vllm_config, rank)
                 self.workers.append(worker)
                 if rank % tensor_parallel_size == 0:
                     self.tp_driver_workers.append(worker)
+                    # [BI100-DP] This is a DP group driver (dp_rank > 0)
+                    if data_parallel_size > 1:
+                        self.dp_driver_workers.append(worker)
                 else:
                     self.non_driver_workers.append(worker)
 
@@ -102,42 +118,48 @@ class MultiprocessingGPUExecutor(DistributedGPUExecutor):
             result_handler.start()
             self.worker_monitor.start()
 
+        if data_parallel_size > 1:
+            logger.info(
+                "[BI100-DP] Data parallel enabled: dp=%d tp=%d "
+                "world_size=%d dp_drivers=%d",
+                data_parallel_size, tensor_parallel_size, world_size,
+                len(self.dp_driver_workers) + 1)  # +1 for rank 0 driver
+
         # Set up signal handlers to shutdown the executor cleanly
         # sometimes gc does not work well
 
-        self.driver_worker = self._create_worker(
-            distributed_init_method=distributed_init_method)
+        _bi100_startup_debug("creating driver worker")
+        self.driver_worker = WorkerWrapperBase(self.vllm_config, 0)
+        _bi100_startup_debug("created driver worker")
+
+        all_kwargs = []
+        distributed_init_method = get_distributed_init_method(
+            get_ip(), get_open_port())
+        for i in range(world_size):
+            local_rank = i
+            rank = i
+            kwargs = dict(
+                vllm_config=self.vllm_config,
+                local_rank=local_rank,
+                rank=rank,
+                distributed_init_method=distributed_init_method,
+                is_driver_worker=(not self.parallel_config)
+                or (rank % self.parallel_config.tensor_parallel_size == 0),
+            )
+            all_kwargs.append(kwargs)
+        _bi100_startup_debug("starting init_worker")
+        self._run_workers("init_worker", all_kwargs)
+        _bi100_startup_debug("finished init_worker")
+        _bi100_startup_debug("starting init_device")
         self._run_workers("init_device")
+        _bi100_startup_debug("finished init_device")
+        _bi100_startup_debug("starting load_model")
         self._run_workers("load_model",
                           max_concurrent_workers=self.parallel_config.
                           max_parallel_loading_workers)
-
-    def _check_executor_parameters(self):
-        world_size = self.parallel_config.world_size
-        tensor_parallel_size = self.parallel_config.tensor_parallel_size
-
-        # Set CUDA_VISIBLE_DEVICES for the driver, inherited by workers
-        if "CUDA_VISIBLE_DEVICES" not in os.environ:
-            update_environment_variables({
-                "CUDA_VISIBLE_DEVICES": (",".join(map(str, range(world_size))))
-            })
-
-        if (cuda_is_initialized()
-                and os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") != "spawn"):
-            logger.warning("CUDA was previously initialized. We must use "
-                           "the `spawn` multiprocessing start method. Setting "
-                           "VLLM_WORKER_MULTIPROC_METHOD to 'spawn'.")
-            os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-
-        cuda_device_count = cuda_device_count_stateless()
-        # Use confusing message for more common TP-only case.
-        assert tensor_parallel_size <= cuda_device_count, (
-            f"please set tensor_parallel_size ({tensor_parallel_size}) "
-            f"to less than max local gpu count ({cuda_device_count})")
-
-        assert world_size <= cuda_device_count, (
-            f"please ensure that world_size ({world_size}) "
-            f"is less than than max local gpu count ({cuda_device_count})")
+        _bi100_startup_debug("finished load_model")
+        self.driver_exec_model = make_async(self.driver_worker.execute_model)
+        self.pp_locks: Optional[List[asyncio.Lock]] = None
 
     def shutdown(self):
         if (worker_monitor := getattr(self, "worker_monitor",
@@ -156,12 +178,12 @@ class MultiprocessingGPUExecutor(DistributedGPUExecutor):
 
     def _run_workers(
         self,
-        method: str,
+        method: Union[str, Callable],
         *args,
         async_run_tensor_parallel_workers_only: bool = False,
         max_concurrent_workers: Optional[int] = None,
         **kwargs,
-    ) -> Any:
+    ) -> List[Any]:
         """Runs the given method on all workers.
 
         Args:
@@ -170,6 +192,11 @@ class MultiprocessingGPUExecutor(DistributedGPUExecutor):
                 It will also be run asynchronously and return a list of futures
                 rather than blocking on the results.
         """
+        if isinstance(method, str):
+            sent_method = method
+        else:
+            sent_method = cloudpickle.dumps(method)
+        del method
 
         if max_concurrent_workers:
             raise NotImplementedError(
@@ -178,20 +205,28 @@ class MultiprocessingGPUExecutor(DistributedGPUExecutor):
         if async_run_tensor_parallel_workers_only:
             # Run only non-driver workers and just return futures.
             return [
-                worker.execute_method(method, *args, **kwargs)
+                worker.execute_method(sent_method, *args, **kwargs)
                 for worker in self.non_driver_workers
             ]
 
+        _bi100_startup_debug("enqueue remote method=%s workers=%d",
+                              sent_method if isinstance(sent_method, str)
+                              else "<callable>",
+                              len(self.workers))
         # Start all remote workers first.
         worker_outputs = [
-            worker.execute_method(method, *args, **kwargs)
+            worker.execute_method(sent_method, *args, **kwargs)
             for worker in self.workers
         ]
+        _bi100_startup_debug("remote enqueued")
 
-        driver_worker_method = getattr(self.driver_worker, method)
-        driver_worker_output = driver_worker_method(*args, **kwargs)
+        _bi100_startup_debug("driver start")
+        driver_worker_output = run_method(self.driver_worker, sent_method,
+                                          args, kwargs)
+        _bi100_startup_debug("driver done")
 
         # Get the results of the workers.
+        _bi100_startup_debug("waiting remote results")
         return [driver_worker_output
                 ] + [output.get() for output in worker_outputs]
 
@@ -206,15 +241,6 @@ class MultiprocessingGPUExecutor(DistributedGPUExecutor):
         async_run_remote_workers_only to complete."""
         for result in parallel_worker_tasks:
             result.get()
-
-
-class MultiprocessingGPUExecutorAsync(MultiprocessingGPUExecutor,
-                                      DistributedGPUExecutorAsync):
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.driver_exec_model = make_async(self.driver_worker.execute_model)
-        self.pp_locks: Optional[List[asyncio.Lock]] = None
 
     async def _driver_execute_model_async(
         self,
