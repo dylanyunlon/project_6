@@ -316,6 +316,39 @@ if source != installed:
     raise SystemExit("runtime api_server overlay identity mismatch")
 PY
 
+build_stage "installing quantization layer overrides (task 13/20)"
+# --- layers/quantization: new API (lazy imports, Fp8LinearOp, block quant,
+#     EP support, ScaledMM kernels, ixformer MoE ops) -----------------------
+# The vendor image ships an older quantization module whose interfaces are
+# incompatible with the rest of the upgraded vLLM code (model_loader,
+# attention, fused_moe all reference the new API).  We replace the entire
+# subtree so every internal import resolves consistently.
+QUANT_OVERRIDE_ROOT="${VLLM_OVERRIDE_ROOT}/model_executor/layers/quantization"
+if [[ -d "$QUANT_OVERRIDE_ROOT" ]]; then
+    # Wipe stale .pyc first so Python never loads cached old bytecode
+    find "${VLLM_ROOT}/model_executor/layers/quantization" \
+         -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+    # Copy the full tree (preserves new subdirs like kernels/scaled_mm,
+    # kernels/mixed_precision, quark/, utils/configs/)
+    cp -r "${QUANT_OVERRIDE_ROOT}/." \
+          "${VLLM_ROOT}/model_executor/layers/quantization/"
+fi
+
+# --- quantization dependency: parameter.py (BlockQuantScaleParameter) -------
+install_patch_file \
+    "${VLLM_OVERRIDE_ROOT}/model_executor/parameter.py" \
+    "${VLLM_ROOT}/model_executor/parameter.py"
+
+# --- quantization dependency: fused_moe (BLOCK enum, EP create_weights) -----
+MOE_OVERRIDE_ROOT="${VLLM_OVERRIDE_ROOT}/model_executor/layers/fused_moe"
+if [[ -d "$MOE_OVERRIDE_ROOT" ]]; then
+    for f in __init__.py layer.py cutlass_moe.py fused_moe.py fused_marlin_moe.py; do
+        [[ -f "${MOE_OVERRIDE_ROOT}/${f}" ]] && \
+            install_patch_file "${MOE_OVERRIDE_ROOT}/${f}" \
+                "${VLLM_ROOT}/model_executor/layers/fused_moe/${f}"
+    done
+fi
+
 # PRD #69: Clear ALL __pycache__ under VLLM_ROOT after every cp/patch is done.
 # py_compile below only compiles ./qwen3_6_scripts, not VLLM_ROOT, so this
 # ensures the docker snapshot has no stale .pyc for any patched vllm module.
