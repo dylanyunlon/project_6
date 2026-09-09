@@ -419,54 +419,66 @@ if [[ -d "$TRANSFORMERS_UTILS_OVERRIDE" ]]; then
     fi
 fi
 
-build_stage "installing multimodal + inputs overrides (task 17/20)"
-# --- multimodal: refactored multi-modal processing pipeline -----------------
-# The vendor image ships an older multimodal module with:
-#   - MultiModalInputs (renamed to MultiModalKwargs in new API)
-#   - No PlaceholderRange / MultiModalPlaceholderMap
-#   - No processing pipeline (BaseMultiModalProcessor / ProcessingCache)
-#   - No profiling support (BaseDummyInputsBuilder / MultiModalProfiler)
-#   - No MediaIO / MediaConnector abstractions
-#   - No MultiModalDataParser / MultiModalDataItems
-#   - No MultiModalFieldConfig / MultiModalKwargsItem batching system
-# The new multimodal module is required by the upgraded:
-#   - inputs/preprocess.py (uses mm_registry.has_processor/create_processor)
-#   - inputs/registry.py (uses MultiModalProfiler for dummy data)
-#   - model_executor/models (multimodal models reference new API)
-#   - entrypoints (MultiModalPlaceholderDict in serving)
-MULTIMODAL_OVERRIDE_ROOT="${VLLM_OVERRIDE_ROOT}/multimodal"
-if [[ -d "$MULTIMODAL_OVERRIDE_ROOT" ]]; then
-    # Wipe stale .pyc first
-    find "${VLLM_ROOT}/multimodal" \
+build_stage "installing spec_decode + lora + prompt_adapter overrides (task 18/20)"
+# --- spec_decode: new PP broadcast, chunked-prefill+spec, DeepSeek MTP,
+#     EAGLE lm_head weight load, smaller_tp_pp proposer, prompt_logprobs ---
+SPEC_DECODE_OVERRIDE="${VLLM_OVERRIDE_ROOT}/spec_decode"
+if [[ -d "$SPEC_DECODE_OVERRIDE" ]]; then
+    find "${VLLM_ROOT}/spec_decode" \
          -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-
-    # All files (modified + new)
-    for f in __init__.py audio.py base.py hasher.py image.py inputs.py \
-             parse.py processing.py profiling.py registry.py utils.py video.py; do
-        [[ -f "${MULTIMODAL_OVERRIDE_ROOT}/${f}" ]] && \
-            install_patch_file "${MULTIMODAL_OVERRIDE_ROOT}/${f}" \
-                "${VLLM_ROOT}/multimodal/${f}"
+    for f in __init__.py batch_expansion.py draft_model_runner.py interfaces.py \
+             medusa_worker.py metrics.py mlp_speculator_worker.py \
+             multi_step_worker.py ngram_worker.py proposer_worker_base.py \
+             spec_decode_worker.py target_model_runner.py top1_proposer.py \
+             util.py smaller_tp_pp_proposer_worker.py; do
+        [[ -f "${SPEC_DECODE_OVERRIDE}/${f}" ]] && \
+            install_patch_file "${SPEC_DECODE_OVERRIDE}/${f}" \
+                "${VLLM_ROOT}/spec_decode/${f}"
     done
 fi
 
-# --- inputs: refactored input processing pipeline --------------------------
-# The vendor image ships older inputs module with:
-#   - LLMInputs / EncoderDecoderLLMInputs (renamed to TokenInputs / DecoderOnlyInputs / EncoderDecoderInputs)
-#   - No token_inputs() factory, no SingletonInputs / SingletonInputsAdapter
-#   - No InputProcessingContext (needed by multimodal processor)
-#   - No DummyData NamedTuple (needed by registry profiling)
-#   - preprocess.py missing mm_registry integration and _process_multimodal
-#   - registry.py missing ClassRegistry, has_processor/create_processor path
-INPUTS_OVERRIDE_ROOT="${VLLM_OVERRIDE_ROOT}/inputs"
-if [[ -d "$INPUTS_OVERRIDE_ROOT" ]]; then
-    # Wipe stale .pyc first
-    find "${VLLM_ROOT}/inputs" \
+# --- lora: new PunicaWrapper (ops/torch_ops, ops/triton_ops, punica_wrapper/),
+#     PEFTHelper, bias support, BaseLinearLayerWithLoRA refactor,
+#     MergedQKVParallelLinearWithLoRA, pooling model support ---
+LORA_OVERRIDE="${VLLM_OVERRIDE_ROOT}/lora"
+if [[ -d "$LORA_OVERRIDE" ]]; then
+    find "${VLLM_ROOT}/lora" \
          -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+    # Remove old single-file punica.py (replaced by punica_wrapper/ package)
+    rm -f "${VLLM_ROOT}/lora/punica.py" 2>/dev/null || true
+    # Top-level lora files
+    for f in __init__.py fully_sharded_layers.py layers.py lora.py models.py \
+             request.py utils.py worker_manager.py peft_helper.py; do
+        [[ -f "${LORA_OVERRIDE}/${f}" ]] && \
+            install_patch_file "${LORA_OVERRIDE}/${f}" \
+                "${VLLM_ROOT}/lora/${f}"
+    done
+    # ops/ subtree (new — replaces old bgmv/sgmv top-level files with
+    #   torch_ops/ and triton_ops/ subdirectories)
+    if [[ -d "${LORA_OVERRIDE}/ops" ]]; then
+        # Wipe stale old-style ops files (bgmv_*.py, sgmv_*.py) and __pycache__
+        find "${VLLM_ROOT}/lora/ops" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+        rm -f "${VLLM_ROOT}/lora/ops/bgmv_"*.py "${VLLM_ROOT}/lora/ops/sgmv_"*.py \
+              "${VLLM_ROOT}/lora/ops/utils.py" 2>/dev/null || true
+        mkdir -p "${VLLM_ROOT}/lora/ops"
+        cp -r "${LORA_OVERRIDE}/ops/." "${VLLM_ROOT}/lora/ops/"
+    fi
+    # punica_wrapper/ subtree (new)
+    if [[ -d "${LORA_OVERRIDE}/punica_wrapper" ]]; then
+        mkdir -p "${VLLM_ROOT}/lora/punica_wrapper"
+        cp -r "${LORA_OVERRIDE}/punica_wrapper/." "${VLLM_ROOT}/lora/punica_wrapper/"
+    fi
+fi
 
-    for f in __init__.py data.py parse.py preprocess.py registry.py; do
-        [[ -f "${INPUTS_OVERRIDE_ROOT}/${f}" ]] && \
-            install_patch_file "${INPUTS_OVERRIDE_ROOT}/${f}" \
-                "${VLLM_ROOT}/inputs/${f}"
+# --- prompt_adapter: SPDX headers, minor style fixes ---
+PA_OVERRIDE="${VLLM_OVERRIDE_ROOT}/prompt_adapter"
+if [[ -d "$PA_OVERRIDE" ]]; then
+    find "${VLLM_ROOT}/prompt_adapter" \
+         -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+    for f in __init__.py layers.py models.py request.py utils.py worker_manager.py; do
+        [[ -f "${PA_OVERRIDE}/${f}" ]] && \
+            install_patch_file "${PA_OVERRIDE}/${f}" \
+                "${VLLM_ROOT}/prompt_adapter/${f}"
     done
 fi
 
