@@ -14,7 +14,6 @@ from typing_extensions import ParamSpec
 # import custom ops, trigger op registration
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.utils import import_pynvml
 
 from .interface import DeviceCapability, Platform, PlatformEnum, _Backend
 
@@ -29,7 +28,14 @@ logger = init_logger(__name__)
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
-pynvml = import_pynvml()
+# BI-V100 compat: vendor image has standard pynvml but no
+# vllm.third_party.pynvml.  Try the vendored copy first
+# (matches upstream import_pynvml()), fall back to the system package.
+try:
+    from vllm.utils import import_pynvml
+    pynvml = import_pynvml()
+except (ImportError, AttributeError):
+    import pynvml  # type: ignore[no-redef]
 
 # pytorch 2.5 uses cudnn sdpa by default, which will cause crash on some models
 # see https://github.com/huggingface/diffusers/issues/9704 for details
