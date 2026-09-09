@@ -419,6 +419,57 @@ if [[ -d "$TRANSFORMERS_UTILS_OVERRIDE" ]]; then
     fi
 fi
 
+build_stage "installing multimodal + inputs overrides (task 17/20)"
+# --- multimodal: refactored multi-modal processing pipeline -----------------
+# The vendor image ships an older multimodal module with:
+#   - MultiModalInputs (renamed to MultiModalKwargs in new API)
+#   - No PlaceholderRange / MultiModalPlaceholderMap
+#   - No processing pipeline (BaseMultiModalProcessor / ProcessingCache)
+#   - No profiling support (BaseDummyInputsBuilder / MultiModalProfiler)
+#   - No MediaIO / MediaConnector abstractions
+#   - No MultiModalDataParser / MultiModalDataItems
+#   - No MultiModalFieldConfig / MultiModalKwargsItem batching system
+# The new multimodal module is required by the upgraded:
+#   - inputs/preprocess.py (uses mm_registry.has_processor/create_processor)
+#   - inputs/registry.py (uses MultiModalProfiler for dummy data)
+#   - model_executor/models (multimodal models reference new API)
+#   - entrypoints (MultiModalPlaceholderDict in serving)
+MULTIMODAL_OVERRIDE_ROOT="${VLLM_OVERRIDE_ROOT}/multimodal"
+if [[ -d "$MULTIMODAL_OVERRIDE_ROOT" ]]; then
+    # Wipe stale .pyc first
+    find "${VLLM_ROOT}/multimodal" \
+         -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+    # All files (modified + new)
+    for f in __init__.py audio.py base.py hasher.py image.py inputs.py \
+             parse.py processing.py profiling.py registry.py utils.py video.py; do
+        [[ -f "${MULTIMODAL_OVERRIDE_ROOT}/${f}" ]] && \
+            install_patch_file "${MULTIMODAL_OVERRIDE_ROOT}/${f}" \
+                "${VLLM_ROOT}/multimodal/${f}"
+    done
+fi
+
+# --- inputs: refactored input processing pipeline --------------------------
+# The vendor image ships older inputs module with:
+#   - LLMInputs / EncoderDecoderLLMInputs (renamed to TokenInputs / DecoderOnlyInputs / EncoderDecoderInputs)
+#   - No token_inputs() factory, no SingletonInputs / SingletonInputsAdapter
+#   - No InputProcessingContext (needed by multimodal processor)
+#   - No DummyData NamedTuple (needed by registry profiling)
+#   - preprocess.py missing mm_registry integration and _process_multimodal
+#   - registry.py missing ClassRegistry, has_processor/create_processor path
+INPUTS_OVERRIDE_ROOT="${VLLM_OVERRIDE_ROOT}/inputs"
+if [[ -d "$INPUTS_OVERRIDE_ROOT" ]]; then
+    # Wipe stale .pyc first
+    find "${VLLM_ROOT}/inputs" \
+         -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+    for f in __init__.py data.py parse.py preprocess.py registry.py; do
+        [[ -f "${INPUTS_OVERRIDE_ROOT}/${f}" ]] && \
+            install_patch_file "${INPUTS_OVERRIDE_ROOT}/${f}" \
+                "${VLLM_ROOT}/inputs/${f}"
+    done
+fi
+
 # PRD #69: Clear ALL __pycache__ under VLLM_ROOT after every cp/patch is done.
 # py_compile below only compiles ./qwen3_6_scripts, not VLLM_ROOT, so this
 # ensures the docker snapshot has no stale .pyc for any patched vllm module.
