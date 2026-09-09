@@ -497,25 +497,9 @@ def init_worker_distributed_environment(
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
 
-    # [BI100-DP] Initialize data parallel process group.
-    # With dp > 1, ranks are laid out as:
-    #   [dp0_tp0, dp0_tp1, dp1_tp0, dp1_tp1] for tp=2, dp=2
-    # Each DP group contains ranks with the same TP-local position.
-    dp_size = parallel_config.data_parallel_size
-    tp_size = parallel_config.tensor_parallel_size
-    if dp_size > 1:
-        dp_rank = rank // tp_size
-        tp_rank = rank % tp_size
-        parallel_config.dp_rank = dp_rank
-
-        import torch.distributed as dist
-        # Build DP groups: ranks that share the same tp_rank
-        for tp_pos in range(tp_size):
-            dp_ranks = [dp_idx * tp_size + tp_pos
-                        for dp_idx in range(dp_size)]
-            group = dist.new_group(dp_ranks)
-            if tp_rank == tp_pos:
-                parallel_config._dp_group = group
+    # NOTE: DP group is now created inside initialize_model_parallel()
+    # (called by ensure_model_parallel_initialized above) using
+    # config.parallel_config.data_parallel_size. Access via get_dp_group().
 
     # [PR #2269] Initialize expert parallel process group.
     # When enable_expert_parallel is True, MoE experts are sharded across

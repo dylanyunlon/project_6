@@ -200,6 +200,36 @@ cp ./paged_attn.py "${VLLM_ROOT}/attention/ops/paged_attn.py"
 # Fix: set prefix_cache_hit=False for Case 1 so the full block_tables is used.
 cp ./model_runner.py "${VLLM_ROOT}/worker/model_runner.py"
 
+build_stage "installing distributed module overrides (task 05/20)"
+DIST_OVERRIDE_ROOT="./distributed_override"
+if [[ -d "$DIST_OVERRIDE_ROOT" ]]; then
+    # Top-level distributed files
+    for f in __init__.py communication_op.py parallel_state.py utils.py; do
+        install_patch_file "${DIST_OVERRIDE_ROOT}/${f}" "${VLLM_ROOT}/distributed/${f}"
+    done
+
+    # device_communicators (modified + new)
+    for f in base_device_communicator.py cpu_communicator.py cuda_communicator.py \
+             cuda_wrapper.py custom_all_reduce.py custom_all_reduce_utils.py \
+             hpu_communicator.py neuron_communicator.py pynccl.py \
+             pynccl_wrapper.py shm_broadcast.py tpu_communicator.py \
+             xpu_communicator.py; do
+        install_patch_file "${DIST_OVERRIDE_ROOT}/device_communicators/${f}" \
+            "${VLLM_ROOT}/distributed/device_communicators/${f}"
+    done
+
+    # kv_transfer directory
+    cp -r "${DIST_OVERRIDE_ROOT}/kv_transfer" "${VLLM_ROOT}/distributed/"
+
+    # platforms (required by new distributed: get_device_communicator_cls, is_fully_connected)
+    if [[ -d "${DIST_OVERRIDE_ROOT}/platforms" ]]; then
+        for f in __init__.py interface.py cuda.py cpu.py rocm.py tpu.py xpu.py hpu.py neuron.py; do
+            [[ -f "${DIST_OVERRIDE_ROOT}/platforms/${f}" ]] && \
+                install_patch_file "${DIST_OVERRIDE_ROOT}/platforms/${f}" "${VLLM_ROOT}/platforms/${f}"
+        done
+    fi
+fi
+
 build_stage "installing executor startup diagnostics"
 # executor startup debug + worker startup profile guard + block_major capacity
 # are pre-merged into vendor_overrides and whole-file copies
