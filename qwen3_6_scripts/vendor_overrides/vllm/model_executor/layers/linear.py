@@ -6,7 +6,14 @@ from typing import Any, Literal, Optional, Union
 
 import torch
 import torch.nn as nn
-import ixformer.inference.functions as F
+try:
+    import ixformer._C as _ixf_C
+    if hasattr(_ixf_C, 'infer'):
+        import ixformer.inference.functions as F
+    else:
+        import torch.nn.functional as F
+except Exception:
+    import torch.nn.functional as F
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 from vllm.distributed import (divide, get_tensor_model_parallel_rank,
