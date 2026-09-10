@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-from __future__ import annotations
 
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
+import torch._inductor.pattern_matcher as pm
 from torch import fx
+from torch._higher_order_ops.auto_functionalize import auto_functionalized
+from torch._inductor.pattern_matcher import PatternMatcherPass
+from torch._ops import OpOverload
 
 from vllm.config import CompilationConfig
 from vllm.logger import init_logger
@@ -15,32 +18,6 @@ from .multi_output_match import MultiOutputMatch
 from .vllm_inductor_pass import VllmInductorPass
 
 logger = init_logger(__name__)
-
-
-def _lazy_imports():
-    """Delay torch._inductor / torch._higher_order_ops imports until
-    actually needed (i.e. when compilation level is PIECEWISE)."""
-    import torch._inductor.pattern_matcher as _pm
-    from torch._higher_order_ops.auto_functionalize import \
-        auto_functionalized as _auto_fn
-    from torch._inductor.pattern_matcher import \
-        PatternMatcherPass as _PatternMatcherPass
-    from torch._ops import OpOverload as _OpOverload
-    return _pm, _auto_fn, _PatternMatcherPass, _OpOverload
-
-
-# module-level aliases, populated on first use
-pm = None
-auto_functionalized = None
-PatternMatcherPass = None
-OpOverload = None
-
-
-def _ensure_imports():
-    global pm, auto_functionalized, PatternMatcherPass, OpOverload
-    if pm is None:
-        pm, auto_functionalized, PatternMatcherPass, OpOverload = \
-            _lazy_imports()
 FP8_DTYPE = current_platform.fp8_dtype()
 
 
@@ -567,7 +544,6 @@ class FusionPass(VllmInductorPass):
         return cls._instance
 
     def __init__(self, config: CompilationConfig.PassConfig):
-        _ensure_imports()
         assert self.__class__._instance is None, \
             "FusionPass singleton instance already exists"
         super().__init__(config)

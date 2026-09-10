@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from unittest.mock import patch
 
 import torch
+import torch._inductor.compile_fx
 import torch.fx as fx
 from packaging.version import Version
 
@@ -169,7 +170,6 @@ class InductorAdaptor(CompilerInterface):
     ) -> Tuple[Optional[Callable], Optional[Any]]:
         from torch._inductor import config
         current_config = config.get_config_copy()
-        import torch._inductor.compile_fx
         from torch._inductor.compile_fx import compile_fx
 
         # disable remote cache

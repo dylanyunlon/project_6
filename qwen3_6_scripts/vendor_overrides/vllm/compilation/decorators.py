@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import torch
 import torch.nn as nn
+from torch._dynamo.symbolic_convert import InliningInstructionTranslator
 
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.wrapper import TorchCompileWrapperWithCustomDispatcher
@@ -224,8 +225,6 @@ def _support_torch_compile(
             # the function by calling InliningInstructionTranslator.inline_call
             # we hijack this function to know all the functions called
             # during Dynamo tracing, and their corresponding files
-            from torch._dynamo.symbolic_convert import \
-                InliningInstructionTranslator
             inline_call = InliningInstructionTranslator.inline_call
 
             def patched_inline_call(parent, func, args, kwargs):

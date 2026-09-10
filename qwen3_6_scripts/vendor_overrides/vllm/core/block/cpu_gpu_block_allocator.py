@@ -1,11 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
-from vllm.core.block.cpu_kv_content_cache import (CpuKvContentCache,
-                                                   cpu_kv_offload_enabled)
 from vllm.core.block.interfaces import (Block, BlockAllocator, BlockId,
                                         DeviceAwareBlockAllocator)
 from vllm.core.block.naive_block import NaiveBlock, NaiveBlockAllocator
 from vllm.core.block.prefix_caching_block import PrefixCachingBlockAllocator
+from vllm.platforms import current_platform
 from vllm.utils import Device
 
 
@@ -54,15 +55,11 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
             - The block IDs are assigned contiguously, with GPU block IDs coming
                 before CPU block IDs.
         """
-        content_offload = cpu_kv_offload_enabled()
-        if content_offload and allocator_type != "prefix_caching":
-            raise RuntimeError(
-                "BI100_CPU_KV_OFFLOAD=1 requires prefix caching")
-        if content_offload and num_cpu_blocks <= 0:
-            raise RuntimeError(
-                "BI100_CPU_KV_OFFLOAD=1 requires at least one CPU KV block")
-
-        block_ids = list(range(num_gpu_blocks + num_cpu_blocks))
+        # For HPU, block id 0 is used only for padding
+        reserved_blocks = 1 if current_platform.is_hpu() else 0
+        block_ids = list(
+            range(reserved_blocks, num_gpu_blocks + num_cpu_blocks))
+        num_gpu_blocks -= reserved_blocks
         gpu_block_ids = block_ids[:num_gpu_blocks]
         cpu_block_ids = block_ids[num_gpu_blocks:]
 
@@ -98,13 +95,10 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         return CpuGpuBlockAllocator(
             cpu_block_allocator=cpu_allocator,
             gpu_block_allocator=gpu_allocator,
-            cpu_content_cache=(CpuKvContentCache(num_cpu_blocks)
-                               if content_offload else None),
         )
 
     def __init__(self, cpu_block_allocator: BlockAllocator,
-                 gpu_block_allocator: BlockAllocator,
-                 cpu_content_cache: Optional[CpuKvContentCache] = None):
+                 gpu_block_allocator: BlockAllocator):
         assert not (
             cpu_block_allocator.all_block_ids
             & gpu_block_allocator.all_block_ids
@@ -117,53 +111,11 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
 
         self._swap_mapping: Dict[int, int] = {}
         self._null_block: Optional[Block] = None
-        self._cpu_content_cache = cpu_content_cache
 
         self._block_ids_to_allocator: Dict[int, BlockAllocator] = {}
         for _, allocator in self._allocators.items():
             for block_id in allocator.all_block_ids:
                 self._block_ids_to_allocator[block_id] = allocator
-
-        if self._cpu_content_cache is not None:
-            if not isinstance(gpu_block_allocator,
-                              PrefixCachingBlockAllocator):
-                raise RuntimeError(
-                    "CPU KV content tier requires PrefixCachingBlockAllocator")
-            if (self._cpu_content_cache.capacity !=
-                    cpu_block_allocator.get_num_total_blocks()):
-                raise RuntimeError(
-                    "CPU KV content capacity must cover the complete CPU cache")
-            gpu_block_allocator.set_external_cache_callbacks(
-                claim=self._claim_cpu_content,
-                load=self._stage_cpu_to_gpu,
-                cancel=self._cancel_cpu_claim,
-                store=self._stage_gpu_to_cpu,
-            )
-
-    @property
-    def content_offload_enabled(self) -> bool:
-        return self._cpu_content_cache is not None
-
-    def _claim_cpu_content(self, content_hash: bytes) -> Optional[int]:
-        assert self._cpu_content_cache is not None
-        return self._cpu_content_cache.claim_load(content_hash)
-
-    def _cancel_cpu_claim(self, content_hash: bytes, cpu_slot: int) -> None:
-        assert self._cpu_content_cache is not None
-        self._cpu_content_cache.cancel_load(content_hash, cpu_slot)
-
-    def _stage_cpu_to_gpu(self, content_hash: bytes, cpu_slot: int,
-                          gpu_block_id: BlockId) -> None:
-        assert self._cpu_content_cache is not None
-        gpu_slot = self.get_physical_block_id(Device.GPU, gpu_block_id)
-        self._cpu_content_cache.stage_load(
-            content_hash, cpu_slot, gpu_slot)
-
-    def _stage_gpu_to_cpu(self, content_hash: bytes,
-                          gpu_block_id: BlockId) -> bool:
-        assert self._cpu_content_cache is not None
-        gpu_slot = self.get_physical_block_id(Device.GPU, gpu_block_id)
-        return self._cpu_content_cache.stage_store(content_hash, gpu_slot)
 
     def allocate_or_get_null_block(self) -> Block:
         if self._null_block is None:
@@ -181,7 +133,9 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
             prev_block (Optional[Block]): The previous block to in the sequence.
                 Used for prefix hashing.
             device (Device): The device on which to allocate the new block.
-            extra_hash (Optional[int]): Additional hash factors (e.g. adapters).
+            extra_hash (Optional[int]): The hash value of additional
+                factors, such as adapters, that influence the block hash
+                in the prefix caching block.
 
         Returns:
             Block: The newly allocated mutable block.
@@ -189,11 +143,12 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         return self._allocators[device].allocate_mutable_block(
             prev_block, extra_hash=extra_hash)
 
-    def allocate_immutable_blocks(self,
-                                  prev_block: Optional[Block],
-                                  block_token_ids: List[List[int]],
-                                  device: Device,
-                                  extra_hash: Optional[int] = None) -> List[Block]:
+    def allocate_immutable_blocks(
+            self,
+            prev_block: Optional[Block],
+            block_token_ids: List[List[int]],
+            device: Device,
+            extra_hash: Optional[int] = None) -> List[Block]:
         """Allocates a new group of immutable blocks with the provided block 
         token IDs on the specified device.
 
@@ -203,7 +158,9 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
             block_token_ids (List[int]): The list of block token IDs to be 
                 stored in the new blocks.
             device (Device): The device on which to allocate the new block.
-            extra_hash (Optional[int]): Additional hash factors (e.g. adapters).
+            extra_hash (Optional[int]): The hash value of additional
+                factors, such as adapters, that influence the block hash
+                in the prefix caching block.
 
         Returns:
             List[Block]: The newly allocated list of immutable blocks 
@@ -226,7 +183,9 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
             token_ids (List[int]): The list of token IDs to be stored in the new
                 block.
             device (Device): The device on which to allocate the new block.
-            extra_hash (Optional[int]): Additional hash factors (e.g. adapters).
+            extra_hash (Optional[int]): The hash value of additional
+                factors, such as adapters, that influence the block hash
+                in the prefix caching block.
 
         Returns:
             Block: The newly allocated immutable block containing the provided
@@ -312,11 +271,6 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
             Dict[int, int]: Swap mapping from source_device
                 on to dest_device.
         """
-        if self.content_offload_enabled:
-            raise RuntimeError(
-                "request-level preemption swap cannot share CPU slots with "
-                "BI100_CPU_KV_OFFLOAD")
-
         src_block_ids = [block.block_id for block in blocks]
         self._allocators[src_device].swap_out(blocks)
         self._allocators[dst_device].swap_in(blocks)
@@ -371,14 +325,6 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         device = Device.GPU
         return self._allocators[device].mark_blocks_as_computed(block_ids)
 
-    def get_computed_block_ids(self, prev_computed_block_ids: List[int],
-                               block_ids: List[int],
-                               skip_last_block_id: bool) -> List[int]:
-        # Prefix caching only supported on GPU.
-        device = Device.GPU
-        return self._allocators[device].get_computed_block_ids(
-            prev_computed_block_ids, block_ids, skip_last_block_id)
-
     def get_common_computed_block_ids(
             self, computed_seq_block_ids: List[List[int]]) -> List[int]:
         # Prefix caching only supported on GPU.
@@ -398,25 +344,11 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
     def reset_prefix_cache(self, device: Optional[Device] = None) -> bool:
         """Reset prefix cache for specified or all devices."""
         if device:
-            _fn = getattr(self._allocators[device], "reset_prefix_cache", None)
-            return _fn() if callable(_fn) else False
+            return self._allocators[device].reset_prefix_cache()
         success = True
-        for alloc in self._allocators.values():
-            _fn = getattr(alloc, "reset_prefix_cache", None)
-            if callable(_fn):
-                success = success and _fn()
+        for allocator in self._allocators.values():
+            success = success and allocator.reset_prefix_cache()
         return success
-
-    def find_cached_blocks_prefix(
-        self,
-        block_hashes: List[int],
-        device: Device = Device.GPU,
-    ) -> List[int]:
-        _fn = getattr(self._allocators[device],
-                      "find_cached_blocks_prefix", None)
-        if callable(_fn):
-            return _fn(block_hashes)
-        return []
 
     def get_and_reset_swaps(self) -> List[Tuple[int, int]]:
         """Returns and clears the mapping of source to destination block IDs.
@@ -430,16 +362,12 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         self._swap_mapping.clear()
         return list(mapping.items())
 
-    def get_and_reset_prefix_swaps(
-            self) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
-        """Return scheduler-owned (CPU->GPU, GPU->CPU) content maps."""
-        if self._cpu_content_cache is None:
-            return [], []
-        return self._cpu_content_cache.drain_step()
-
-    def begin_prefix_cache_step(self) -> None:
-        if self._cpu_content_cache is not None:
-            self._cpu_content_cache.begin_step()
+    def find_cached_blocks_prefix(
+        self,
+        block_hashes: List[int],
+        device: Device = Device.GPU,
+    ) -> List[int]:
+        return self._allocators[device].find_cached_blocks_prefix(block_hashes)
 
 
 class NullBlock(Block):

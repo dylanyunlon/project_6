@@ -6,7 +6,6 @@ from functools import cached_property
 from typing import Any, Dict, List, Optional, Set, Tuple, Type
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 
 from vllm.config import ParallelConfig, SpeculativeConfig, VllmConfig
@@ -343,20 +342,6 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         self._disable_log_stats = disable_log_stats
         self._num_spec_prefill_steps = num_spec_prefill_steps
 
-        # [PR #2269] DP/EP awareness for speculative decoding.
-        # These are populated during init_device from the scorer worker's
-        # parallel config, which carries the process groups created in
-        # init_worker_distributed_environment.
-        self._dp_group = None
-        self._dp_size: int = 1
-        self._ep_group = None
-        self._ep_enabled: bool = False
-        # Aggregated acceptance rate across DP replicas (TC-01).
-        # Used by adaptive draft-length controller. When dp_size=1,
-        # this is the local acceptance rate (TC-04 regression guard:
-        # no all-reduce when DP is not active).
-        self._last_aggregated_acceptance_rate: float = 0.0
-
     def init_device(self) -> None:
         """Initialize both scorer and proposer models.
         """
@@ -399,21 +384,6 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             self._metrics.init_tensors(self.rank, device_type=self.device)
             self.spec_decode_sampler.init_tensors(self.rank,
                                                   device_type=self.device)
-
-        # [PR #2269] Extract DP/EP process groups from the scorer worker's
-        # parallel config. These were created during
-        # init_worker_distributed_environment.
-        parallel_config = self.scorer_worker.parallel_config
-        self._dp_size = getattr(parallel_config, 'data_parallel_size', 1)
-        self._dp_group = getattr(parallel_config, '_dp_group', None)
-        self._ep_group = getattr(parallel_config, '_ep_group', None)
-        self._ep_enabled = getattr(
-            parallel_config, 'enable_expert_parallel', False)
-        if self._dp_size > 1 or self._ep_enabled:
-            logger.info(
-                "[PR #2269] SpecDecodeWorker DP/EP context: dp_size=%d, "
-                "ep_enabled=%s, rank=%d",
-                self._dp_size, self._ep_enabled, self.rank)
 
         scorer_cls: Type[SpeculativeScorer]
         if self.disable_mqa_scorer:
@@ -600,38 +570,8 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             self, execute_model_req: ExecuteModelRequest) -> bool:
         # When the batch size is too large, disable speculative decoding
         # to stop trading off throughput for latency.
-        if (execute_model_req.running_queue_size
-                >= self.disable_by_batch_size):
-            return True
-
-        # [PR #2269] TC-01: Adaptive draft-length control based on
-        # DP-aggregated acceptance rate. When the aggregated acceptance
-        # rate drops below a threshold, speculation is unlikely to help
-        # and we disable it to avoid wasted verification compute.
-        # This consumes the rate computed by aggregate_dp_acceptance_rates
-        # (Sub-task 1) and is the reason the aggregation exists.
-        #
-        # xllm equivalent: AdaptiveSpeculativeController::
-        #   select_pruned_prefix_lengths uses path_prob to decide per-seq
-        #   whether to speculate. We use a simpler global threshold since
-        #   vllm 0.6.3 doesn't support per-seq speculation lengths.
-        #
-        # Threshold 0.1 = if <10% of draft tokens are accepted, stop.
-        # Only active when DP > 1 (single-rank uses local stats which
-        # are already available via the metrics collector — TC-04 guard).
-        _ADAPTIVE_MIN_ACCEPTANCE_RATE = 0.1
-        if (self._dp_size > 1
-                and self._last_aggregated_acceptance_rate > 0.0
-                and self._last_aggregated_acceptance_rate
-                < _ADAPTIVE_MIN_ACCEPTANCE_RATE):
-            logger.info(
-                "[PR #2269] Adaptive controller: disabling speculation, "
-                "DP-aggregated acceptance rate %.3f < %.3f threshold",
-                self._last_aggregated_acceptance_rate,
-                _ADAPTIVE_MIN_ACCEPTANCE_RATE)
-            return True
-
-        return False
+        return (execute_model_req.running_queue_size
+                >= self.disable_by_batch_size)
 
     def _maybe_disable_speculative_tokens(
             self, disable_all_speculation: bool,
@@ -935,20 +875,6 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
                 proposals,
             )
 
-        # [PR #2269] Sub-task 2: EP-aware verification routing.
-        # When EP is active, the target model's MoE layers use the EP
-        # communicator (all-to-all) to route tokens to the correct
-        # expert-holding ranks during the scoring forward pass. The EP
-        # process group was created in init_worker_distributed_environment
-        # and is available via parallel_config._ep_group. The target
-        # model's MoE layers (ex_engine/moe/) automatically use EP routing
-        # when FusedMoEParallelConfig.use_ep is True, which is gated by
-        # parallel_config.enable_expert_parallel. No token remapping is
-        # needed here — the existing MoE forward path handles expert
-        # dispatch transparently via the EP communicator.
-        #
-        # xllm equivalent: SpeculativeWorkerImpl::apply_ep_verification_routing
-
         _, (non_spec_seqs, non_spec_indices) = split_batch_by_proposal_len(
             execute_model_req.seq_group_metadata_list, proposals.proposal_lens)
         # With prefill chunking enabled, `non_spec_seqs` contains prefills too:
@@ -972,38 +898,6 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             accepted_token_ids, target_logprobs = self._verify_tokens(
                 execute_model_req, proposal_scores, proposals,
                 execute_model_req.num_lookahead_slots)
-
-        # [PR #2269] Sub-task 1: DP-aware acceptance rate aggregation.
-        # After rejection sampling, aggregate acceptance statistics across
-        # all DP replicas via all-reduce so every replica sees the same
-        # acceptance rate. This ensures the adaptive draft-length controller
-        # converges all replicas to the same draft length.
-        #
-        # xllm equivalent: SpeculativeWorkerImpl::aggregate_dp_acceptance_rates
-        if self._dp_size > 1 and self._dp_group is not None:
-            # Count accepted tokens locally: non-(-1) entries in
-            # accepted_token_ids[:, 1:] (column 0 is the base token,
-            # columns 1..k are the draft positions).
-            local_accepted = (accepted_token_ids[:, 1:] != -1).sum()
-            local_total = torch.tensor(
-                accepted_token_ids[:, 1:].numel(),
-                dtype=torch.float32, device=accepted_token_ids.device)
-            local_accepted_f = local_accepted.float()
-
-            # All-reduce SUM across DP replicas, then average.
-            # After this, every DP replica sees the same aggregated rate.
-            dist.all_reduce(local_accepted_f, op=dist.ReduceOp.SUM,
-                            group=self._dp_group)
-            dist.all_reduce(local_total, op=dist.ReduceOp.SUM,
-                            group=self._dp_group)
-
-            if local_total.item() > 0:
-                aggregated_acceptance_rate = (
-                    local_accepted_f.item() / local_total.item())
-            else:
-                aggregated_acceptance_rate = 0.0
-            # Store for adaptive draft-length controller (future use).
-            self._last_aggregated_acceptance_rate = aggregated_acceptance_rate
 
         stage_times = (proposal_execute_time, scoring_timer.elapsed_time_ms,
                        verification_timer.elapsed_time_ms)

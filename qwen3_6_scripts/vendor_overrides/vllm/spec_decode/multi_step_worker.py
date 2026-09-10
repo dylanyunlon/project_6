@@ -6,12 +6,9 @@ from typing import Dict, List, Set, Tuple
 
 import torch
 
-from vllm.logger import init_logger
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.platforms import current_platform
-
-logger = init_logger(__name__)
 from vllm.sequence import (ExecuteModelRequest, HiddenStates, SequenceData,
                            SequenceGroupMetadata)
 
@@ -50,27 +47,6 @@ class MultiStepWorker(ProposerWorkerBase, DelegateWorkerBase):
             self.vocab_size,
             max_proposal_len=self.max_model_len,
         )
-
-        # [PR #2269] Sub-task 3/4: Verify DP/EP context propagation.
-        # In xllm, DFlash/MTP workers explicitly propagate DP/EP context
-        # to the speculative base. In vllm, this happens implicitly via
-        # Worker.init_device() → init_worker_distributed_environment()
-        # which sets _dp_group and _ep_group on self.parallel_config.
-        # We verify the context arrived correctly.
-        dp_size = getattr(self.parallel_config, 'data_parallel_size', 1)
-        ep_enabled = getattr(
-            self.parallel_config, 'enable_expert_parallel', False)
-        if dp_size > 1 or ep_enabled:
-            dp_group = getattr(self.parallel_config, '_dp_group', None)
-            ep_group = getattr(self.parallel_config, '_ep_group', None)
-            logger.info(
-                "[PR #2269] MultiStepWorker (MTP equivalent) DP/EP context "
-                "propagated: dp_size=%d, dp_group=%s, ep_enabled=%s, "
-                "ep_group=%s",
-                dp_size,
-                "initialized" if dp_group is not None else "MISSING",
-                ep_enabled,
-                "initialized" if ep_group is not None else "MISSING")
 
     def set_include_gpu_probs_tensor(self) -> None:
         # Need include_gpu_probs_tensor for MultiStepWorker

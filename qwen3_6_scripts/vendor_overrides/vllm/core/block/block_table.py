@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 from typing import List, Optional
 
@@ -23,7 +25,7 @@ class BlockTable:
             blocks to initialize the BlockTable with. If not provided, an empty
             BlockTable is created.
         max_block_sliding_window (Optional[int], optional): The number of
-            blocks to keep around for each sequance. If None, all blocks
+            blocks to keep around for each sequence. If None, all blocks
             are kept (eg., when sliding window is not used).
             It should at least fit the sliding window size of the model.
 
@@ -44,11 +46,9 @@ class BlockTable:
         block_allocator: DeviceAwareBlockAllocator,
         _blocks: Optional[List[Block]] = None,
         max_block_sliding_window: Optional[int] = None,
-        cache_namespace: Optional[bytes] = None,
     ):
         self._block_size = block_size
         self._allocator = block_allocator
-        self._cache_namespace = cache_namespace
         if _blocks is None:
             _blocks = []
         self._blocks: BlockList = BlockList(_blocks)
@@ -93,7 +93,9 @@ class BlockTable:
             token_ids (List[int]): The sequence of token IDs to be stored.
             device (Device, optional): The device on which the blocks should be
                 allocated. Defaults to Device.GPU.
-            extra_hash (Optional[int]): Additional hash factors.
+            extra_hash (Optional[int]): The hash value of additional
+                factors, such as adapters, that influence the block hash
+                in the prefixcaching block.
         """
         assert not self._is_allocated
         assert token_ids
@@ -105,19 +107,10 @@ class BlockTable:
         self._num_full_slots = len(token_ids)
 
     def update(self, blocks: List[Block]) -> None:
-        """Resets the table to the newly provided blocks
+        """Resets the table to the newly provided blocks 
         (with their corresponding block ids)
         """
         self._blocks.update(blocks)
-
-    def get_content_hashes(self) -> List[bytes]:
-        """Returns block-level content hashes for full blocks in order."""
-        content_hashes: List[bytes] = []
-        for block in self._blocks:
-            block_hash = block.content_hash
-            if block_hash is not None:
-                content_hashes.append(block_hash)
-        return content_hashes
 
     def append_token_ids(self,
                          token_ids: List[int],
@@ -145,6 +138,9 @@ class BlockTable:
                 Without sliding window, None can be passed.
                 Without chunked prefill, it should be the same as
                 _num_full_slots.
+            extra_hash (Optional[int]): The hash value of additional
+                factors such as adapters that influence the block, apart
+                from the token_ids.
         """
         assert self._is_allocated, "no blocks have been allocated"
         assert len(self._blocks) > 0
@@ -189,7 +185,9 @@ class BlockTable:
 
         Args:
             num_empty_slots (int): The minimum number of empty slots required.
-            extra_hash (Optional[int]): Additional hash factors.
+            extra_hash (Optional[int]): The hash value of additional
+                factors such as adapters that influence the block, apart
+                from the token_ids.
         """
         # Currently the block table only supports
         # appending tokens to GPU blocks.
@@ -231,7 +229,6 @@ class BlockTable:
             block_allocator=self._allocator,
             _blocks=forked_blocks,
             max_block_sliding_window=self._max_block_sliding_window,
-            cache_namespace=self._cache_namespace,
         )
 
     def free(self) -> None:
@@ -281,11 +278,12 @@ class BlockTable:
         # ones after the appended ones.
         return sequence_token_ids[self.num_full_slots:]
 
-    def _allocate_blocks_for_token_ids(self, prev_block: Optional[Block],
-                                       token_ids: List[int],
-                                       device: Device,
-                                       extra_hash: Optional[int] = None
-                                       ) -> List[Block]:
+    def _allocate_blocks_for_token_ids(
+            self,
+            prev_block: Optional[Block],
+            token_ids: List[int],
+            device: Device,
+            extra_hash: Optional[int] = None) -> List[Block]:
         blocks: List[Block] = []
 
         block_token_ids = []
@@ -297,102 +295,25 @@ class BlockTable:
                 tail_token_ids.append(cur_token_ids)
 
         if block_token_ids:
-            blocks.extend(self._allocate_immutable_blocks(
-                prev_block=prev_block,
-                block_token_ids=block_token_ids,
-                device=device,
-                extra_hash=extra_hash))
+            blocks.extend(
+                self._allocator.allocate_immutable_blocks(
+                    prev_block,
+                    block_token_ids=block_token_ids,
+                    device=device,
+                    extra_hash=extra_hash))
             prev_block = blocks[-1]
 
         if tail_token_ids:
             assert len(tail_token_ids) == 1
             cur_token_ids = tail_token_ids[0]
 
-            block = self._allocate_mutable_block(prev_block=prev_block,
-                                                 device=device,
-                                                 extra_hash=extra_hash)
+            block = self._allocator.allocate_mutable_block(
+                prev_block=prev_block, device=device, extra_hash=extra_hash)
             block.append_token_ids(cur_token_ids)
 
             blocks.append(block)
 
         return blocks
-
-    def _allocate_mutable_block(self, prev_block: Optional[Block],
-                                device: Device,
-                                extra_hash: Optional[int] = None) -> Block:
-        if self._cache_namespace is None:
-            return self._allocator.allocate_mutable_block(
-                prev_block=prev_block, device=device,
-                extra_hash=extra_hash)
-
-        with_cache_namespace = getattr(
-            self._allocator, "allocate_mutable_block_with_cache_namespace",
-            None)
-        if callable(with_cache_namespace):
-            return with_cache_namespace(
-                prev_block=prev_block,
-                cache_namespace=self._cache_namespace,
-                device=device)
-
-        backend_allocators = getattr(self._allocator, "_allocators", None)
-        if isinstance(backend_allocators, dict):
-            device_allocator = backend_allocators.get(device)
-            if device_allocator is not None:
-                with_cache_namespace = getattr(
-                    device_allocator,
-                    "allocate_mutable_block_with_cache_namespace", None)
-                if callable(with_cache_namespace):
-                    return with_cache_namespace(
-                        prev_block=prev_block,
-                        cache_namespace=self._cache_namespace)
-
-        return self._allocator.allocate_mutable_block(
-            prev_block=prev_block, device=device,
-            extra_hash=extra_hash)
-
-    def _allocate_immutable_blocks(self,
-                                  prev_block: Optional[Block],
-                                  block_token_ids: List[List[int]],
-                                  device: Device,
-                                  extra_hash: Optional[int] = None
-                                  ) -> List[Block]:
-        if self._cache_namespace is None:
-            return self._allocator.allocate_immutable_blocks(
-                prev_block,
-                block_token_ids=block_token_ids,
-                device=device,
-                extra_hash=extra_hash)
-
-        with_cache_namespace = getattr(
-            self._allocator, "allocate_immutable_blocks_with_cache_namespace", None)
-        if callable(with_cache_namespace):
-            return with_cache_namespace(
-                prev_block=prev_block,
-                block_token_ids=block_token_ids,
-                cache_namespace=self._cache_namespace,
-                device=device)
-
-        backend_allocator = getattr(self._allocator, "_allocators", None)
-        if isinstance(backend_allocator, dict):
-            device_allocator = backend_allocator.get(device)
-            if device_allocator is not None:
-                with_cache_namespace = getattr(
-                    device_allocator,
-                    "allocate_immutable_blocks_with_cache_namespace",
-                    None)
-                if callable(with_cache_namespace):
-                    return with_cache_namespace(
-                        prev_block=prev_block,
-                        block_token_ids=block_token_ids,
-                        cache_namespace=self._cache_namespace)
-
-        # Fallback: keep behavior identical when no namespace-aware allocator
-        # is available.
-        return self._allocator.allocate_immutable_blocks(
-            prev_block,
-            block_token_ids=block_token_ids,
-            device=device,
-            extra_hash=extra_hash)
 
     def _get_all_token_ids(self) -> List[int]:
         # NOTE: This function is O(seq_len); use sparingly.

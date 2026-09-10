@@ -3,7 +3,6 @@
 import argparse
 import dataclasses
 import json
-import os
 import threading
 from dataclasses import dataclass
 from typing import (TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional,
@@ -116,13 +115,8 @@ class EngineArgs:
     # number of P/D disaggregation (or other disaggregation) workers
     pipeline_parallel_size: int = 1
     tensor_parallel_size: int = 1
-    data_parallel_size: int = int(os.environ.get("VLLM_DATA_PARALLEL_SIZE", "1"))
-    # [PR #2269] EP support: enable expert parallelism for MoE models.
-    enable_expert_parallel: bool = bool(int(os.environ.get(
-        "VLLM_ENABLE_EXPERT_PARALLEL", "0")))
-    all2all_backend: str = os.environ.get(
-        "VLLM_ALL2ALL_BACKEND", "allgather_reducescatter")
-    enable_eplb: bool = bool(int(os.environ.get("VLLM_ENABLE_EPLB", "0")))
+    data_parallel_size: int = 1
+    enable_expert_parallel: bool = False
     max_parallel_loading_workers: Optional[int] = None
     block_size: Optional[int] = None
     enable_prefix_caching: Optional[bool] = None
@@ -1013,14 +1007,8 @@ class EngineArgs:
     def from_cli_args(cls, args: argparse.Namespace):
         # Get the list of attributes of this dataclass.
         attrs = [attr.name for attr in dataclasses.fields(cls)]
-        # Fields that exist in the dataclass but have no corresponding CLI
-        # argument (e.g. data_parallel_size, enable_expert_parallel) will
-        # fall back to their dataclass defaults (typically read from env vars).
-        engine_args = cls(**{
-            attr: getattr(args, attr)
-            for attr in attrs
-            if hasattr(args, attr)
-        })
+        # Set the attributes from the parsed arguments.
+        engine_args = cls(**{attr: getattr(args, attr) for attr in attrs})
         return engine_args
 
     def create_model_config(self) -> ModelConfig:
@@ -1204,10 +1192,8 @@ class EngineArgs:
             num_virtual_engine=self.pipeline_parallel_size,
             data_parallel_size=self.data_parallel_size,
             enable_expert_parallel=self.enable_expert_parallel,
-            all2all_backend=self.all2all_backend,
-            enable_eplb=self.enable_eplb,
             max_parallel_loading_workers=self.max_parallel_loading_workers,
-            disable_custom_all_reduce=True,
+            disable_custom_all_reduce=True,  # BI100: forced — corex NCCL
             tokenizer_pool_config=TokenizerPoolConfig.create_config(
                 self.tokenizer_pool_size,
                 self.tokenizer_pool_type,
@@ -1581,8 +1567,10 @@ class EngineArgs:
                         and not self.enable_lora
                         and not self.enable_prompt_adapter
                         and model_config.runner_type != "pooling"):
-                    pass  # skip auto-enable: Q-tiling in _run_sdpa_fallback
-                          # handles long-context memory without chunked prefill
+                    pass  # BI100: skip auto-enable — Q-tiling in
+                          # _run_sdpa_fallback handles long-context memory
+                          # without chunked prefill, and auto-enabling it
+                          # would break pooling models and xformers fallback
 
             if self.enable_chunked_prefill is None:
                 self.enable_chunked_prefill = False
@@ -1594,14 +1582,20 @@ class EngineArgs:
                 "in low performance due to small KV cache size. Consider "
                 "setting --max-model-len to a smaller value.", max_model_len)
         elif (self.enable_chunked_prefill
-              and model_config.runner_type == "pooling"):
-            msg = "Chunked prefill is not supported for pooling models"
-            raise ValueError(msg)
+              and getattr(model_config, 'runner_type', None) == "pooling"):
+            # BI100: downgrade from hard error to warning + auto-disable.
+            # The launch_service may pass --enable-chunked-prefill globally
+            # but some models resolve to pooling runner_type.
+            logger.warning(
+                "Chunked prefill is not supported for pooling models. "
+                "Disabling chunked prefill automatically.")
+            self.enable_chunked_prefill = False
 
         # if using prefix caching, we must set a hash algo
         if self.enable_prefix_caching:
-            # Keeping prefix caching enabled for the Qwen3.6 BI100 deploy.
-            # The scheduler's GDN digest already handles non-text tokens.
+            # BI100: keep prefix caching enabled for multimodal models.
+            # The scheduler's GDN digest already handles non-text tokens
+            # correctly for Qwen3.6 on BI100.
             if model_config.is_multimodal_model:
                 pass
 

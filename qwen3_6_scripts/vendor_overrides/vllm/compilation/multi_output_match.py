@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-from __future__ import annotations
 
 import abc
 import operator
@@ -7,6 +6,9 @@ from abc import abstractmethod
 from typing import Iterable, List, Tuple
 
 from torch import fx
+from torch._higher_order_ops.auto_functionalize import auto_functionalized
+from torch._inductor import pattern_matcher as pm
+from torch._ops import OpOverload
 from torch.fx import Node
 
 from vllm.compilation.fx_utils import find_auto_fn
@@ -102,7 +104,5 @@ class MultiOutputMatch(abc.ABC):
         """
         Insert an auto_functionalized node with the given op and kwargs.
         """
-        from torch._higher_order_ops.auto_functionalize import \
-            auto_functionalized
         return self.graph.call_function(auto_functionalized, (op, ),
                                         kwargs=kwargs)

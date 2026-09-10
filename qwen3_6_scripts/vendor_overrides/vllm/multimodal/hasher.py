@@ -6,11 +6,7 @@ from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import torch
-try:
-    from blake3 import blake3 as _hash_factory
-except ImportError:
-    import hashlib
-    _hash_factory = hashlib.sha256
+from blake3 import blake3
 from PIL import Image
 
 from vllm.logger import init_logger
@@ -72,7 +68,7 @@ class MultiModalHasher:
 
     @classmethod
     def hash_kwargs(cls, **kwargs: object) -> str:
-        hasher = _hash_factory()
+        hasher = blake3()
 
         for k, v in kwargs.items():
             for k_bytes, v_bytes in cls.item_to_bytes(k, v):

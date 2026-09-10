@@ -4,12 +4,8 @@ import operator
 from typing import Iterable, Optional
 
 from torch import fx
-
-
-def _get_auto_functionalized():
-    from torch._higher_order_ops.auto_functionalize import \
-        auto_functionalized
-    return auto_functionalized
+from torch._higher_order_ops.auto_functionalize import auto_functionalized
+from torch._ops import OpOverload
 
 
 def is_func(node: fx.Node, target) -> bool:
@@ -17,16 +13,16 @@ def is_func(node: fx.Node, target) -> bool:
 
 
 # Returns the first auto_functionalized node with the given op (if it exists)
-def find_auto_fn_maybe(nodes, op) -> "Optional[fx.Node]":
-    auto_fn = _get_auto_functionalized()
+def find_auto_fn_maybe(nodes: Iterable[fx.Node],
+                       op: OpOverload) -> Optional[fx.Node]:
     for node in nodes:
-        if is_func(node, auto_fn) and node.args[0] == op:  # noqa
+        if is_func(node, auto_functionalized) and node.args[0] == op:  # noqa
             return node
     return None
 
 
 # Returns the first auto_functionalized node with the given op
-def find_auto_fn(nodes, op) -> fx.Node:
+def find_auto_fn(nodes: Iterable[fx.Node], op: OpOverload) -> fx.Node:
     node = find_auto_fn_maybe(nodes, op)
     assert node is not None, f"Could not find {op} in nodes {nodes}"
     return node

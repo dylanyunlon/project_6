@@ -2605,7 +2605,9 @@ def sha256(input) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Backward-compat shims for system files that still use old vllm.utils APIs.
+# Backward-compat shims for base-image files (vllm 0.6.3) that are NOT
+# overridden by patch_ops.sh but still import these names from vllm.utils.
+# e.g. attention/selector.py, worker/cpu_worker.py, etc.
 # New code should use vllm.platforms directly.
 # ---------------------------------------------------------------------------
 def is_hip() -> bool:

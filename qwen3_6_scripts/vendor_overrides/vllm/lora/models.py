@@ -30,12 +30,7 @@ from vllm.lora.utils import (from_layer, from_layer_logits_processor,
                              is_regex_target_modules,
                              parse_fine_tuned_lora_name, replace_submodule)
 from vllm.model_executor.models import SupportsLoRA, supports_multimodal
-try:
-    from vllm.model_executor.models.interfaces import is_pooling_model
-except ImportError:
-    # Older vendor images may not expose is_pooling_model yet (task 19/20).
-    def is_pooling_model(_model) -> bool:  # type: ignore[misc]
-        return False
+from vllm.model_executor.models.interfaces import is_pooling_model
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.utils import PPMissingLayer, WeightsMapper
 from vllm.utils import is_pin_memory_available

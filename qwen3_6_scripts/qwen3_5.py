@@ -89,14 +89,11 @@ from vllm.model_executor.models.qwen2_vl import (Qwen2VisionAttention,
                                                  Qwen2VisionRotaryEmbedding)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.inputs import INPUT_REGISTRY, InputContext, LLMInputs
+from vllm.inputs import INPUT_REGISTRY, InputContext, TokenInputs as LLMInputs
 from vllm.multimodal import (MULTIMODAL_REGISTRY, MultiModalDataDict,
-                             MultiModalInputs)
-from vllm.multimodal.base import MultiModalData
+                             MultiModalKwargs as MultiModalInputs)
 from vllm.sequence import IntermediateTensors, SequenceData
 from vllm.transformers_utils.tokenizer import get_tokenizer
-from vllm.worker.model_runner import (_BATCH_SIZES_TO_CAPTURE,
-                                      _get_graph_batch_size)
 from vllm.logger import init_logger
 from vllm.bi100_env import env_bool, env_int
 from vllm.bi100_profile import (bi100_profile_event_enabled,
@@ -819,7 +816,7 @@ def _qwen36_image_token_count(image, image_processor) -> int:
 
 def qwen36_image_input_mapper(
     ctx: InputContext,
-    data: MultiModalData[object],
+    data: object,
 ) -> MultiModalInputs:
     if isinstance(data, dict):
         return MultiModalInputs({
@@ -2772,10 +2769,9 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
             _bi100_model_trace("first model forward entered")
         if self.mamba_cache is None:
             if self.scheduler_config is not None:
-                max_batch_size = _get_graph_batch_size(
-                    self.scheduler_config.max_num_seqs)
+                max_batch_size = self.scheduler_config.max_num_seqs
             else:
-                max_batch_size = max(_BATCH_SIZES_TO_CAPTURE) + 2
+                max_batch_size = 256
             self.mamba_cache = MambaCacheManager(
                 torch.float32,
                 self.num_linear_layers,

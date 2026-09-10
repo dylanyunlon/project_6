@@ -4,6 +4,7 @@ import operator
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
+from torch._higher_order_ops.auto_functionalize import auto_functionalized
 
 from vllm.logger import init_logger
 
@@ -23,8 +24,6 @@ class FixFunctionalizationPass(VllmInductorPass):
     """
 
     def __call__(self, graph: torch.fx.Graph):
-        from torch._higher_order_ops.auto_functionalize import \
-            auto_functionalized
         self.begin()
         self.dump_graph(graph, "before_fix_functionalization")
 
@@ -168,8 +167,6 @@ class FixFunctionalizationPass(VllmInductorPass):
         :param args: If we cannot use kwargs, specify args directly.
         If an arg is a string, `node.kwargs[arg]` is used.
         """  # noqa: E501
-        from torch._higher_order_ops.auto_functionalize import \
-            auto_functionalized
         assert is_func(node, auto_functionalized), \
             f"node must be auto-functionalized, is {node} instead"
 

@@ -245,6 +245,8 @@ build_stage "installing vLLM Qwen3.6 model implementation"
 cp ./mamba_cache.py "${VLLM_ROOT}/model_executor/models/"
 cp ./qwen3_5.py "${VLLM_ROOT}/model_executor/models/qwen3_5.py"
 cp ./registry.py "${VLLM_ROOT}/model_executor/models/registry.py"
+cp ./interfaces.py "${VLLM_ROOT}/model_executor/models/interfaces.py"
+cp ./interfaces_base.py "${VLLM_ROOT}/model_executor/models/interfaces_base.py"
 
 # --- sequence.py: fix completion_tokens inflation under chunked prefill ------
 # Bug: get_output_token_ids_to_return(delta=True) with num_new_tokens=0

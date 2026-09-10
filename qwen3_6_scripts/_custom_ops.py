@@ -494,6 +494,16 @@ def cutlass_scaled_mm_supports_fp8(cuda_device_capability: int) -> bool:
     return True
 
 
+def cutlass_scaled_mm_supports_block_fp8(cuda_device_capability: int) -> bool:
+    # BI100 does not support block-scaled FP8 CUTLASS kernels
+    return False
+
+
+def cutlass_group_gemm_supported(cuda_device_capability: int) -> bool:
+    # BI100 does not support CUTLASS group GEMM
+    return False
+
+
 def cutlass_scaled_mm(a: torch.Tensor,
                       b: torch.Tensor,
                       scale_a: torch.Tensor,

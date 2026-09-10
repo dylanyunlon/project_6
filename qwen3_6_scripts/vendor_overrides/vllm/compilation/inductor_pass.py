@@ -12,11 +12,7 @@ from packaging.version import Version
 from torch import fx
 
 if Version(importlib.metadata.version('torch')) >= Version("2.6"):
-    try:
-        from torch._inductor.custom_graph_pass import CustomGraphPass
-    except ImportError:
-        from .torch25_custom_graph_pass import (  # noqa: yapf
-            Torch25CustomGraphPass as CustomGraphPass)
+    from torch._inductor.custom_graph_pass import CustomGraphPass
 else:
     # CustomGraphPass is not present in 2.5 or lower, import our version
     from .torch25_custom_graph_pass import (  # noqa: yapf

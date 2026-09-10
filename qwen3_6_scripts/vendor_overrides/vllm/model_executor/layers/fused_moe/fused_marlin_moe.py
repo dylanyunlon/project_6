@@ -9,10 +9,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
     fused_topk, moe_align_block_size, try_get_optimal_moe_config)
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
-try:
-    from vllm.utils import direct_register_custom_op
-except ImportError:
-    direct_register_custom_op = None
+from vllm.utils import direct_register_custom_op
 
 
 def get_scalar_type(num_bits: int, has_zp: bool):
@@ -139,13 +136,12 @@ def single_marlin_moe_fake(
     return torch.empty_like(hidden_states)
 
 
-if direct_register_custom_op is not None:
-    direct_register_custom_op(
-        op_name="single_marlin_moe",
-        op_func=single_marlin_moe,
-        mutates_args=[],
-        fake_impl=single_marlin_moe_fake,
-    )
+direct_register_custom_op(
+    op_name="single_marlin_moe",
+    op_func=single_marlin_moe,
+    mutates_args=[],
+    fake_impl=single_marlin_moe_fake,
+)
 
 
 def fused_marlin_moe(
@@ -357,10 +353,9 @@ def fused_marlin_moe_fake(
     return torch.empty_like(hidden_states)
 
 
-if direct_register_custom_op is not None:
-    direct_register_custom_op(
-        op_name="fused_marlin_moe",
-        op_func=fused_marlin_moe,
-        mutates_args=[],
-        fake_impl=fused_marlin_moe_fake,
-    )
+direct_register_custom_op(
+    op_name="fused_marlin_moe",
+    op_func=fused_marlin_moe,
+    mutates_args=[],
+    fake_impl=fused_marlin_moe_fake,
+)

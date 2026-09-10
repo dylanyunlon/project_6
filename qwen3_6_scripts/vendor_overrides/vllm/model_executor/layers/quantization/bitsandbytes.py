@@ -9,10 +9,7 @@ from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
                                                set_weight_attrs)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
-try:
-    from vllm.utils import direct_register_custom_op
-except ImportError:
-    direct_register_custom_op = None
+from vllm.utils import direct_register_custom_op
 
 
 class BitsAndBytesConfig(QuantizationConfig):
@@ -386,17 +383,14 @@ def _apply_bnb_4bit_fake(
     return
 
 
-if direct_register_custom_op is not None:
-    try:
-        direct_register_custom_op(
-            op_name="apply_bnb_4bit",
-            op_func=_apply_bnb_4bit,
-            mutates_args=["out"],
-            fake_impl=_apply_bnb_4bit_fake,
-        )
-        apply_bnb_4bit = torch.ops.vllm.apply_bnb_4bit
-    except AttributeError as error:
-        raise error
-else:
-    # Fallback: direct call without torch.compile custom op registration
-    apply_bnb_4bit = _apply_bnb_4bit
+try:
+    direct_register_custom_op(
+        op_name="apply_bnb_4bit",
+        op_func=_apply_bnb_4bit,
+        mutates_args=["out"],
+        fake_impl=_apply_bnb_4bit_fake,
+    )
+    apply_bnb_4bit = None
+
+except AttributeError as error:
+    raise error

@@ -1,6 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# BI100-DP adapted multiprocessing distributed executor
-# Based on new vllm mp_distributed_executor.py + BI100 data-parallel support
 
 import asyncio
 import os
@@ -23,27 +21,22 @@ from vllm.worker.worker_base import WorkerWrapperBase
 logger = init_logger(__name__)
 
 
-def _bi100_startup_debug(message: str, *args) -> None:
-    if os.getenv("BI100_EXECUTOR_STARTUP_DEBUG") == "1":
-        logger.info("[BI100 startup] " + message, *args)
-
-
-print("=================patch_ok: mp_distributed_executor.py loaded===========")
-
-
 class MultiprocessingDistributedExecutor(DistributedExecutorBase):
-    """Python multiprocessing-based distributed executor with BI100-DP support"""
+    """Python multiprocessing-based distributed executor"""
 
     uses_ray: bool = False
 
     def _check_cuda(self) -> None:
         """Check that the number of GPUs is sufficient for the parallel
-        configuration."""
+        configuration. Separate from _init_executor to reduce the number of
+        indented blocks.
+        """
         parallel_config = self.parallel_config
         world_size = parallel_config.world_size
         tensor_parallel_size = parallel_config.tensor_parallel_size
 
         cuda_device_count = cuda_device_count_stateless()
+        # Use confusing message for more common TP-only case.
         if tensor_parallel_size > cuda_device_count:
             raise RuntimeError(
                 f"please set tensor_parallel_size ({tensor_parallel_size}) "
@@ -69,8 +62,6 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
         # Create the parallel GPU workers.
         world_size = self.parallel_config.world_size
         tensor_parallel_size = self.parallel_config.tensor_parallel_size
-        data_parallel_size = getattr(self.parallel_config,
-                                     'data_parallel_size', 1)
 
         # Set multiprocessing envs that are common to V0 and V1
         set_multiprocessing_worker_envs(self.parallel_config)
@@ -91,12 +82,6 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
         # broadcasted to.
         self.non_driver_workers: List[ProcessWorkerWrapper] = []
 
-        # [BI100-DP] Track DP group driver workers for request dispatching.
-        # Layout: [dp0_tp0, dp0_tp1, ..., dp1_tp0, dp1_tp1, ...]
-        # DP driver = rank 0 of each DP group (i.e. rank % tp_size == 0)
-        self.dp_driver_workers: List[ProcessWorkerWrapper] = []
-        self.data_parallel_size = data_parallel_size
-
         if world_size == 1:
             self.worker_monitor = None
         else:
@@ -108,9 +93,6 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
                 self.workers.append(worker)
                 if rank % tensor_parallel_size == 0:
                     self.tp_driver_workers.append(worker)
-                    # [BI100-DP] This is a DP group driver (dp_rank > 0)
-                    if data_parallel_size > 1:
-                        self.dp_driver_workers.append(worker)
                 else:
                     self.non_driver_workers.append(worker)
 
@@ -118,19 +100,10 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
             result_handler.start()
             self.worker_monitor.start()
 
-        if data_parallel_size > 1:
-            logger.info(
-                "[BI100-DP] Data parallel enabled: dp=%d tp=%d "
-                "world_size=%d dp_drivers=%d",
-                data_parallel_size, tensor_parallel_size, world_size,
-                len(self.dp_driver_workers) + 1)  # +1 for rank 0 driver
-
         # Set up signal handlers to shutdown the executor cleanly
         # sometimes gc does not work well
 
-        _bi100_startup_debug("creating driver worker")
         self.driver_worker = WorkerWrapperBase(self.vllm_config, 0)
-        _bi100_startup_debug("created driver worker")
 
         all_kwargs = []
         distributed_init_method = get_distributed_init_method(
@@ -147,17 +120,11 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
                 or (rank % self.parallel_config.tensor_parallel_size == 0),
             )
             all_kwargs.append(kwargs)
-        _bi100_startup_debug("starting init_worker")
         self._run_workers("init_worker", all_kwargs)
-        _bi100_startup_debug("finished init_worker")
-        _bi100_startup_debug("starting init_device")
         self._run_workers("init_device")
-        _bi100_startup_debug("finished init_device")
-        _bi100_startup_debug("starting load_model")
         self._run_workers("load_model",
                           max_concurrent_workers=self.parallel_config.
                           max_parallel_loading_workers)
-        _bi100_startup_debug("finished load_model")
         self.driver_exec_model = make_async(self.driver_worker.execute_model)
         self.pp_locks: Optional[List[asyncio.Lock]] = None
 
@@ -209,24 +176,16 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
                 for worker in self.non_driver_workers
             ]
 
-        _bi100_startup_debug("enqueue remote method=%s workers=%d",
-                              sent_method if isinstance(sent_method, str)
-                              else "<callable>",
-                              len(self.workers))
         # Start all remote workers first.
         worker_outputs = [
             worker.execute_method(sent_method, *args, **kwargs)
             for worker in self.workers
         ]
-        _bi100_startup_debug("remote enqueued")
 
-        _bi100_startup_debug("driver start")
         driver_worker_output = run_method(self.driver_worker, sent_method,
                                           args, kwargs)
-        _bi100_startup_debug("driver done")
 
         # Get the results of the workers.
-        _bi100_startup_debug("waiting remote results")
         return [driver_worker_output
                 ] + [output.get() for output in worker_outputs]
 

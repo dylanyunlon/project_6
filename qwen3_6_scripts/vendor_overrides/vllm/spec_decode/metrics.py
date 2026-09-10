@@ -46,11 +46,6 @@ class SpecDecodeWorkerMetrics(
     # The number of speculative tokens per sequence.
     num_spec_tokens: int
 
-    # [PR #2269] DP-aggregated acceptance rate across all DP replicas.
-    # When dp_size=1 (TC-04), this equals draft_acceptance_rate.
-    # When dp_size>1 (TC-01), this is the all-reduced average.
-    dp_aggregated_acceptance_rate: float = float("nan")
-
 
 Timer = Callable[[], float]
 

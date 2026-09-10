@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A GPU worker class - BI100 adapted."""
+"""A GPU worker class."""
 import gc
 import os
 from typing import Dict, List, Optional, Set, Tuple, Type, Union
@@ -50,9 +50,6 @@ except ImportError:
 logger = init_logger(__name__)
 
 
-print("=================patch_ok: vendor_overrides/worker.py loaded===========")
-
-
 class Worker(LocalOrDistributedWorkerBase):
     """A worker class that executes (a partition of) the model on a GPU.
 
@@ -89,8 +86,7 @@ class Worker(LocalOrDistributedWorkerBase):
             or (speculative_config.draft_model_config.hf_config.model_type ==
                 model_config.hf_config.model_type) \
             or (speculative_config.draft_model_config.hf_config.model_type
-                not in ("medusa", "mlp_speculator", "eagle",
-                        "deepseek_mtp")) \
+                not in ("medusa", "mlp_speculator", "eagle", "deepseek_mtp")) \
                     else {"return_hidden_states": True}
 
         ModelRunnerClass: Type[GPUModelRunnerBase] = ModelRunner
@@ -328,6 +324,8 @@ class Worker(LocalOrDistributedWorkerBase):
         return num_gpu_blocks, num_cpu_blocks
 
     def _assert_memory_footprint_increased_during_profiling(self):
+        # NOTE(woosuk): Here we assume that the other processes using the same
+        # GPU did not change their memory usage during the profiling.
         free_gpu_memory, total = torch.cuda.mem_get_info()
         cuda_memory = total - free_gpu_memory
         assert self.baseline_snapshot.cuda_memory < cuda_memory, (
@@ -419,7 +417,6 @@ class Worker(LocalOrDistributedWorkerBase):
     @property
     def kv_cache(self) -> Optional[List[List[torch.Tensor]]]:
         return self.gpu_cache
-
     @property
     def kv_cache_scale(self) -> Optional[List[List[torch.Tensor]]]:
         return self.gpu_cache_scale
@@ -458,7 +455,7 @@ class Worker(LocalOrDistributedWorkerBase):
     def execute_worker(self, worker_input: WorkerInput) -> None:
         virtual_engine = worker_input.virtual_engine
         # Issue cache operations.
-        # BI100 content-addressed CPU KV tier may preserve a victim and reuse
+        # BI100: content-addressed CPU KV tier may preserve a victim and reuse
         # that same GPU slot in one step. Complete every D2H before any H2D.
         if (worker_input.blocks_to_swap_out is not None
                 and worker_input.blocks_to_swap_out.numel() > 0):
@@ -587,22 +584,6 @@ def init_worker_distributed_environment(
 
     ensure_kv_transfer_initialized(vllm_config)
 
-    # NOTE: DP group is now created inside initialize_model_parallel()
-    # (called by ensure_model_parallel_initialized above) using
-    # config.parallel_config.data_parallel_size. Access via get_dp_group().
-
-    # [PR #2269] Initialize expert parallel process group.
-    if getattr(parallel_config, 'enable_expert_parallel', False):
-        import torch.distributed as dist
-        world_size = parallel_config.world_size
-        ep_ranks = list(range(world_size))
-        parallel_config._ep_group = dist.new_group(ep_ranks)
-        logger.info(
-            "[PR #2269] EP process group initialized: ep_size=%d, "
-            "all2all_backend=%s, rank=%d",
-            world_size, getattr(parallel_config, 'all2all_backend', 'nccl'),
-            rank)
-
 
 def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):
     # Check if the GPU supports the dtype.
@@ -625,8 +606,7 @@ def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):
 
 
 def raise_if_cache_size_invalid(num_gpu_blocks, block_size, is_attention_free,
-                                max_model_len,
-                                pipeline_parallel_size) -> None:
+                                max_model_len, pipeline_parallel_size) -> None:
     if is_attention_free and num_gpu_blocks != 0:
         raise ValueError("No memory should be allocated for the cache blocks "
                          f"for an attention-free model, but {num_gpu_blocks} "

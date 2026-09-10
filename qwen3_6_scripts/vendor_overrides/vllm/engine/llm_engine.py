@@ -16,7 +16,7 @@ import torch
 from typing_extensions import TypeVar, deprecated
 
 import vllm.envs as envs
-from vllm.config import (CacheConfig, DecodingConfig, LoRAConfig, ModelConfig,
+from vllm.config import (DecodingConfig, LoRAConfig, ModelConfig,
                          ObservabilityConfig, ParallelConfig, SchedulerConfig,
                          VllmConfig)
 from vllm.core.scheduler import ScheduledSequenceGroup, SchedulerOutputs
@@ -359,61 +359,14 @@ class LLMEngine:
                 self.vllm_config.scheduler_config.scheduler_cls)
         else:
             Scheduler = self.vllm_config.scheduler_config.scheduler_cls
-
-        #
-        # [BI100-DP] With dp > 1, create one scheduler per DP group.
-        # Each DP group independently schedules its assigned requests.
-        # For dp=1, this is identical to the original code (pp schedulers).
-        dp_size = self.parallel_config.data_parallel_size
-        num_virtual_engines = self.parallel_config.pipeline_parallel_size
-        self._dp_size = dp_size
-        self._dp_next = 0  # round-robin counter for request dispatch
-
-        if dp_size > 1:
-            # One scheduler per DP group.  Each DP group gets its own
-            # share of the GPU/CPU blocks.
-            # CacheConfig.__init__ expects swap_space in GiB (it multiplies
-            # internally by GiB_bytes), so convert back from bytes.
-            from vllm.utils import GiB_bytes
-            dp_cache_config = CacheConfig(
-                block_size=self.cache_config.block_size,
-                gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
-                swap_space=self.cache_config.swap_space_bytes / GiB_bytes,
-                cache_dtype=self.cache_config.cache_dtype,
-                num_gpu_blocks_override=None,
-                sliding_window=self.cache_config.sliding_window,
-                enable_prefix_caching=self.cache_config.enable_prefix_caching,
-                cpu_offload_gb=0,
-            )
-            # Split blocks evenly across DP groups
-            if self.cache_config.num_gpu_blocks:
-                dp_cache_config.num_gpu_blocks = (
-                    self.cache_config.num_gpu_blocks // dp_size)
-            if self.cache_config.num_cpu_blocks:
-                dp_cache_config.num_cpu_blocks = (
-                    self.cache_config.num_cpu_blocks // dp_size)
-
-            self.scheduler = [
-                Scheduler(
-                    self.scheduler_config, dp_cache_config, self.lora_config,
-                    num_virtual_engines,
-                    self.async_callbacks[v_id]
-                    if self.model_config.use_async_output_proc else None)
-                for v_id in range(dp_size)
-            ]
-            logger.info("[BI100-DP] Created %d schedulers (one per DP group), "
-                        "%d gpu_blocks each",
-                        dp_size,
-                        dp_cache_config.num_gpu_blocks)
-        else:
-            self.scheduler = [
-                Scheduler(
-                    self.scheduler_config, self.cache_config, self.lora_config,
-                    self.parallel_config.pipeline_parallel_size,
-                    self.async_callbacks[v_id]
-                    if self.model_config.use_async_output_proc else None)
-                for v_id in range(self.parallel_config.pipeline_parallel_size)
-            ]
+        self.scheduler = [
+            Scheduler(
+                self.scheduler_config, self.cache_config, self.lora_config,
+                self.parallel_config.pipeline_parallel_size,
+                self.async_callbacks[v_id]
+                if self.model_config.use_async_output_proc else None)
+            for v_id in range(self.parallel_config.pipeline_parallel_size)
+        ]
 
         # Metric Logging.
         if self.log_stats:
@@ -706,11 +659,6 @@ class LLMEngine:
         ]
         min_cost_scheduler = self.scheduler[costs.index(min(costs))]
         min_cost_scheduler.add_seq_group(seq_group)
-
-        # [BI100-DP] Advance round-robin counter so next request
-        # goes to a different DP group if costs are equal.
-        if self._dp_size > 1:
-            self._dp_next = (self._dp_next + 1) % self._dp_size
 
         return seq_group
 
