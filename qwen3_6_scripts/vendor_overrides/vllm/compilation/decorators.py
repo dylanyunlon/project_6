@@ -6,7 +6,10 @@ from unittest.mock import patch
 
 import torch
 import torch.nn as nn
-from torch._dynamo.symbolic_convert import InliningInstructionTranslator
+try:
+    from torch._dynamo.symbolic_convert import InliningInstructionTranslator
+except ImportError:
+    InliningInstructionTranslator = None
 
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.wrapper import TorchCompileWrapperWithCustomDispatcher
@@ -168,7 +171,7 @@ def _support_torch_compile(
         # torch.compiler.is_compiling() means we are inside the compilation
         # e.g. TPU has the compilation logic in model runner, so we don't
         # need to compile the model inside.
-        if self.do_not_compile or torch.compiler.is_compiling():
+        if self.do_not_compile or getattr(torch.compiler, 'is_compiling', lambda: False)():
             return self.forward(*args, **kwargs)
 
         # the first compilation needs to have dynamic shapes marked

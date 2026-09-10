@@ -55,7 +55,7 @@ if not hasattr(_qwen2_vl_image_processing, "make_batched_videos"):
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import (CacheConfig, LoRAConfig, MultiModalConfig,
-                         SchedulerConfig, VllmConfig)
+                         SchedulerConfig)
 from vllm.distributed import (get_tensor_model_parallel_rank,
                                get_tensor_model_parallel_world_size,
                                tensor_model_parallel_all_reduce)
@@ -255,6 +255,53 @@ from vllm.model_executor.models.interfaces import (HasInnerState, SupportsLoRA,
 logger = init_logger(__name__)
 
 _bi100_model_trace("qwen3_5 runtime imports complete")
+
+# ---------------------------------------------------------------------------
+# BI100 flash_attn compatibility patch
+# The corex flash_attn_cuda.varlen_fwd kernel has a different signature than
+# upstream flash_attn >= 2.5.  We monkey-patch flash_attn.flash_attn_interface
+# so that flash_attn_varlen_func works transparently on BI100.
+# ---------------------------------------------------------------------------
+_flash_attn_patched = False
+
+
+def _patch_flash_attn_varlen_for_bi100():
+    """Patch flash_attn for BI100 corex compatibility.
+
+    The BI100 corex flash_attn package adds three extra required parameters
+    to both ``_flash_attn_varlen_forward`` and ``flash_attn_varlen_func``:
+        use_alibi (bool), alibi_mode (int), imp_mode (int)
+    Upstream callers (e.g. qwen2_vl.py) don't pass these, so we wrap the
+    low-level ``_flash_attn_varlen_forward`` to supply defaults.
+    """
+    global _flash_attn_patched
+    if _flash_attn_patched:
+        return
+    _flash_attn_patched = True
+
+    import flash_attn.flash_attn_interface as _fai
+
+    _orig = _fai._flash_attn_varlen_forward
+
+    def _compat_flash_attn_varlen_forward(
+        q, k, v, cu_seqlens_q, cu_seqlens_k,
+        max_seqlen_q, max_seqlen_k,
+        dropout_p, softmax_scale, causal,
+        window_size=(-1, -1), alibi_slopes=None,
+        return_softmax=False,
+        use_alibi=False, alibi_mode=1, imp_mode=0,
+    ):
+        return _orig(
+            q, k, v, cu_seqlens_q, cu_seqlens_k,
+            max_seqlen_q, max_seqlen_k,
+            dropout_p, softmax_scale, causal,
+            window_size, alibi_slopes, return_softmax,
+            use_alibi, alibi_mode, imp_mode,
+        )
+
+    _fai._flash_attn_varlen_forward = _compat_flash_attn_varlen_forward
+    logger.info("BI100: patched _flash_attn_varlen_forward — "
+                "added use_alibi/alibi_mode/imp_mode defaults")
 
 _ALLOW_GDN_NAN_ZERO = env_bool("BI100_GDN_ALLOW_NAN_ZERO", False)
 _GDN_FINITE_CHECK = (env_bool("BI100_GDN_FINITE_CHECK", False)
@@ -641,14 +688,24 @@ class Qwen3_5VisionBlock(nn.Module):
             projection_size=dim,
             quant_config=quant_config,
         )
+        # BI100: keep FLASH_ATTN backend but patch flash_attn_cuda.varlen_fwd
+        # to be compatible with the corex kernel signature.
+        from vllm.platforms import _Backend as _Bk
+        if hasattr(self.attn, 'attn_backend'):
+            self.attn.attn_backend = _Bk.FLASH_ATTN
+            _patch_flash_attn_varlen_for_bi100()
         self.mlp = Qwen3_5VisionMLP(vision_config, quant_config)
 
     def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor,
-                rotary_pos_emb: torch.Tensor) -> torch.Tensor:
+                rotary_pos_emb: torch.Tensor,
+                max_seqlen: Optional[int] = None,
+                seqlens: Optional[list] = None) -> torch.Tensor:
         x = x + self.attn(
             self.norm1(x),
             cu_seqlens=cu_seqlens,
             rotary_pos_emb=rotary_pos_emb,
+            max_seqlen=max_seqlen,
+            seqlens=seqlens,
         )
         return x + self.mlp(self.norm2(x))
 
@@ -745,8 +802,12 @@ class Qwen3_5VisionTransformer(nn.Module):
         ).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
         x = x.unsqueeze(1)
+        # Pre-compute seqlens for xformers attn mask
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
         for block in self.blocks:
-            x = block(x, cu_seqlens, rotary_pos_emb)
+            x = block(x, cu_seqlens, rotary_pos_emb,
+                      max_seqlen=max_seqlen, seqlens=seqlens)
         return self.merger(x)
 
 
@@ -844,6 +905,7 @@ def dummy_data_for_qwen36(
     ctx: InputContext,
     seq_len: int,
     mm_counts: Mapping[str, int],
+    **kwargs,
 ) -> "DummyData":
     from vllm.inputs.registry import DummyData
     num_images = mm_counts.get("image", 0)
@@ -2587,16 +2649,26 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
 
     def __init__(
         self,
-        vllm_config: VllmConfig,
+        config=None,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        lora_config: Optional[LoRAConfig] = None,
+        scheduler_config: Optional[SchedulerConfig] = None,
+        multimodal_config: Optional[MultiModalConfig] = None,
         prefix: str = "",
+        vllm_config=None,
+        **kwargs,
     ) -> None:
-        config = vllm_config.model_config.hf_config
-        cache_config = vllm_config.cache_config
-        quant_config = vllm_config.quant_config
-        lora_config = vllm_config.lora_config
-        scheduler_config = vllm_config.scheduler_config
-        multimodal_config = getattr(vllm_config.model_config,
-                                    'multimodal_config', None)
+        # BI100: support both new-style (vllm_config=) and old-style init
+        if vllm_config is not None:
+            config = config or vllm_config.model_config.hf_config
+            cache_config = cache_config or vllm_config.cache_config
+            quant_config = quant_config or getattr(vllm_config, 'quant_config', None)
+            lora_config = lora_config or getattr(vllm_config, 'lora_config', None)
+            scheduler_config = scheduler_config or vllm_config.scheduler_config
+            multimodal_config = multimodal_config or getattr(
+                vllm_config, 'multimodal_config',
+                getattr(vllm_config.model_config, 'multimodal_config', None))
         # Apply ix_bridge operator patches on first model init (safe: GPU is ready)
         try:
             from vllm import ix_startup_patch
@@ -2605,8 +2677,8 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
             pass
         _bi100_model_trace("Qwen3_5ForCausalLM initialization begin")
         super().__init__()
+        self._vllm_config = vllm_config  # kept for new-style MambaCacheManager
         self.config = config
-        self.vllm_config = vllm_config
         self.scheduler_config = scheduler_config
         self.multimodal_config = multimodal_config
 
@@ -2773,23 +2845,45 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
             self._startup_forward_traced = True
             _bi100_model_trace("first model forward entered")
         if self.mamba_cache is None:
-            self.mamba_cache = MambaCacheManager(
-                self.vllm_config,
-                torch.float32,
-                self.num_linear_layers,
-                *self._get_mamba_cache_shape(),
-            )
+            conv_shape, temporal_shape = self._get_mamba_cache_shape()
+            # New-style MambaCacheManager takes (vllm_config, dtype,
+            # num_mamba_layers, conv_state_shape, temporal_state_shape)
+            import inspect as _inspect
+            _mcm_params = list(
+                _inspect.signature(MambaCacheManager.__init__).parameters)
+            if "vllm_config" in _mcm_params:
+                self.mamba_cache = MambaCacheManager(
+                    self._vllm_config,
+                    torch.float32,
+                    self.num_linear_layers,
+                    conv_shape,
+                    temporal_shape,
+                )
+            else:
+                if self.scheduler_config is not None:
+                    max_batch_size = self.scheduler_config.max_num_seqs
+                else:
+                    max_batch_size = 256
+                self.mamba_cache = MambaCacheManager(
+                    torch.float32,
+                    self.num_linear_layers,
+                    max_batch_size,
+                    *self._get_mamba_cache_shape(),
+                )
 
         gdn_restore_key = kwargs.pop("gdn_restore_key", None)
         gdn_capture_points = kwargs.pop("gdn_capture_points", None) or []
         gdn_evict_keys = kwargs.pop("gdn_evict_keys", None) or []
         gdn_segment_offsets = kwargs.pop("gdn_segment_offsets", None) or []
 
-        mamba_params = self.mamba_cache.current_run_tensors(**kwargs)
-        # conv_states:     (num_linear_layers, batch, local_conv_dim, kernel-1)
-        # temporal_states: (num_linear_layers, batch, local_num_v, k_dim, v_dim)
-        conv_states = mamba_params.conv_state
-        temporal_states = mamba_params.ssm_state
+        mamba_cache_params = self.mamba_cache.current_run_tensors(**kwargs)
+        # New API returns MambaCacheParams with .conv_state, .ssm_state,
+        # .state_indices_tensor; old API returned (conv_states, temporal_states)
+        if hasattr(mamba_cache_params, 'conv_state'):
+            conv_states = mamba_cache_params.conv_state
+            temporal_states = mamba_cache_params.ssm_state
+        else:
+            conv_states, temporal_states = mamba_cache_params
 
         _is_single_seq_prefill = (
             attn_metadata is not None

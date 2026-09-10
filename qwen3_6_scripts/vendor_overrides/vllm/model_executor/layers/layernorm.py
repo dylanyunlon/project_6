@@ -269,7 +269,7 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if torch.compiler.is_compiling():
+        if getattr(torch.compiler, 'is_compiling', lambda: False)():
             return self.forward_native(x, residual)
 
         if not getattr(self, "_is_compiled", False):

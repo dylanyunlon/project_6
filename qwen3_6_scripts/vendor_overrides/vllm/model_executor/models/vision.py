@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import Final, Generic, Optional, Protocol, TypeVar, Union, cast
@@ -92,21 +93,45 @@ def get_vit_attn_backend(support_fa: bool = False) -> _Backend:
             selected_backend = backend_name_to_enum(backend_by_env_var)
     if selected_backend is None:
         if current_platform.is_cuda():
-            device_available = current_platform.has_device_capability(80)
-            if device_available and support_fa:
-                from transformers.utils import is_flash_attn_2_available
-                if is_flash_attn_2_available():
-                    selected_backend = _Backend.FLASH_ATTN
-                else:
-                    logger.warning_once(
-                        "Current `vllm-flash-attn` has a bug inside vision "
-                        "module, so we use xformers backend instead. You can "
-                        "run `pip install flash-attn` to use flash-attention "
-                        "backend.")
-                    selected_backend = _Backend.XFORMERS
-            else:
-                # For Volta and Turing GPUs, use xformers instead.
+            # BI100: flash_attn_cuda.varlen_fwd has an incompatible signature
+            # with upstream flash_attn_varlen_func (fewer kwargs).  Force
+            # xformers for the ViT so we never hit the varlen_fwd mismatch.
+            # Detect via corex path, env var, or direct signature probe.
+            _is_bi100 = (
+                os.path.isdir("/usr/local/corex") or
+                os.environ.get("COREX_HOME", "") != "" or
+                "corex" in os.environ.get("LD_LIBRARY_PATH", "").lower()
+            )
+            if not _is_bi100:
+                # Final check: probe flash_attn_cuda.varlen_fwd signature
+                try:
+                    import inspect
+                    import flash_attn.flash_attn_interface as _fai
+                    _sig = inspect.signature(_fai._flash_attn_varlen_forward)
+                    if len(_sig.parameters) < 22:
+                        _is_bi100 = True
+                except Exception:
+                    pass
+            if _is_bi100:
+                logger.info("BI100 detected — using XFORMERS for ViT attn "
+                            "(flash_attn varlen_fwd signature mismatch)")
                 selected_backend = _Backend.XFORMERS
+            else:
+                device_available = current_platform.has_device_capability(80)
+                if device_available and support_fa:
+                    from transformers.utils import is_flash_attn_2_available
+                    if is_flash_attn_2_available():
+                        selected_backend = _Backend.FLASH_ATTN
+                    else:
+                        logger.warning_once(
+                            "Current `vllm-flash-attn` has a bug inside vision "
+                            "module, so we use xformers backend instead. You "
+                            "can run `pip install flash-attn` to use "
+                            "flash-attention backend.")
+                        selected_backend = _Backend.XFORMERS
+                else:
+                    # For Volta and Turing GPUs, use xformers instead.
+                    selected_backend = _Backend.XFORMERS
         else:
             # Default to torch SDPA for other non-GPU platforms.
             selected_backend = _Backend.TORCH_SDPA
