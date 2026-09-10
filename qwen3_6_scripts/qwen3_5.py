@@ -844,7 +844,8 @@ def dummy_data_for_qwen36(
     ctx: InputContext,
     seq_len: int,
     mm_counts: Mapping[str, int],
-) -> Tuple[SequenceData, Optional[MultiModalDataDict]]:
+) -> "DummyData":
+    from vllm.inputs.registry import DummyData
     num_images = mm_counts.get("image", 0)
     image_tokens = _MAX_IMAGE_TOKENS * num_images
     if seq_len < image_tokens + 2:
@@ -852,17 +853,18 @@ def dummy_data_for_qwen36(
             f"Qwen3.6 needs {image_tokens + 2} tokens for {num_images} "
             f"max-size image(s), but max_model_len is {seq_len}")
     config = ctx.model_config.hf_config
-    seq_data = SequenceData.from_token_counts(
+    seq_data = SequenceData.from_prompt_token_counts(
         (config.vision_start_token_id, 1),
         (config.image_token_id, image_tokens),
         (config.vision_end_token_id, 1),
         (0, seq_len - image_tokens - 2),
     )
     dummy_image = Image.new("RGB", (1280, 1024), color=0)
-    return seq_data, {
+    mm_data = {
         "image": (dummy_image if num_images == 1
                   else [dummy_image] * num_images)
     }
+    return DummyData(seq_data=seq_data, multi_modal_data=mm_data)
 
 
 def input_processor_for_qwen36(ctx: InputContext,

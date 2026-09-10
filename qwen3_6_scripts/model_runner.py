@@ -47,7 +47,8 @@ from vllm.prompt_adapter.worker_manager import (
     LRUCacheWorkerPromptAdapterManager)
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors, SequenceGroupMetadata
-from vllm.utils import (DeviceMemoryProfiler, PyObjectCache, async_tensor_h2d,
+from vllm.utils import (DeviceMemoryProfiler, LayerBlockType, PyObjectCache,
+                        async_tensor_h2d,
                         flatten_2d_lists, is_hip, is_pin_memory_available,
                         supports_dynamo)
 from vllm.worker.model_runner_base import (
@@ -1326,10 +1327,12 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                        (group_id < max_num_batched_tokens % max_num_seqs))
             batch_size += seq_len
 
-            seq_data, dummy_multi_modal_data = self.input_registry \
+            dummy_data = self.input_registry \
                 .dummy_data_for_profiling(self.model_config,
                                           seq_len,
                                           self.mm_registry)
+            seq_data = dummy_data.seq_data
+            dummy_multi_modal_data = dummy_data.multi_modal_data
 
             seq = SequenceGroupMetadata(
                 request_id=str(group_id),
