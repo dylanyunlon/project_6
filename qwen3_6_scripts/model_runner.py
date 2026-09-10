@@ -511,7 +511,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             context_len = seq_data.get_num_computed_tokens()
             seq_len = min(seq_len, context_len + token_chunk_size)
         elif self.runner.scheduler_config.is_multi_step or \
-            self.runner.model_config.is_encoder_decoder_model:
+            self.runner.model_config.is_encoder_decoder:
             context_len = seq_len - 1
         else:
             context_len = seq_data.get_num_computed_tokens()
@@ -722,14 +722,10 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                 mrope_input_positions, mrope_position_delta = \
                     MRotaryEmbedding.get_input_positions(
                         token_ids,
+                        hf_config=hf_config,
                         image_grid_thw=image_grid_thw,
                         video_grid_thw=video_grid_thw,
-                        image_token_id=hf_config.image_token_id,
-                        video_token_id=hf_config.video_token_id,
-                        vision_start_token_id=hf_config.vision_start_token_id,
-                        vision_end_token_id=hf_config.vision_end_token_id,
-                        spatial_merge_size=hf_config.vision_config.
-                        spatial_merge_size,
+                        second_per_grid_ts=None,
                         context_len=0,
                     )
                 mrope_input_positions = _slice_mrope_positions(
@@ -741,6 +737,11 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                 seq_data.mrope_position_delta = mrope_position_delta
                 inter_data.mrope_input_positions[
                     seq_idx] = mrope_input_positions
+
+    def prepare(self,
+                finished_requests_ids: Optional[List[str]] = None) -> None:
+        """Prepare the builder — initialize attn metadata builder state."""
+        self.attn_metadata_builder.prepare()
 
     def add_seq_group(self, seq_group_metadata: SequenceGroupMetadata):
         """Add a sequence group to the builder."""
@@ -770,7 +771,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
 
         encoder_seq_len = 0
 
-        if self.runner.model_config.is_encoder_decoder_model:
+        if self.runner.model_config.is_encoder_decoder:
             encoder_seq_len = seq_group_metadata.encoder_seq_data.get_len()
 
         inter_data = self.init_cached_inter_data(
@@ -896,7 +897,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             if not inter_data.is_prompt:
                 max_decode_seq_len = max(max_decode_seq_len,
                                          max(inter_data.seq_lens))
-                if self.runner.model_config.is_encoder_decoder_model:
+                if self.runner.model_config.is_encoder_decoder:
                     max_encoder_seq_len = max(max_encoder_seq_len,
                                               inter_data.encoder_seq_len)
 
@@ -1260,6 +1261,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         If cuda graph is required, this API automatically pads inputs.
         """
         builder = self._builder_cls(weakref.proxy(self), finished_requests_ids)
+        builder.prepare()
         for seq_group_metadata in seq_group_metadata_list:
             builder.add_seq_group(seq_group_metadata)
 
@@ -1527,7 +1529,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                         self.attn_state.graph_capture_get_metadata_for_batch(
                             batch_size,
                             is_encoder_decoder_model=self.model_config.
-                            is_encoder_decoder_model))
+                            is_encoder_decoder))
 
                     if self.lora_config:
                         lora_mapping = LoRAMapping(
@@ -1546,7 +1548,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                     graph_runner = CUDAGraphRunner(
                         self.model, self.attn_backend.get_name(),
                         self.attn_state.graph_clone(batch_size),
-                        self.model_config.is_encoder_decoder_model)
+                        self.model_config.is_encoder_decoder)
 
                     capture_inputs = {
                         "input_ids":
@@ -1583,7 +1585,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                             self.model.get_seqlen_agnostic_capture_inputs(
                                 batch_size)
                         })
-                    if self.model_config.is_encoder_decoder_model:
+                    if self.model_config.is_encoder_decoder:
                         # add the additional inputs to capture for
                         # encoder-decoder models.
                         self._update_inputs_to_capture_for_enc_dec_model(
