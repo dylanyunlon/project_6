@@ -55,7 +55,7 @@ if not hasattr(_qwen2_vl_image_processing, "make_batched_videos"):
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import (CacheConfig, LoRAConfig, MultiModalConfig,
-                         SchedulerConfig)
+                         SchedulerConfig, VllmConfig)
 from vllm.distributed import (get_tensor_model_parallel_rank,
                                get_tensor_model_parallel_world_size,
                                tensor_model_parallel_all_reduce)
@@ -66,6 +66,15 @@ from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                ReplicatedLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.fused_moe import FusedMoE
+# [PR #2269] Apply EP patch to FusedMoE before any layers are constructed.
+# When VLLM_ENABLE_EXPERT_PARALLEL=1, this replaces TP-sharded MoE weights
+# with EP-sharded MoE weights (each card holds num_experts/ep_size experts
+# with full intermediate_size), solving the OOM under TP=2.
+try:
+    from vllm.ep_fused_moe_patch import patch_fused_moe_for_ep as _patch_ep
+    _patch_ep()
+except ImportError:
+    pass  # EP patch not installed — TP mode unchanged
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import (
@@ -80,14 +89,11 @@ from vllm.model_executor.models.qwen2_vl import (Qwen2VisionAttention,
                                                  Qwen2VisionRotaryEmbedding)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.inputs import INPUT_REGISTRY, InputContext, LLMInputs
+from vllm.inputs import INPUT_REGISTRY, InputContext, TokenInputs as LLMInputs
 from vllm.multimodal import (MULTIMODAL_REGISTRY, MultiModalDataDict,
-                             MultiModalInputs)
-from vllm.multimodal.base import MultiModalData
+                             MultiModalKwargs as MultiModalInputs)
 from vllm.sequence import IntermediateTensors, SequenceData
 from vllm.transformers_utils.tokenizer import get_tokenizer
-from vllm.worker.model_runner import (_BATCH_SIZES_TO_CAPTURE,
-                                      _get_graph_batch_size)
 from vllm.logger import init_logger
 from vllm.bi100_env import env_bool, env_int
 from vllm.bi100_profile import (bi100_profile_event_enabled,
@@ -171,9 +177,15 @@ except ImportError:
 def _load_xllm_prebuilt(name):
     """Load a prebuilt xllm .so from corex-3.2.3-ivcore10 directory."""
     import importlib.util as _ilu
-    for _p in [f"/workspace/qwen3_6_scripts/prebuilt/corex-3.2.3-ivcore10/{name}.so",
-               os.path.join(os.path.dirname(__file__), "prebuilt",
-                            "corex-3.2.3-ivcore10", f"{name}.so")]:
+    _search = [
+        f"/workspace/qwen3_6_scripts/prebuilt/corex-3.2.3-ivcore10/{name}.so",
+        os.path.join(os.path.dirname(__file__), "prebuilt",
+                     "corex-3.2.3-ivcore10", f"{name}.so"),
+        # When patch_ops.sh copies this file into vllm package, __file__
+        # points to vllm/model_executor/models/ — look back up to workspace
+        f"/home/dylan/0814/project_6/qwen3_6_scripts/prebuilt/corex-3.2.3-ivcore10/{name}.so",
+    ]
+    for _p in _search:
         if os.path.isfile(_p):
             print(f"[xllm] loading {name} from {_p} ...", file=sys.stderr, flush=True)
             try:
@@ -219,7 +231,7 @@ _HAS_BRIDGE_LINEAR = (
     _ix_moe_bridge is not None
     and hasattr(_ix_moe_bridge, 'linear'))
 if _HAS_BRIDGE_LINEAR:
-    logger.info("ix_moe_bridge.linear ENABLED — 4.1x GEMV speedup for decode")
+    print("[xllm] ix_moe_bridge.linear ENABLED", file=sys.stderr, flush=True)
 
 
 def _fast_linear(x: torch.Tensor, weight: torch.Tensor,
@@ -392,14 +404,24 @@ if _USE_XLLM_ACTIVATION:
 
 
 # --- 3. Cache ops: xllm_cache (reshape_paged_cache / block_copy) ---
-# The vllm cache ops already go through ixformer (ixf_F) which has its own
-# CUDA kernels.  xllm_cache exposes a different API signature
-# (slot_ids, keys, values, key_cache, value_cache) that doesn't map 1:1 to
-# the vllm reshape_and_cache interface.  Replacing here carries risk of
-# breaking the attention layer.  We leave this as a future optimisation.
+# Replace ixformer vllm_cache_ops_reshape_and_cache with xllm_cache.
+# xllm_cache signature: reshape_paged_cache(slot_ids, keys, values, kc, vc)
+# vllm calls:           ops.reshape_and_cache(key, value, kc, vc, slot_mapping, ...)
+# Difference: arg order, slot_ids must be int32.
 if _USE_XLLM_CACHE:
-    logger.info("xllm_cache LOADED but NOT PATCHED — vllm cache ops use ixformer path; "
-                "xllm_cache available for future direct-call optimisation")
+    import vllm._custom_ops as _vllm_ops
+
+    _orig_reshape_and_cache = _vllm_ops.reshape_and_cache
+
+    def _xllm_reshape_and_cache(key, value, key_cache, value_cache,
+                                slot_mapping, kv_cache_dtype="auto",
+                                k_scale=1.0, v_scale=1.0):
+        slot_ids = slot_mapping.flatten().to(torch.int32)
+        _xllm_cache.reshape_paged_cache(slot_ids, key, value,
+                                        key_cache, value_cache)
+
+    _vllm_ops.reshape_and_cache = _xllm_reshape_and_cache
+    logger.info("xllm_cache PATCHED — reshape_and_cache → xllm CUDA kernel")
 
 
 # --- 4. RoPE: xllm_rope ---
@@ -794,7 +816,7 @@ def _qwen36_image_token_count(image, image_processor) -> int:
 
 def qwen36_image_input_mapper(
     ctx: InputContext,
-    data: MultiModalData[object],
+    data: object,
 ) -> MultiModalInputs:
     if isinstance(data, dict):
         return MultiModalInputs({
@@ -822,7 +844,8 @@ def dummy_data_for_qwen36(
     ctx: InputContext,
     seq_len: int,
     mm_counts: Mapping[str, int],
-) -> Tuple[SequenceData, Optional[MultiModalDataDict]]:
+) -> "DummyData":
+    from vllm.inputs.registry import DummyData
     num_images = mm_counts.get("image", 0)
     image_tokens = _MAX_IMAGE_TOKENS * num_images
     if seq_len < image_tokens + 2:
@@ -830,17 +853,18 @@ def dummy_data_for_qwen36(
             f"Qwen3.6 needs {image_tokens + 2} tokens for {num_images} "
             f"max-size image(s), but max_model_len is {seq_len}")
     config = ctx.model_config.hf_config
-    seq_data = SequenceData.from_token_counts(
+    seq_data = SequenceData.from_prompt_token_counts(
         (config.vision_start_token_id, 1),
         (config.image_token_id, image_tokens),
         (config.vision_end_token_id, 1),
         (0, seq_len - image_tokens - 2),
     )
     dummy_image = Image.new("RGB", (1280, 1024), color=0)
-    return seq_data, {
+    mm_data = {
         "image": (dummy_image if num_images == 1
                   else [dummy_image] * num_images)
     }
+    return DummyData(seq_data=seq_data, multi_modal_data=mm_data)
 
 
 def input_processor_for_qwen36(ctx: InputContext,
@@ -1869,8 +1893,11 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         self.router_shared_gate.weight.weight_loader = \
             self._router_shared_gate_weight_loader
 
-        # FusedMoE: only used for weight storage + weight_loader.
-        # Forward is bypassed — see _pure_pytorch_experts().
+        # FusedMoE: weight storage + weight_loader ONLY.
+        # Forward is NEVER called — _pure_pytorch_experts() handles everything.
+        # In EP mode, _ep_enabled/start_expert_id/num_experts_per_rank attrs
+        # are set by ep_fused_moe_patch.py, used by _pure_pytorch_experts()
+        # to mask non-local experts and remap ids.
         self.experts = FusedMoE(
             num_experts=text_cfg.num_experts,
             top_k=text_cfg.num_experts_per_tok,
@@ -2001,116 +2028,202 @@ class Qwen3_5MoeSparseBlock(nn.Module):
             topk_weights = torch.softmax(topk_logits, dim=-1)
             topk_weights = topk_weights.to(hidden_states.dtype)
 
-        w13 = self.experts.w13_weight  # (E, 2*I, H)
-        w2  = self.experts.w2_weight   # (E, H, I)
+        w13 = self.experts.w13_weight  # (E_local, 2*I_tp, H) or (E_global, 2*I_tp, H)
+        w2  = self.experts.w2_weight   # (E_local, H, I_tp) or (E_global, H, I_tp)
+
+        # --- EP: mask non-local experts, remap global ids to local ---
+        # Ported from tpu-inference PR #2137 (7163afb1) ragged_gather:
+        #   In EP mode, instead of assigning ghost tokens to local experts
+        #   (weight=0 but still computed), we FILTER THEM OUT entirely.
+        #   This reduces per-expert GEMM from T*topk to ~T*topk/ep_size.
+        _ep = getattr(self.experts, '_ep_enabled', False)
+        if _ep:
+            from vllm.ep_fused_moe_patch import ep_mask_and_remap
+            topk_ids, topk_weights, _local_mask = ep_mask_and_remap(
+                topk_ids, topk_weights,
+                self.experts._start_expert_id,
+                self.experts._num_experts_per_rank,
+                self.experts._ep_rank)
+            if not hasattr(self, '_ep_diag_done'):
+                self._ep_diag_done = True
+                _lc = _local_mask.sum().item()
+                _tc = _local_mask.numel()
+                logger.info(
+                    "[EP] rank=%d experts=[%d,%d) local_hits=%d/%d (%.1f%%) "
+                    "w13=%s w2=%s",
+                    self.experts._ep_rank,
+                    self.experts._start_expert_id,
+                    self.experts._start_expert_id + self.experts._num_experts_per_rank,
+                    _lc, _tc, 100.0 * _lc / max(_tc, 1),
+                    list(w13.shape), list(w2.shape))
 
         T = hidden_states.shape[0]
         if T == 1:
             # Fast path: single token (decode).
-            # Batched GEMM: replace top_k separate F.linear calls with 2 fused ops.
-            # gate_up: 1 large GEMM  (1,H) × (K*2*I,H)^T → (1, K*2*I)
-            # down:    1 bmm         (K,H,I) @ (K,I,1)    → (K,H)
-            # Total: 3 kernel launches vs previous 16 (top_k*2).
             eids    = topk_ids[0]                              # (K,)
             ws      = topk_weights[0].to(hidden_states.dtype)  # (K,)
-            # --- corex_moe_direct_routed: zero-copy indexed GEMM (warp64) ---
-            # Compiled kernel constants: kHidden=2048, kExperts=256, kTopK=8
-            # w13 must be (256, 256, 2048), w2 must be (256, 2048, 128)
-            # eids MUST be int64 (verified on real hardware)
-            # act for w2_reduce must be (8, 128) not (1, 1024)
-            use_corex_direct = (
-                _USE_COREX_MOE_DIRECT_ROUTED
-                and hidden_states.dtype == torch.float16
-                and w13.dtype == torch.float16
-                and w2.dtype == torch.float16
-                and hidden_states.is_cuda and w13.is_cuda
-                and hidden_states.is_contiguous()
-                and w13.is_contiguous() and w2.is_contiguous()
-                and w13.shape == (256, 256, 2048)
-                and w2.shape == (256, 2048, 128)
-                and eids.numel() == 8)
-            if not hasattr(self, '_direct_routed_logged'):
-                self._direct_routed_logged = True
-                logger.info(
-                    "MoE T=1 direct_routed check: flag=%s match=%s "
-                    "hs=%s w13=%s w2=%s eids=%s ws=%s dtype_eids=%s",
-                    _USE_COREX_MOE_DIRECT_ROUTED, use_corex_direct,
-                    tuple(hidden_states.shape), tuple(w13.shape),
-                    tuple(w2.shape), tuple(eids.shape), tuple(ws.shape),
-                    eids.dtype)
-            if use_corex_direct:
-                eids_i64 = eids.to(torch.int64)  # kernel requires int64
-                gate_up = _corex_moe_direct_routed.w13(
-                    hidden_states, w13, eids_i64)              # (8, 256)
-                gate, up = gate_up.chunk(2, dim=-1)            # (8, 128) each
-                act = (torch.nn.functional.silu(gate) * up).contiguous()  # (8, 128)
-                return _corex_moe_direct_routed.w2_reduce(
-                    act, w2, eids_i64, ws)                     # (1, 2048)
 
-            # Tier 1.5: CUTLASS batched GEMM (verified 2.462ms, issue #68)
-            # 1 launch for 8 experts vs 8 launches for F.linear loop
-            if (_USE_COREX_BATCHED_GEMM
-                    and hidden_states.dtype == torch.float16
-                    and w13.dtype == torch.float16
-                    and w2.dtype == torch.float16):
-                return _corex_batched_gemm.moe_decode_fused(
-                    hidden_states, w13[eids], w2[eids], ws)
+            # --- EP T=1: skip ghost experts ---
+            # In EP mode, ~6/8 experts have weight=0 (non-local).
+            # Must skip them: EP intermediate_size=1024 (full) vs TP=256 (1/4).
+            # 8 experts × 1024 = 4× more compute than 8 × 256.
+            # Skipping to ~2 local experts: 2 × 1024 = 2048, same as TP's 8 × 256.
+            #
+            # .item() here does ONE GPU→CPU sync per layer. CUDA pipelines
+            # the 8 scalar transfers into one sync. 40 layers × ~30μs = ~1.2ms,
+            # far less than the ~50ms saved by skipping 6 experts' GEMM.
+            if _ep:
+                valid = ws != 0
+                K_local = valid.sum().item()
+                if K_local == 0:
+                    return torch.zeros(1, hidden_states.shape[-1],
+                                       dtype=hidden_states.dtype,
+                                       device=hidden_states.device)
+                eids = eids[valid]                              # (K_local,)
+                ws   = ws[valid]                                # (K_local,)
 
-            use_corex_gather = (
-                _USE_COREX_MOE_WEIGHT_GATHER
-                and hidden_states.dtype == torch.float16
-                and w13.dtype == torch.float16
-                and w2.dtype == torch.float16
-                and w13.is_cuda and w2.is_cuda and eids.is_cuda
-                and w13.is_contiguous() and w2.is_contiguous()
-                and eids.is_contiguous()
-                and w13.dim() == 3 and w2.dim() == 3
-                and eids.dim() == 1 and eids.numel() == 8
-                and w13.shape[0] == w2.shape[0]
-                and w13.shape[2] == w2.shape[1]
-                and w13.shape[1] == 2 * w2.shape[2]
-                and w13.shape[1] * w13.shape[2] % 8 == 0
-                and w2.shape[1] * w2.shape[2] % 8 == 0)
-            if use_corex_gather:
-                w13_sel, w2_sel = _corex_moe_weight_gather.gather(
-                    w13, w2, eids)
-            else:
-                w13_sel = w13[eids]                            # (K, 2*I, H)
-                w2_sel = w2[eids]                              # (K, H, I)
+                w13_sel = w13[eids]                            # (K_local, 2*I, H)
+                w2_sel = w2[eids]                              # (K_local, H, I)
+                H = hidden_states.shape[-1]
 
-            H = hidden_states.shape[-1]
+                gate_up = _fast_linear(
+                    hidden_states,
+                    w13_sel.reshape(-1, H),                    # (K_local*2*I, H)
+                )                                              # (1, K_local*2*I)
+                gate_up = gate_up.view(K_local, -1)            # (K_local, 2*I)
 
-            # FC1: single large GEMM via F.linear
-            # (1, H) @ (K*2*I, H)^T → (1, K*2*I)
-            # Source: base qwen3_5.py — verified on BI-V100 (sub 655 = 683)
-            gate_up = _fast_linear(
-                hidden_states,
-                w13_sel.reshape(-1, H),                        # (K*2*I, H)
-            )                                                  # (1, K*2*I)
-            gate_up = gate_up.view(self.top_k, -1)             # (K, 2*I)
+                if _USE_FUSED_MOE_ACTIVATION:
+                    act = self.act_fn(gate_up)
+                else:
+                    gate, up = gate_up.chunk(2, dim=-1)
+                    act = F.silu(gate) * up
 
-            if _USE_FUSED_MOE_ACTIVATION:
-                act = self.act_fn(gate_up)                      # (K, I)
-            else:
-                gate, up = gate_up.chunk(2, dim=-1)
-                act = F.silu(gate) * up
-
-            # FC2: bmm (K, H, I) @ (K, I, 1) → (K, H)
-            # w2_sel is (K, H, I), act is (K, I)
-            expert_out = torch.bmm(w2_sel, act.unsqueeze(-1)).squeeze(-1)  # (K, H)
-
-            if (_USE_COREX_MOE_EXACT_REDUCE
-                    and expert_out.dtype == torch.float16
-                    and ws.dtype == torch.float16
-                    and expert_out.shape[0] == 8):
-                out = _corex_moe_exact_reduce.serial_float(expert_out, ws)
-            else:
+                expert_out = torch.bmm(w2_sel, act.unsqueeze(-1)).squeeze(-1)
                 out = (expert_out * ws.unsqueeze(-1)).sum(
                     0, keepdim=True).to(hidden_states.dtype)   # (1, H)
+            else:
+                # --- TP mode: all 8 experts are local ---
+                # --- corex_moe_direct_routed: zero-copy indexed GEMM (warp64) ---
+                # Compiled kernel constants: kHidden=2048, kExperts=256, kTopK=8
+                # w13 must be (256, 256, 2048), w2 must be (256, 2048, 128)
+                # eids MUST be int64 (verified on real hardware)
+                # act for w2_reduce must be (8, 128) not (1, 1024)
+                use_corex_direct = (
+                    _USE_COREX_MOE_DIRECT_ROUTED
+                    and hidden_states.dtype == torch.float16
+                    and w13.dtype == torch.float16
+                    and w2.dtype == torch.float16
+                    and hidden_states.is_cuda and w13.is_cuda
+                    and hidden_states.is_contiguous()
+                    and w13.is_contiguous() and w2.is_contiguous()
+                    and w13.shape == (256, 256, 2048)
+                    and w2.shape == (256, 2048, 128)
+                    and eids.numel() == 8)
+                if not hasattr(self, '_direct_routed_logged'):
+                    self._direct_routed_logged = True
+                    logger.info(
+                        "MoE T=1 direct_routed check: flag=%s match=%s ep=%s "
+                        "hs=%s w13=%s w2=%s eids=%s ws=%s dtype_eids=%s",
+                        _USE_COREX_MOE_DIRECT_ROUTED, use_corex_direct, _ep,
+                        tuple(hidden_states.shape), tuple(w13.shape),
+                        tuple(w2.shape), tuple(eids.shape), tuple(ws.shape),
+                        eids.dtype)
+                if use_corex_direct:
+                    eids_i64 = eids.to(torch.int64)  # kernel requires int64
+                    gate_up = _corex_moe_direct_routed.w13(
+                        hidden_states, w13, eids_i64)              # (8, 256)
+                    gate, up = gate_up.chunk(2, dim=-1)            # (8, 128) each
+                    act = (torch.nn.functional.silu(gate) * up).contiguous()  # (8, 128)
+                    return _corex_moe_direct_routed.w2_reduce(
+                        act, w2, eids_i64, ws)                     # (1, 2048)
+
+                # Tier 1.5: CUTLASS batched GEMM (verified 2.462ms, issue #68)
+                # 1 launch for 8 experts vs 8 launches for F.linear loop
+                if (_USE_COREX_BATCHED_GEMM
+                        and hidden_states.dtype == torch.float16
+                        and w13.dtype == torch.float16
+                        and w2.dtype == torch.float16):
+                    return _corex_batched_gemm.moe_decode_fused(
+                        hidden_states, w13[eids], w2[eids], ws)
+
+                use_corex_gather = (
+                    _USE_COREX_MOE_WEIGHT_GATHER
+                    and hidden_states.dtype == torch.float16
+                    and w13.dtype == torch.float16
+                    and w2.dtype == torch.float16
+                    and w13.is_cuda and w2.is_cuda and eids.is_cuda
+                    and w13.is_contiguous() and w2.is_contiguous()
+                    and eids.is_contiguous()
+                    and w13.dim() == 3 and w2.dim() == 3
+                    and eids.dim() == 1 and eids.numel() == self.top_k
+                    and w13.shape[0] == w2.shape[0]
+                    and w13.shape[2] == w2.shape[1]
+                    and w13.shape[1] == 2 * w2.shape[2]
+                    and w13.shape[1] * w13.shape[2] % 8 == 0
+                    and w2.shape[1] * w2.shape[2] % 8 == 0)
+                if use_corex_gather:
+                    w13_sel, w2_sel = _corex_moe_weight_gather.gather(
+                        w13, w2, eids)
+                else:
+                    w13_sel = w13[eids]                            # (K_actual, 2*I, H)
+                    w2_sel = w2[eids]                              # (K_actual, H, I)
+
+                H = hidden_states.shape[-1]
+
+                # FC1: single large GEMM via F.linear
+                # (1, H) @ (K_actual*2*I, H)^T → (1, K_actual*2*I)
+                gate_up = _fast_linear(
+                    hidden_states,
+                    w13_sel.reshape(-1, H),                        # (K_actual*2*I, H)
+                )                                                  # (1, K_actual*2*I)
+                gate_up = gate_up.view(K_actual, -1)               # (K_actual, 2*I)
+
+                if _USE_FUSED_MOE_ACTIVATION:
+                    act = self.act_fn(gate_up)                      # (K_actual, I)
+                else:
+                    gate, up = gate_up.chunk(2, dim=-1)
+                    act = F.silu(gate) * up
+
+                # FC2: bmm (K_actual, H, I) @ (K_actual, I, 1) → (K_actual, H)
+                expert_out = torch.bmm(w2_sel, act.unsqueeze(-1)).squeeze(-1)
+
+                if (_USE_COREX_MOE_EXACT_REDUCE
+                        and expert_out.dtype == torch.float16
+                        and ws.dtype == torch.float16
+                        and expert_out.shape[0] == 8):
+                    out = _corex_moe_exact_reduce.serial_float(expert_out, ws)
+                else:
+                    out = (expert_out * ws.unsqueeze(-1)).sum(
+                        0, keepdim=True).to(hidden_states.dtype)   # (1, H)
         else:
             # General path (prefill / multi-seq): group assignments once.
             out = torch.zeros_like(hidden_states)
             flat_eids = topk_ids.reshape(-1)
+            flat_weights = topk_weights.reshape(-1)
+
+            # --- EP: upstream _process_tokens_locally approach ---
+            # (PR #2137, 7163afb1 — fused_moe_gmm.py lines 674-718)
+            #
+            # Upstream sorts by GLOBAL expert id (no mask, no remap),
+            # then uses prefix-sum (group_offsets) to locate the
+            # contiguous [start, end) range of locally-routed tokens.
+            # The per-expert loop only iterates over local experts.
+            #
+            # Key: NO boolean mask, NO .item(), NO dynamic shape.
+            # The sort + prefix-sum are all static-shape tensor ops.
+            #
+            # In EP mode, ep_mask_and_remap already remapped to local ids.
+            # But the upstream approach is different: it keeps global ids
+            # for sorting, and only narrows the loop range.
+            #
+            # For our code: since ep_mask_and_remap already remapped to
+            # local [0, E_local) and zeroed non-local weights, we sort
+            # by local id. Non-local entries have weight=0 and are
+            # distributed across local experts (via mod). The per-expert
+            # loop processes ALL entries including ghosts, but ghosts
+            # contribute nothing due to weight=0. This matches the upstream
+            # behavior where ragged_gather_reduce applies valid_rows_mask
+            # to zero out non-local entries (line 264-270 in moe_gmm_local).
 
             if _USE_XLLM_MOE:
                 # xllm CUDA: histogram + prefix_sum + place
@@ -2119,7 +2232,7 @@ class Qwen3_5MoeSparseBlock(nn.Module):
                 sorted_tok_ids = torch.arange(
                     T, device=topk_ids.device
                 ).repeat_interleave(self.top_k)[dst_src.long()]
-                sorted_weights = topk_weights.reshape(-1)[dst_src.long()]
+                sorted_weights = flat_weights[dst_src.long()]
                 expert_counts = expert_sizes.tolist()
             elif _USE_COREX_MOE_INDEX_COMBINE:
                 # Fused CUDA: histogram + prefix_sum + place (11.5x faster)
@@ -2129,14 +2242,14 @@ class Qwen3_5MoeSparseBlock(nn.Module):
                 sorted_tok_ids = torch.arange(
                     T, device=topk_ids.device
                 ).repeat_interleave(self.top_k)[dst_src.long()]
-                sorted_weights = topk_weights.reshape(-1)[dst_src.long()]
+                sorted_weights = flat_weights[dst_src.long()]
                 expert_counts = expert_sizes.tolist()
             else:
                 order = torch.argsort(flat_eids, stable=True)
                 sorted_tok_ids = torch.arange(
                     T, device=topk_ids.device
                 ).repeat_interleave(self.top_k)[order]
-                sorted_weights = topk_weights.reshape(-1)[order]
+                sorted_weights = flat_weights[order]
                 expert_counts = torch.bincount(
                     flat_eids, minlength=w13.shape[0]).tolist()
 
@@ -2181,6 +2294,17 @@ class Qwen3_5MoeSparseBlock(nn.Module):
                     out.index_add_(0, tok_ids, (expert_out * weights).to(out.dtype))
                     start = end
 
+        # One-shot diagnostic: log routed output norm after first forward
+        if not hasattr(self, '_routed_diag_done'):
+            self._routed_diag_done = True
+            _ep = getattr(self.experts, '_ep_enabled', False)
+            logger.info(
+                "[MoE_OUT] EP=%s T=%d out_shape=%s out_norm=%.6f "
+                "out_abs_max=%.6f out_has_nan=%s out_has_inf=%s",
+                _ep, hidden_states.shape[0], list(out.shape),
+                out.float().norm().item(),
+                out.float().abs().max().item(),
+                bool(out.isnan().any()), bool(out.isinf().any()))
         return out  # partial, all-reduce done in forward()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -2197,11 +2321,35 @@ class Qwen3_5MoeSparseBlock(nn.Module):
             shared_out, _ = self.shared_expert_down(shared_out)
             shared_out = shared_out * torch.sigmoid(gate_score)
 
-        with bi100_timer("moe.combine"):
-            out = routed_out + shared_out
-        if self.experts.tp_size > 1:
-            with bi100_timer("moe.all_reduce"):
-                out = tensor_model_parallel_all_reduce(out)
+        # --- Reduction ---
+        # Ported from tpu-inference:
+        #   PR #2679 (df7f5b35): scatter_results / defer_all_reduce
+        #   PR #3435 (57987c2):  shared expert reduce axis under attn DP
+        #
+        # TP mode: routed_out + shared_out are both TP-partial → single all-reduce
+        # EP mode: routed_out is EP-partial, shared_out is TP-partial
+        #          Since TP group == EP group == WORLD → same single all-reduce
+        #          (defer_all_reduce pattern: combine first, reduce once)
+        _ep = getattr(self.experts, '_ep_enabled', False)
+        if _ep:
+            from vllm.ep_fused_moe_patch import ep_reduce_output
+            with bi100_timer("moe.ep_reduce"):
+                out = ep_reduce_output(routed_out, shared_out)
+        else:
+            with bi100_timer("moe.combine"):
+                out = routed_out + shared_out
+            if self.experts.tp_size > 1:
+                with bi100_timer("moe.all_reduce"):
+                    out = tensor_model_parallel_all_reduce(out)
+        _fwd_cnt = getattr(self, '_fwd_diag_cnt', 0)
+        if _fwd_cnt < 3:
+            self._fwd_diag_cnt = _fwd_cnt + 1
+            logger.info(
+                "[MoE_FWD] ep=%s call=%d T=%d routed=%.4f shared=%.4f final=%.4f",
+                _ep, _fwd_cnt, hidden_states.shape[0],
+                routed_out.float().norm().item(),
+                shared_out.float().norm().item(),
+                out.float().norm().item())
         return out
 
 
@@ -2439,14 +2587,16 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
 
     def __init__(
         self,
-        config,                                           # Qwen3_5Config (top-level)
-        cache_config: Optional[CacheConfig] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        lora_config: Optional[LoRAConfig] = None,
-        scheduler_config: Optional[SchedulerConfig] = None,
-        multimodal_config: Optional[MultiModalConfig] = None,
+        vllm_config: VllmConfig,
         prefix: str = "",
     ) -> None:
+        config = vllm_config.model_config.hf_config
+        cache_config = vllm_config.cache_config
+        quant_config = vllm_config.quant_config
+        lora_config = vllm_config.lora_config
+        scheduler_config = vllm_config.scheduler_config
+        multimodal_config = getattr(vllm_config.model_config,
+                                    'multimodal_config', None)
         # Apply ix_bridge operator patches on first model init (safe: GPU is ready)
         try:
             from vllm import ix_startup_patch
@@ -2456,6 +2606,7 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
         _bi100_model_trace("Qwen3_5ForCausalLM initialization begin")
         super().__init__()
         self.config = config
+        self.vllm_config = vllm_config
         self.scheduler_config = scheduler_config
         self.multimodal_config = multimodal_config
 
@@ -2622,15 +2773,10 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
             self._startup_forward_traced = True
             _bi100_model_trace("first model forward entered")
         if self.mamba_cache is None:
-            if self.scheduler_config is not None:
-                max_batch_size = _get_graph_batch_size(
-                    self.scheduler_config.max_num_seqs)
-            else:
-                max_batch_size = max(_BATCH_SIZES_TO_CAPTURE) + 2
             self.mamba_cache = MambaCacheManager(
+                self.vllm_config,
                 torch.float32,
                 self.num_linear_layers,
-                max_batch_size,
                 *self._get_mamba_cache_shape(),
             )
 
@@ -2639,11 +2785,11 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
         gdn_evict_keys = kwargs.pop("gdn_evict_keys", None) or []
         gdn_segment_offsets = kwargs.pop("gdn_segment_offsets", None) or []
 
-        mamba_tensors = self.mamba_cache.current_run_tensors(
-            input_ids, attn_metadata, **kwargs)
+        mamba_params = self.mamba_cache.current_run_tensors(**kwargs)
         # conv_states:     (num_linear_layers, batch, local_conv_dim, kernel-1)
         # temporal_states: (num_linear_layers, batch, local_num_v, k_dim, v_dim)
-        conv_states, temporal_states = mamba_tensors
+        conv_states = mamba_params.conv_state
+        temporal_states = mamba_params.ssm_state
 
         _is_single_seq_prefill = (
             attn_metadata is not None
@@ -2795,6 +2941,23 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
         # logits_processor.py (patched by patch_xformers_sdpa_seq.py).
         logits = self.logits_processor(self.lm_head, hidden_states,
                                        sampling_metadata)
+        if logits is not None:
+            _cnt = getattr(self, '_logits_diag_cnt', 0)
+            if _cnt < 5:
+                self._logits_diag_cnt = _cnt + 1
+                try:
+                    top5_vals, top5_ids = logits[-1].topk(5)
+                    logger.info(
+                        "[LOGITS] call=%d shape=%s last_row_norm=%.4f "
+                        "top5_ids=%s top5_vals=%s "
+                        "has_nan=%s min=%.4f max=%.4f",
+                        _cnt, list(logits.shape),
+                        logits[-1].float().norm().item(),
+                        top5_ids.tolist(), top5_vals.tolist(),
+                        bool(logits.isnan().any()),
+                        logits.min().item(), logits.max().item())
+                except Exception as e:
+                    logger.info("[LOGITS] call=%d diag failed: %s", _cnt, e)
         return logits
 
     def sample(

@@ -5,6 +5,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 import ixformer.distributed as ixfd
+from ixformer.contrib.torch.extension.ixformer_torch.distributed import create_ixformer_group_from_pg
 import os
 
 
@@ -33,6 +34,13 @@ class DeviceCommunicatorBase:
         self.rank_in_group = dist.get_group_rank(self.cpu_group,
                                                  self.global_rank)
         self.use_vllm_comm = os.environ.get("VLLM_FORCE_NCCL_COMM",None) not in ["1", "Y", "y"]
+
+        # Convert torch ProcessGroup to ixformer NcclGroup for ixfd calls.
+        if self.use_vllm_comm and device_group is not None:
+            self.ixformer_group = create_ixformer_group_from_pg(device_group)
+        else:
+            self.ixformer_group = None
+
         if "pp" in unique_name:
             # pipeline parallel does not need custom allreduce
             use_custom_allreduce = False
@@ -58,7 +66,7 @@ class DeviceCommunicatorBase:
             return input_
         
         if self.use_vllm_comm:
-            ixfd.all_reduce(input_, group=self.device_group, async_op=True)
+            ixfd.all_reduce(input_, group=self.ixformer_group, async_op=True)
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)   
         return input_
@@ -80,7 +88,7 @@ class DeviceCommunicatorBase:
         if self.use_vllm_comm:
             ixfd.all_gather_into_tensor(output_tensor,
                                         input_,
-                                        group=self.device_group,
+                                        group=self.ixformer_group,
                                         async_op=True)
         else:
             torch.distributed.all_gather_into_tensor(output_tensor,
@@ -121,7 +129,7 @@ class DeviceCommunicatorBase:
             ixfd.gather(input_,
                         gather_list,
                         dst=self.ranks[dst],
-                        group=self.device_group,
+                        group=self.ixformer_group,
                         async_op=True)
         else:
             torch.distributed.gather(input_,
@@ -140,7 +148,7 @@ class DeviceCommunicatorBase:
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
         if self.use_vllm_comm:
-                ixfd.send(tensor, self.ranks[dst], self.device_group)
+                ixfd.send(tensor, self.ranks[dst], self.ixformer_group)
         else:
             torch.distributed.send(tensor, self.ranks[dst], self.device_group)
 
@@ -155,7 +163,7 @@ class DeviceCommunicatorBase:
 
         tensor = torch.empty(size, dtype=dtype, device=self.device)
         if self.use_vllm_comm:
-            ixfd.recv(tensor, self.ranks[src], self.device_group)
+            ixfd.recv(tensor, self.ranks[src], self.ixformer_group)
         else:
             torch.distributed.recv(tensor, self.ranks[src], self.device_group)
         return tensor

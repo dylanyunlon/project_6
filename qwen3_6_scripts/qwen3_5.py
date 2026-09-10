@@ -2606,6 +2606,7 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
         _bi100_model_trace("Qwen3_5ForCausalLM initialization begin")
         super().__init__()
         self.config = config
+        self.vllm_config = vllm_config
         self.scheduler_config = scheduler_config
         self.multimodal_config = multimodal_config
 
@@ -2772,14 +2773,10 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
             self._startup_forward_traced = True
             _bi100_model_trace("first model forward entered")
         if self.mamba_cache is None:
-            if self.scheduler_config is not None:
-                max_batch_size = self.scheduler_config.max_num_seqs
-            else:
-                max_batch_size = 256
             self.mamba_cache = MambaCacheManager(
+                self.vllm_config,
                 torch.float32,
                 self.num_linear_layers,
-                max_batch_size,
                 *self._get_mamba_cache_shape(),
             )
 
@@ -2788,11 +2785,11 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
         gdn_evict_keys = kwargs.pop("gdn_evict_keys", None) or []
         gdn_segment_offsets = kwargs.pop("gdn_segment_offsets", None) or []
 
-        mamba_tensors = self.mamba_cache.current_run_tensors(
-            input_ids, attn_metadata, **kwargs)
+        mamba_params = self.mamba_cache.current_run_tensors(**kwargs)
         # conv_states:     (num_linear_layers, batch, local_conv_dim, kernel-1)
         # temporal_states: (num_linear_layers, batch, local_num_v, k_dim, v_dim)
-        conv_states, temporal_states = mamba_tensors
+        conv_states = mamba_params.conv_state
+        temporal_states = mamba_params.ssm_state
 
         _is_single_seq_prefill = (
             attn_metadata is not None
