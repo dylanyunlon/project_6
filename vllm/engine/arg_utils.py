@@ -954,13 +954,10 @@ class EngineArgs:
                 if (is_gpu and not use_sliding_window and not use_spec_decode
                         and not self.enable_lora
                         and not self.enable_prompt_adapter):
-                    self.enable_chunked_prefill = True
-                    logger.warning(
-                        "Chunked prefill is enabled by default for models with "
-                        "max_model_len > 32K. Currently, chunked prefill might "
-                        "not work with some features or models. If you "
-                        "encounter any issues, please disable chunked prefill "
-                        "by setting --enable-chunked-prefill=False.")
+                    pass  # BI100: skip auto-enable — Q-tiling in
+                          # _run_sdpa_fallback handles long-context memory
+                          # without chunked prefill, and auto-enabling it
+                          # would break pooling models and xformers fallback
             if self.enable_chunked_prefill is None:
                 self.enable_chunked_prefill = False
 

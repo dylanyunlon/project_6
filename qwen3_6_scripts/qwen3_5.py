@@ -55,7 +55,7 @@ if not hasattr(_qwen2_vl_image_processing, "make_batched_videos"):
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import (CacheConfig, LoRAConfig, MultiModalConfig,
-                         SchedulerConfig)
+                         SchedulerConfig, VllmConfig)
 from vllm.distributed import (get_tensor_model_parallel_rank,
                                get_tensor_model_parallel_world_size,
                                tensor_model_parallel_all_reduce)
@@ -2585,14 +2585,16 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
 
     def __init__(
         self,
-        config,                                           # Qwen3_5Config (top-level)
-        cache_config: Optional[CacheConfig] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        lora_config: Optional[LoRAConfig] = None,
-        scheduler_config: Optional[SchedulerConfig] = None,
-        multimodal_config: Optional[MultiModalConfig] = None,
+        vllm_config: VllmConfig,
         prefix: str = "",
     ) -> None:
+        config = vllm_config.model_config.hf_config
+        cache_config = vllm_config.cache_config
+        quant_config = vllm_config.quant_config
+        lora_config = vllm_config.lora_config
+        scheduler_config = vllm_config.scheduler_config
+        multimodal_config = getattr(vllm_config.model_config,
+                                    'multimodal_config', None)
         # Apply ix_bridge operator patches on first model init (safe: GPU is ready)
         try:
             from vllm import ix_startup_patch

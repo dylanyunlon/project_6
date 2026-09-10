@@ -1827,13 +1827,17 @@ class SchedulerConfig:
     def _verify_args(self) -> None:
         if (self.max_num_batched_tokens < self.max_model_len
                 and not self.chunked_prefill_enabled):
-            raise ValueError(
-                f"max_num_batched_tokens ({self.max_num_batched_tokens}) is "
-                f"smaller than max_model_len ({self.max_model_len}). "
-                "This effectively limits the maximum sequence length to "
-                "max_num_batched_tokens and makes vLLM reject longer "
-                "sequences. Please increase max_num_batched_tokens or "
-                "decrease max_model_len.")
+            # BI100: auto-enable chunked prefill instead of raising.
+            # max_num_batched_tokens < max_model_len is the normal
+            # chunked-prefill use case (e.g. 4096 chunk for 131072 ctx).
+            # The original hard error blocks valid launch commands on
+            # BI-V100 where chunked prefill is the expected path.
+            logger.warning(
+                "max_num_batched_tokens (%d) is smaller than "
+                "max_model_len (%d). Auto-enabling chunked prefill.",
+                self.max_num_batched_tokens, self.max_model_len)
+            self.chunked_prefill_enabled = True
+            self.enable_chunked_prefill = True
 
         if self.max_num_batched_tokens < self.max_num_seqs:
             raise ValueError(

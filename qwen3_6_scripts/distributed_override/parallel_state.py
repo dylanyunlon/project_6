@@ -186,7 +186,7 @@ class GroupCoordinator:
             # processes through the CPU.
             cpu_group = torch.distributed.new_group(ranks, backend="gloo")
             if self.rank in ranks:
-                ixfd.init_comm_with_store(device_group)
+                ixfd.init_process_group()
                 self.ranks = ranks
                 self.world_size = len(ranks)
                 self.rank_in_group = ranks.index(self.rank)
