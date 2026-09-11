@@ -49,7 +49,8 @@ global_thread_pool = None  # used for generating logits processor fsm
 
 
 async def get_outlines_guided_decoding_logits_processor(
-    guided_params: GuidedDecodingParams, tokenizer: PreTrainedTokenizerBase
+    guided_params: GuidedDecodingParams, tokenizer: PreTrainedTokenizerBase,
+    reasoner=None,
 ) -> Union[JSONLogitsProcessor, RegexLogitsProcessor, CFGLogitsProcessor,
            None]:
     """
@@ -70,11 +71,13 @@ async def get_outlines_guided_decoding_logits_processor(
 
     return await loop.run_in_executor(global_thread_pool,
                                       _get_logits_processor, guide, tokenizer,
-                                      mode, guided_params.whitespace_pattern)
+                                      mode, guided_params.whitespace_pattern,
+                                      reasoner)
 
 
 def get_local_outlines_guided_decoding_logits_processor(
-    guided_params: GuidedDecodingParams, tokenizer: PreTrainedTokenizerBase
+    guided_params: GuidedDecodingParams, tokenizer: PreTrainedTokenizerBase,
+    reasoner=None,
 ) -> Union[JSONLogitsProcessor, RegexLogitsProcessor, CFGLogitsProcessor,
            None]:
     """
@@ -88,7 +91,7 @@ def get_local_outlines_guided_decoding_logits_processor(
         return None
 
     return _get_logits_processor(guide, tokenizer, mode,
-                                 guided_params.whitespace_pattern)
+                                 guided_params.whitespace_pattern, reasoner)
 
 
 def _get_guide_and_mode(
@@ -120,13 +123,14 @@ def _get_guide_and_mode(
 
 def _get_logits_processor(
     guide: str, tokenizer: PreTrainedTokenizerBase, mode: GuidedDecodingMode,
-    whitespace_pattern: Union[str, None]
+    whitespace_pattern: Union[str, None], reasoner=None,
 ) -> Union[JSONLogitsProcessor, RegexLogitsProcessor, CFGLogitsProcessor]:
     if mode == GuidedDecodingMode.JSON:
-        return JSONLogitsProcessor(guide, tokenizer, whitespace_pattern)
+        return JSONLogitsProcessor(guide, tokenizer, whitespace_pattern,
+                                   reasoner)
     elif mode == GuidedDecodingMode.REGEX or mode == GuidedDecodingMode.CHOICE:
-        return RegexLogitsProcessor(guide, tokenizer)
+        return RegexLogitsProcessor(guide, tokenizer, reasoner)
     elif mode == GuidedDecodingMode.GRAMMAR:
-        return CFGLogitsProcessor(guide, tokenizer)
+        return CFGLogitsProcessor(guide, tokenizer, reasoner)
     else:
         raise ValueError(f"Unknown guided decoding mode {mode}")

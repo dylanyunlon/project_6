@@ -1037,8 +1037,28 @@ class Async_helper():
         return True
 
 
+_ixformer_group_cache: Dict[int, Any] = {}
+
+def _to_ixformer_group(group):
+    """Convert a torch.distributed ProcessGroup to an ixformer NcclGroup.
+
+    ixformer's C++ broadcast() expects an NcclGroup (or None), not a
+    torch ProcessGroup.  We cache the conversion keyed on the PG's
+    Python id() so it is done at most once per group object.
+    """
+    if group is None:
+        return None
+    pg_id = id(group)
+    if pg_id not in _ixformer_group_cache:
+        from ixformer.contrib.torch.extension.ixformer_torch.distributed import (
+            create_ixformer_group_from_pg,
+        )
+        _ixformer_group_cache[pg_id] = create_ixformer_group_from_pg(group)
+    return _ixformer_group_cache[pg_id]
+
 def broadcast(tensor, src=0, group=None, async_op=False):
-    cdist.broadcast(tensor,src,group,async_op=True)
+    ix_group = _to_ixformer_group(group)
+    cdist.broadcast(tensor, src, ix_group)
     if async_op:
         return Async_helper()
     else:

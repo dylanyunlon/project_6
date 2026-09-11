@@ -668,7 +668,7 @@ class SequenceGroup:
                  draft_size: int = 1) -> None:
         self.request_id = request_id
         self.seqs = seqs
-        self.first_seq = seqs[0]
+        self.first_seq = seqs[0] if seqs else None  # type: ignore[assignment]
         self.arrival_time = arrival_time
         self.is_single_seq = len(seqs) == 1
         self.seqs_dict = {seq.seq_id: seq for seq in seqs}

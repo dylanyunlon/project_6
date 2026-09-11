@@ -25,10 +25,22 @@ import numpy as np
 import torch
 from outlines import grammars
 from outlines.caching import cache, disable_cache
-from outlines.fsm.guide import (CFGGuide, CFGState, Generate, Guide,
-                                RegexGuide, Write)
-from outlines.fsm.parsing import PartialLark
-from outlines_core.fsm.json_schema import build_regex_from_schema
+from outlines.fsm.guide import CFGGuide, Generate, Guide, RegexGuide, Write
+
+try:
+    from outlines.fsm.guide import CFGState
+except ImportError:
+    CFGState = None  # type: ignore[misc,assignment]
+
+try:
+    from outlines.fsm.parsing import PartialLark
+except ImportError:
+    PartialLark = None  # type: ignore[misc,assignment]
+
+try:
+    from outlines_core.fsm.json_schema import build_regex_from_schema
+except ImportError:
+    from outlines.fsm.json_schema import build_regex_from_schema
 from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
 
@@ -53,8 +65,11 @@ class BaseLogitsProcessor:
         self._guide: Guide = guide
         self._reasoner: Optional[ReasoningParser] = reasoner
         # CFGState is used for the FSM state for CFGGuide
-        self._fsm_state: DefaultDict[int, Union[int,
-                                                CFGState]] = defaultdict(int)
+        if CFGState is not None:
+            self._fsm_state: DefaultDict[int, Union[int,
+                                                    CFGState]] = defaultdict(int)
+        else:
+            self._fsm_state: DefaultDict[int, int] = defaultdict(int)  # type: ignore[no-redef]
 
     def __call__(self, input_ids: List[int],
                  scores: torch.Tensor) -> torch.Tensor:
@@ -86,13 +101,25 @@ class BaseLogitsProcessor:
             # On the first time this is called, we simply re-create
             # the Lark object.
             if isinstance(self._guide, CFGGuide):
-                self._guide.parser = PartialLark(
-                    self._guide.cfg_string,
-                    parser="lalr",
-                    import_paths=[grammars.GRAMMAR_PATH],
-                )
-                self._fsm_state[seq_id] = CFGState(
-                    parser_state=self._guide.parser.parse(""), prev_token=None)
+                if PartialLark is not None:
+                    self._guide.parser = PartialLark(
+                        self._guide.cfg_string,
+                        parser="lalr",
+                        import_paths=[grammars.GRAMMAR_PATH],
+                    )
+                else:
+                    from lark import Lark
+                    self._guide.parser = Lark(
+                        self._guide.cfg_string,
+                        parser="lalr",
+                        import_paths=[grammars.GRAMMAR_PATH],
+                    )
+                if CFGState is not None:
+                    self._fsm_state[seq_id] = CFGState(
+                        parser_state=self._guide.parser.parse(""),
+                        prev_token=None)
+                else:
+                    self._fsm_state[seq_id] = 0
 
         instruction = self._guide.get_next_instruction(
             state=self._fsm_state[seq_id])

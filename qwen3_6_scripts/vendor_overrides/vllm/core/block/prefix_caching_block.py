@@ -121,6 +121,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         allocator: BlockAllocator,
         block_id: Optional[int] = None,
         computed: bool = False,
+        extra_hash: Optional[int] = None,
     ) -> Block:
         # Bind block to self.
         allocator = self
@@ -132,6 +133,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
             block_id=block_id,
             allocator=allocator,
             computed=computed,
+            extra_hash=extra_hash,
         )
 
     def allocate_immutable_block(self,
@@ -753,6 +755,7 @@ class PrefixCachingBlock(Block):
         allocator: BlockAllocator,
         block_id: Optional[int] = None,
         computed: bool = False,
+        extra_hash: Optional[int] = None,
     ):
         assert isinstance(allocator, PrefixCachingBlockAllocator), (
             "Currently this class is only tested with "
@@ -766,6 +769,7 @@ class PrefixCachingBlock(Block):
         self._allocator = allocator
         self._last_accessed: float = _DEFAULT_LAST_ACCESSED_TIME
         self._computed = computed
+        self._extra_hash = extra_hash
 
         # On the first time, we create the block object, and next we only
         # reinitialize it
@@ -775,13 +779,15 @@ class PrefixCachingBlock(Block):
                 token_ids=token_ids,
                 block_size=block_size,
                 block_id=block_id,
-                allocator=self._allocator)
+                allocator=self._allocator,
+                extra_hash=extra_hash)
         else:
             self._block = NaiveBlock(prev_block=prev_block,
                                      token_ids=token_ids,
                                      block_size=block_size,
                                      block_id=block_id,
-                                     allocator=self._allocator)
+                                     allocator=self._allocator,
+                                     extra_hash=extra_hash)
 
         self._update_num_tokens_total()
 
@@ -876,6 +882,10 @@ class PrefixCachingBlock(Block):
         return self._prev_block
 
     @property
+    def extra_hash(self) -> Optional[int]:
+        return self._extra_hash
+
+    @property
     def content_hash(self) -> Optional[int]:
         """Return the content-based hash of the current block, or None if it is
         not yet defined.
@@ -905,17 +915,17 @@ class PrefixCachingBlock(Block):
         self._cached_content_hash = PrefixCachingBlock.hash_block_tokens(
             is_first_block,
             prev_block_hash,
-            cur_block_token_ids=self.token_ids)
+            cur_block_token_ids=self.token_ids,
+            extra_hash=self._extra_hash)
         return self._cached_content_hash
 
     @staticmethod
     def hash_block_tokens(is_first_block: bool, prev_block_hash: Optional[int],
-                          cur_block_token_ids: List[int]) -> int:
+                          cur_block_token_ids: List[int],
+                          extra_hash: Optional[int] = None) -> int:
         """Computes a hash value corresponding to the contents of a block and
         the contents of the preceding block(s). The hash value is used for
         prefix caching.
-
-        NOTE: Content-based hashing does not yet support LoRA.
 
         Parameters:
         - is_first_block (bool): A flag indicating if the block is the first in
@@ -924,12 +934,15 @@ class PrefixCachingBlock(Block):
             if this is the first block.
         - cur_block_token_ids (List[int]): A list of token ids in the current
             block. The current block is assumed to be full.
+        - extra_hash (Optional[int]): An optional extra hash (e.g. LoRA adapter
+            id) to include in the content hash for disambiguation.
 
         Returns:
         - int: The computed hash value for the block.
         """
         assert (prev_block_hash is None) == is_first_block
-        return hash((is_first_block, prev_block_hash, *cur_block_token_ids))
+        return hash((is_first_block, prev_block_hash, extra_hash,
+                     *cur_block_token_ids))
 
 
 class ComputedBlocksTracker:

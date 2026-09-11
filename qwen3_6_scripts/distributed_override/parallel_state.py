@@ -355,7 +355,7 @@ class GroupCoordinator:
         if self.device_communicator.use_vllm_comm:
             ops.broadcast(input_,
                         src=self.ranks[src],
-                        group=self.device_group)
+                        group=self.device_communicator.ixformer_group)
         else:
             torch.distributed.broadcast(input_,
                                         src=self.ranks[src],
@@ -484,6 +484,8 @@ class GroupCoordinator:
 
         group = self.device_group
         metadata_group = self.cpu_group
+        ix_group = (self.device_communicator.ixformer_group
+                    if self.device_communicator is not None else None)
         assert src < self.world_size, f"Invalid src rank ({src})"
 
         rank_in_group = self.rank_in_group
@@ -513,7 +515,7 @@ class GroupCoordinator:
                     if self.device_communicator.use_vllm_comm:
                         handle = ops.broadcast(tensor,
                                                src=self.ranks[src],
-                                               group=group,
+                                               group=ix_group,
                                                async_op=True)
                     else:
                         handle = torch.distributed.broadcast(tensor,
@@ -549,7 +551,7 @@ class GroupCoordinator:
                         if self.device_communicator.use_vllm_comm:
                             handle = ops.broadcast(tensor,
                                                    src=self.ranks[src],
-                                                   group=group,
+                                                   group=ix_group,
                                                    async_op=True)
                         else:
                             handle = torch.distributed.broadcast(
@@ -585,6 +587,8 @@ class GroupCoordinator:
 
         group = self.device_group
         metadata_group = self.cpu_group
+        ix_group = (self.device_communicator.ixformer_group
+                    if self.device_communicator is not None else None)
 
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
@@ -619,7 +623,7 @@ class GroupCoordinator:
                 if self.device_communicator.use_vllm_comm:
                      ixfd.send(tensor,
                                dst=self.ranks[dst],
-                               group=group)
+                               group=ix_group)
                 else:
                     # use group for GPU tensors
                     torch.distributed.send(tensor,
@@ -646,6 +650,8 @@ class GroupCoordinator:
 
         group = self.device_group
         metadata_group = self.cpu_group
+        ix_group = (self.device_communicator.ixformer_group
+                    if self.device_communicator is not None else None)
 
         if src is None:
             src = (self.rank_in_group - 1) % self.world_size
@@ -682,7 +688,7 @@ class GroupCoordinator:
                     if self.device_communicator.use_vllm_comm:
                         ixfd.recv(tensor,
                                   src=self.ranks[src],
-                                  group=group)
+                                  group=ix_group)
                     else:
                         # use group for GPU tensors
                         torch.distributed.recv(tensor,

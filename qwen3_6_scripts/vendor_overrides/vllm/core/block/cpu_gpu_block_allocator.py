@@ -337,6 +337,39 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         self._swap_mapping.clear()
         return list(mapping.items())
 
+    def reset_prefix_cache(self, device: Optional[Device] = None) -> bool:
+        """Reset prefix cache on the given device, or all devices if None."""
+        if device is not None:
+            return self._allocators[device].reset_prefix_cache()
+        success = True
+        for alloc in self._allocators.values():
+            if not alloc.reset_prefix_cache():
+                success = False
+        return success
+
+    def find_cached_blocks_prefix(
+        self,
+        block_hashes: List[int],
+        device: Device = Device.GPU,
+    ) -> List[int]:
+        """Find the prefix of cached blocks on the given device."""
+        return self._allocators[device].find_cached_blocks_prefix(block_hashes)
+
+    @property
+    def content_offload_enabled(self) -> bool:
+        """Whether content offload (CPU<->GPU background transfer) is active."""
+        return False
+
+    def begin_prefix_cache_step(self) -> None:
+        """Called at the start of each scheduler step (no-op without content
+        offload)."""
+        pass
+
+    def get_and_reset_prefix_swaps(
+            self) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+        """Return (swap_in, swap_out) prefix transfer pairs and reset."""
+        return [], []
+
 
 class NullBlock(Block):
     """
@@ -402,3 +435,7 @@ class NullBlock(Block):
     @property
     def content_hash(self):
         return self._proxy.content_hash
+
+    @property
+    def extra_hash(self):
+        return self._proxy.extra_hash

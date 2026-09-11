@@ -233,6 +233,7 @@ class SamplingParams(
     logit_bias: Optional[Dict[int, float]] = None
     allowed_token_ids: Optional[List[int]] = None
     prompt_logprob_positions: Optional[List[int]] = None
+    bad_words: List[str] = msgspec.field(default_factory=list)
 
     @staticmethod
     def from_optional(
