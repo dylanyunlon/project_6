@@ -5,7 +5,15 @@ from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
-import ixformer.inference.functions as IXF
+try:
+    import ixformer._C as _ixf_C
+    if hasattr(_ixf_C, 'infer') and hasattr(_ixf_C.infer, 'linear'):
+        import ixformer.inference.functions as IXF
+    else:
+        # CoreX 3.2.3 _C.so lacks infer submodule; use torch native
+        import torch.nn.functional as IXF
+except Exception:
+    import torch.nn.functional as IXF
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 from vllm.distributed import (divide, get_tensor_model_parallel_rank,

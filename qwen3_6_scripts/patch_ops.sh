@@ -60,6 +60,34 @@ install_patch_file() {
 
 build_stage "patch script entered"
 
+build_stage "patching torch._inductor triton_heuristics (get_cuda_stream compat)"
+# --- torch._inductor: fix Triton 2.3.1 / corex torch incompatibility --------
+# The corex torch build's triton_heuristics.py line 43 does:
+#   from triton.runtime.jit import get_cuda_stream, KernelInterface
+# But Standard Triton 2.3.1 (BI-V100 image) does not export get_cuda_stream.
+# Upstream PyTorch >=2.5 uses torch._C._cuda_getCurrentRawStream instead.
+# We patch the file on disk and inject a runtime compat shim.
+python3 ./patch_triton_compat.py <<'PY_DISK_PATCH'
+import sys
+sys.path.insert(0, '.')
+from patch_triton_compat import patch_triton_heuristics_on_disk
+patched = patch_triton_heuristics_on_disk()
+if not patched:
+    print('[skip] triton_heuristics already patched or not found')
+PY_DISK_PATCH
+
+build_stage "bridging ixformer SDK 0.6.0 infer API to CoreX 3.2.3 _functions"
+# SDK 0.6.0 inference/functions/*.py calls _C.infer.xxx but CoreX 3.2.3
+# _C.so only exposes _C._functions.xxx_forward. Deploy the bridge module
+# into VLLM_ROOT so env_override.py can find it at runtime.
+if [[ -f "./patch_ixformer_infer.py" ]]; then
+    cp -f "./patch_ixformer_infer.py" "${VLLM_ROOT}/patch_ixformer_infer.py"
+    python3 -m py_compile "${VLLM_ROOT}/patch_ixformer_infer.py"
+    echo "[ok] deployed ixformer infer bridge to ${VLLM_ROOT}/"
+    # Pre-apply: run bridge now so any subsequent py_compile imports succeed
+    python3 -c "import sys; sys.path.insert(0,'.'); import patch_ixformer_infer" 2>/dev/null || true
+fi
+
 build_stage "checking offline transformers dependency"
 # --- transformers: Qwen3_5 tokenizer / model files --------------------------
 TRANSFORMERS_REQUIRED_VERSION="4.55.3"

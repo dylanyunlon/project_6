@@ -1879,7 +1879,7 @@ class Qwen3_5FullAttention(nn.Module):
 
         with bi100_timer("full_attn.attention"):
             with bi100_timer(f"L{self.layer_idx}.full_attn"):
-                attn_out = self.attn(q, k, v, kv_cache, attn_metadata)
+                attn_out = self.attn(q, k, v)
 
         with bi100_timer("full_attn.gate"):
             attn_out = (attn_out

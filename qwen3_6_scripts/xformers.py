@@ -406,6 +406,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         key: Optional[torch.Tensor],
         value: Optional[torch.Tensor],
         kv_cache: torch.Tensor,
+        kv_cache_scale: torch.Tensor,
         attn_metadata: "XFormersMetadata",
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:

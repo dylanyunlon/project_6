@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Custom normalization layers."""
+import functools
 from typing import Optional, Tuple, Union
 
 import torch
@@ -269,11 +270,30 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # Guard: if already inside torch.compile tracing, use native directly
         if getattr(torch.compiler, 'is_compiling', lambda: False)():
             return self.forward_native(x, residual)
 
+        # BI-V100 / CoreX: torch.compile inductor backend calls
+        # triton.compile(signature=...) which Triton 2.3.1 does not support.
+        # Detect this at first call and permanently skip torch.compile if so.
         if not getattr(self, "_is_compiled", False):
-            self.forward_static = torch.compile(  # type: ignore
-                self.forward_static)
+            if self._can_torch_compile():
+                self.forward_static = torch.compile(  # type: ignore
+                    self.forward_static)
             self._is_compiled = True
         return self.forward_native(x, residual)
+
+    @staticmethod
+    @functools.lru_cache(maxsize=1)
+    def _can_torch_compile() -> bool:
+        """Check if torch.compile + inductor + triton.compile is functional."""
+        try:
+            import inspect
+            import triton
+            sig = inspect.signature(triton.compile)
+            # Triton 2.3.1 (CoreX) does not accept 'signature' kwarg;
+            # newer Triton (>=3.0) does. If missing, inductor will crash.
+            return 'signature' in sig.parameters
+        except Exception:
+            return False

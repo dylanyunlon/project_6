@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 try:
     import ixformer._C as _ixf_C
-    if hasattr(_ixf_C, 'infer'):
+    if hasattr(_ixf_C, 'infer') and hasattr(_ixf_C.infer, 'linear'):
         import ixformer.inference.functions as F
     else:
         import torch.nn.functional as F
