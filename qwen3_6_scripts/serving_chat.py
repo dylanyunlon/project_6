@@ -1279,6 +1279,9 @@ class OpenAIServingChat(OpenAIServing):
         created_time = int(time.time())
         final_res: Optional[RequestOutput] = None
 
+        should_stream_with_reasoning_parsing = (
+            self._should_stream_with_reasoning_parsing(request))
+
         # [BI100] Disconnect watcher for non-streaming
         _disconnect_watcher: Optional[asyncio.Task] = None
         if raw_request is not None:
@@ -1359,6 +1362,7 @@ class OpenAIServingChat(OpenAIServing):
                 output_text = output.text
 
             named_tool_called = False
+            auto_tools_called = False
 
             # if auto tools are not enabled, and a named tool choice using
             #   outlines is not being used

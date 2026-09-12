@@ -1037,28 +1037,29 @@ class Async_helper():
         return True
 
 
-_ixformer_group_cache: Dict[int, Any] = {}
-
-def _to_ixformer_group(group):
-    """Convert a torch.distributed ProcessGroup to an ixformer NcclGroup.
-
-    ixformer's C++ broadcast() expects an NcclGroup (or None), not a
-    torch ProcessGroup.  We cache the conversion keyed on the PG's
-    Python id() so it is done at most once per group object.
-    """
-    if group is None:
-        return None
-    pg_id = id(group)
-    if pg_id not in _ixformer_group_cache:
-        from ixformer.contrib.torch.extension.ixformer_torch.distributed import (
-            create_ixformer_group_from_pg,
-        )
-        _ixformer_group_cache[pg_id] = create_ixformer_group_from_pg(group)
-    return _ixformer_group_cache[pg_id]
-
 def broadcast(tensor, src=0, group=None, async_op=False):
-    ix_group = _to_ixformer_group(group)
-    cdist.broadcast(tensor, src, ix_group)
+    # ixformer cdist.broadcast signature:
+    #   (data: TensorBase, src_rank: int, group: NcclGroup = None) -> None
+    #
+    # `group` arriving here can be:
+    #   a) None                         → pass through
+    #   b) ixformer NcclGroup           → pass through
+    #   c) torch.distributed ProcessGroup → must convert
+    #
+    # We detect (c) by checking for the torch PG attribute `_get_backend_name`;
+    # NcclGroup and None lack it.  Only when we see a real torch PG do we
+    # convert; otherwise we forward as-is.
+    ix_group = group
+    if group is not None and hasattr(group, '_get_backend_name'):
+        # It is a torch ProcessGroup — convert to NcclGroup.
+        try:
+            from ixformer.contrib.torch.extension.ixformer_torch.distributed import (
+                create_ixformer_group_from_pg,
+            )
+            ix_group = create_ixformer_group_from_pg(group)
+        except Exception:
+            ix_group = None
+    cdist.broadcast(tensor, src, ix_group, async_op=True)
     if async_op:
         return Async_helper()
     else:

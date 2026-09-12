@@ -2879,9 +2879,17 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
         mamba_cache_params = self.mamba_cache.current_run_tensors(**kwargs)
         # New API returns MambaCacheParams with .conv_state, .ssm_state,
         # .state_indices_tensor; old API returned (conv_states, temporal_states)
+        _mamba_state_indices = None
         if hasattr(mamba_cache_params, 'conv_state'):
             conv_states = mamba_cache_params.conv_state
             temporal_states = mamba_cache_params.ssm_state
+            # New API keeps the full (num_layers, max_batch_size, ...) cache
+            # and provides state_indices_tensor to map actual seqs → slots.
+            # Gather active slots so downstream sees (num_layers, batch, ...).
+            if hasattr(mamba_cache_params, 'state_indices_tensor'):
+                _mamba_state_indices = mamba_cache_params.state_indices_tensor.long()
+                conv_states = conv_states[:, _mamba_state_indices].contiguous()
+                temporal_states = temporal_states[:, _mamba_state_indices].contiguous()
         else:
             conv_states, temporal_states = mamba_cache_params
 
@@ -2978,6 +2986,11 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
                 inputs_embeds=inputs_embeds,
                 gdn_capture_offsets=interior_capture_offsets,
                 gdn_segment_offsets=interior_segment_offsets)
+
+        # Scatter modified states back into the full cache when using new API
+        if _mamba_state_indices is not None:
+            mamba_cache_params.conv_state[:, _mamba_state_indices] = conv_states
+            mamba_cache_params.ssm_state[:, _mamba_state_indices] = temporal_states
 
         for offset, capture_key in capture_keys.items():
             if offset == query_len:
