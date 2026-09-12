@@ -411,6 +411,18 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with xFormers and PagedAttention."""
+        # [DEBUG] Check if kv_cache is properly bound
+        _xf_diag = getattr(self, '_xf_diag_cnt', 0)
+        if _xf_diag < 3:
+            self._xf_diag_cnt = _xf_diag + 1
+            logger.info(
+                "[DEBUG_XFORMERS] call=%d kv_cache.shape=%s numel=%d "
+                "num_prefills=%s num_decode=%s",
+                _xf_diag,
+                tuple(kv_cache.shape) if kv_cache.numel() > 0 else "(empty)",
+                kv_cache.numel(),
+                getattr(attn_metadata, 'num_prefills', '?'),
+                getattr(attn_metadata, 'num_decode_tokens', '?'))
         attn_type = self.attn_type
         # Check that appropriate attention metadata attributes are
         # selected for the desired attention type
@@ -505,6 +517,20 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         if decode_meta := attn_metadata.decode_metadata:
             assert attn_type != AttentionType.ENCODER_ONLY, (
                 "Encoder-only models should not have decode metadata.")
+
+            _dec_diag = getattr(self, '_dec_diag', 0)
+            if _dec_diag < 3:
+                self._dec_diag = _dec_diag + 1
+                logger.info(
+                    "[DEBUG_DECODE] call=%d kv_numel=%d "
+                    "seq_lens=%s block_tables_shape=%s "
+                    "num_prefill_q=%d num_decode_q=%d",
+                    _dec_diag, kv_cache.numel(),
+                    decode_meta.seq_lens_tensor[:3].tolist()
+                        if decode_meta.seq_lens_tensor is not None else None,
+                    tuple(decode_meta.block_tables.shape)
+                        if decode_meta.block_tables is not None else None,
+                    num_prefill_query_tokens, num_decode_query_tokens)
 
             (
                 seq_lens_arg,

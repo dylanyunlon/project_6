@@ -439,6 +439,17 @@ class OpenAIServingChat(OpenAIServing):
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(str(e))
 
+        # [DEBUG] Log rendered prompt to diagnose model quality issues
+        if engine_prompts:
+            ep0 = engine_prompts[0]
+            if hasattr(ep0, 'prompt') and ep0.prompt:
+                logger.info("[DEBUG_PROMPT] text=%r",
+                            ep0.prompt[:500])
+            if hasattr(ep0, 'prompt_token_ids') and ep0.prompt_token_ids:
+                ids = ep0.prompt_token_ids
+                logger.info("[DEBUG_PROMPT] token_ids len=%d first10=%s last10=%s",
+                            len(ids), ids[:10], ids[-10:])
+
         # tool_choice = "required" is not supported on BI-V100
         if request.tool_choice == "required":
             return self.create_error_response(
@@ -1348,9 +1359,17 @@ class OpenAIServingChat(OpenAIServing):
                 except RuntimeError as e:
                     logger.exception("Error in reasoning parser creation.")
                     return self.create_error_response(str(e))
+                logger.info(
+                    "[DEBUG_REASONING] raw output.text=%r token_ids=%s",
+                    output.text[:200] if output.text else output.text,
+                    list(output.token_ids[:20]) if output.token_ids else [])
                 reasoning_content, extracted = (
                     reasoning_parser.extract_reasoning_content(
                         output.text, request=request))
+                logger.info(
+                    "[DEBUG_REASONING] after parse: reasoning=%r content=%r",
+                    reasoning_content[:200] if reasoning_content else reasoning_content,
+                    extracted[:200] if extracted else extracted)
                 output_text = extracted or ""
                 if isinstance(request.tool_choice,
                               ChatCompletionNamedToolChoiceParam):

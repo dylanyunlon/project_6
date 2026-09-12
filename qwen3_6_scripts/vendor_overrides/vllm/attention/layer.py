@@ -174,6 +174,12 @@ class Attention(nn.Module):
         # shape does not match the query shape, so we optionally let the model
         # definition specify the output tensor shape.
         output_shape: Optional[torch.Size] = None,
+        # BI100 compat: accept kv_cache / attn_metadata passed explicitly by
+        # model code (old-style API).  When provided, these override the
+        # forward_context lookup so that models that pass kv_cache through
+        # the call chain keep working even if bind_kv_cache did not run.
+        kv_cache: Optional[torch.Tensor] = None,
+        attn_metadata: Optional["AttentionMetadata"] = None,
     ) -> torch.Tensor:
         """
         The KV cache is stored inside this class and is accessed via
@@ -184,8 +190,20 @@ class Attention(nn.Module):
         context using
         `vllm.forward_context.get_forward_context().attn_metadata`.
         """
+        # BI100 compat: resolve kv_cache / attn_metadata from explicit args
+        # first, falling back to forward_context when not provided.
+        if attn_metadata is None or kv_cache is None:
+            _fwd_ctx = get_forward_context()
+            if attn_metadata is None:
+                attn_metadata = _fwd_ctx.attn_metadata
+            if kv_cache is None:
+                kv_cache = self.kv_cache[_fwd_ctx.virtual_engine]
+            _kv_cache_scale = self.kv_cache_scale[_fwd_ctx.virtual_engine]
+        else:
+            # Explicit kv_cache provided — use a zero scale placeholder
+            _kv_cache_scale = torch.zeros(
+                1, dtype=query.dtype, device=query.device)
         if self.calculate_kv_scales:
-            attn_metadata = get_forward_context().attn_metadata
             if attn_metadata.enable_kv_scales_calculation:
                 self.calc_kv_scales(query, key, value)
         if self.use_output:
@@ -209,16 +227,12 @@ class Attention(nn.Module):
                 if value is not None:
                     value = value.view(-1, self.num_kv_heads, self.head_size)
             if self.use_direct_call:
-                forward_context: ForwardContext = get_forward_context()
-                attn_metadata = forward_context.attn_metadata
-                self_kv_cache = self.kv_cache[forward_context.virtual_engine]
-                self_kv_cache_scale = self.kv_cache_scale[forward_context.virtual_engine]
                 return self.impl.forward(self,
                                   query,
                                   key,
                                   value,
-                                  self_kv_cache,
-                                  self_kv_cache_scale,
+                                  kv_cache,
+                                  _kv_cache_scale,
                                   attn_metadata,
                                   output=output)
             else:
@@ -227,12 +241,19 @@ class Attention(nn.Module):
             # return output.view(-1, hidden_size)
         else:
             if self.use_direct_call:
-                forward_context = get_forward_context()
-                attn_metadata = forward_context.attn_metadata
-                self_kv_cache = self.kv_cache[forward_context.virtual_engine]
-                self_kv_cache_scale = self.kv_cache_scale[forward_context.virtual_engine]
+                _lyr_diag = getattr(self, '_lyr_diag_cnt', 0)
+                if _lyr_diag < 3:
+                    self._lyr_diag_cnt = _lyr_diag + 1
+                    import logging as _lg
+                    _lg.getLogger("vllm.attention.layer").info(
+                        "[DEBUG_LAYER] call=%d layer=%s kv_cache numel=%d "
+                        "shape=%s attn_meta=%s",
+                        _lyr_diag, self.layer_name,
+                        kv_cache.numel(),
+                        tuple(kv_cache.shape) if kv_cache.numel() > 0 else "(empty)",
+                        type(attn_metadata).__name__)
                 return self.impl.forward(self, query, key, value,
-                                         self_kv_cache,self_kv_cache_scale, attn_metadata)
+                                         kv_cache, _kv_cache_scale, attn_metadata)
             else:
                 return torch.ops.vllm.unified_attention(
                     query, key, value, self.layer_name)

@@ -23,6 +23,13 @@ class Qwen3ReasoningParser(ReasoningParser):
     output via the 'enable_thinking=False' parameter. This parser extracts the
     reasoning content enclosed by <think> and </think> tokens from the model's
     output.
+
+    IMPORTANT: When enable_thinking=True, the Qwen3 chat template appends
+    ``<think>\n`` to the end of the prompt. This means the model's generated
+    output does NOT start with ``<think>``; it starts directly with reasoning
+    text followed by ``</think>`` and then the actual content. The parser
+    must handle this case: when ``</think>`` is present but ``<think>`` is
+    absent, everything before ``</think>`` is reasoning content.
     """
 
     def __init__(self, tokenizer: PreTrainedTokenizerBase):
@@ -71,6 +78,12 @@ class Qwen3ReasoningParser(ReasoningParser):
         For text <think>abc</think>xyz:
         - 'abc' goes to reasoning_content
         - 'xyz' goes to content
+
+        When Qwen3 chat template has enable_thinking=True, ``<think>`` is
+        already part of the prompt so the generated output starts directly
+        with reasoning tokens.  We detect this case (no ``<think>`` in
+        previous or delta, no ``</think>`` yet) and route those tokens to
+        reasoning_content.
         """
         # Skip single special tokens
         if len(delta_token_ids) == 1 and (delta_token_ids[0] in [
@@ -97,7 +110,7 @@ class Qwen3ReasoningParser(ReasoningParser):
                 return DeltaMessage(reasoning_content=delta_text)
         elif self.think_start_token_id in delta_token_ids:
             if self.think_end_token_id in delta_token_ids:
-                # <think> in delta, </think> in delta, extract reasoning content
+                # <think> in delta, </think> in delta, extract reasoning
                 start_index = delta_text.find(self.think_start_token)
                 end_index = delta_text.find(self.think_end_token)
                 reasoning_content = delta_text[start_index +
@@ -111,8 +124,26 @@ class Qwen3ReasoningParser(ReasoningParser):
                 # reasoning content continues
                 return DeltaMessage(reasoning_content=delta_text)
         else:
-            # thinking is disabled, just content
-            return DeltaMessage(content=delta_text)
+            # -----------------------------------------------------------
+            # Neither previous nor delta contains <think>.
+            # This happens when enable_thinking=True and the chat template
+            # already placed <think> at the end of the prompt.  The model
+            # output starts directly with reasoning text.
+            # -----------------------------------------------------------
+            if self.think_end_token_id in previous_token_ids:
+                # </think> already seen -> past reasoning, emit content.
+                return DeltaMessage(content=delta_text)
+            elif self.think_end_token_id in delta_token_ids:
+                # </think> in this delta -> split reasoning / content.
+                end_index = delta_text.find(self.think_end_token)
+                reasoning_content = delta_text[:end_index]
+                content = delta_text[end_index + len(self.think_end_token):]
+                return DeltaMessage(
+                    reasoning_content=reasoning_content or None,
+                    content=content if content else None)
+            else:
+                # No </think> seen yet -> still in reasoning phase.
+                return DeltaMessage(reasoning_content=delta_text)
 
     def extract_reasoning_content(
             self, model_output: str, request: ChatCompletionRequest
@@ -124,27 +155,42 @@ class Qwen3ReasoningParser(ReasoningParser):
         - 'abc' goes to reasoning_content
         - 'xyz' goes to content
 
+        When ``enable_thinking=True``, the chat template places ``<think>``
+        inside the prompt so the model output looks like ``abc</think>xyz``
+        (no leading ``<think>``).  We handle that by treating everything
+        before ``</think>`` as reasoning content.
+
         Returns:
             tuple[Optional[str], Optional[str]]: reasoning content and content
         """
 
-        # Check if the model output contains the <think> and </think> tokens.
-        if (self.think_start_token not in model_output
-                or self.think_end_token not in model_output):
-            return None, model_output
-        # Check if the <think> is present in the model output, remove it
-        # if it is present.
-        model_output_parts = model_output.partition(self.think_start_token)
-        model_output = model_output_parts[2] if model_output_parts[
-            1] else model_output_parts[0]
-        # Check if the model output contains the </think> tokens.
-        # If the end token is not found, return the model output as is.
-        if self.think_end_token not in model_output:
-            return None, model_output
+        # --- Case 1: output contains both <think> and </think> ---
+        if (self.think_start_token in model_output
+                and self.think_end_token in model_output):
+            # Strip <think> prefix
+            model_output_parts = model_output.partition(
+                self.think_start_token)
+            model_output = (model_output_parts[2]
+                            if model_output_parts[1]
+                            else model_output_parts[0])
+            # Split on </think>
+            reasoning_content, _, content = model_output.partition(
+                self.think_end_token)
+            return reasoning_content, content or None
 
-        # Extract reasoning content from the model output.
-        reasoning_content, _, content = model_output.partition(
-            self.think_end_token)
+        # --- Case 2: output contains </think> but NOT <think> ---
+        # Normal path when enable_thinking=True: the chat template already
+        # emitted <think> as part of the prompt, so the model output starts
+        # with reasoning text directly.
+        if self.think_end_token in model_output:
+            reasoning_content, _, content = model_output.partition(
+                self.think_end_token)
+            # Strip the leading newline that the chat template adds after
+            # <think>\n - the model continues from there.
+            if reasoning_content.startswith("\n"):
+                reasoning_content = reasoning_content[1:]
+            return reasoning_content or None, content.strip() or None
 
-        final_content = content or None
-        return reasoning_content, final_content
+        # --- Case 3: neither tag present -> thinking disabled or no
+        # reasoning block at all ---
+        return None, model_output
