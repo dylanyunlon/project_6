@@ -191,6 +191,18 @@ class Qwen3ReasoningParser(ReasoningParser):
                 reasoning_content = reasoning_content[1:]
             return reasoning_content or None, content.strip() or None
 
+        # --- Case 2b: output contains <think> but NOT </think> ---
+        # This happens when the model emits its own <think> tag (e.g. when
+        # enable_thinking did not inject it into the prompt, or the model
+        # echoes it anyway) and then gets truncated by max_tokens before
+        # producing </think>.  Everything after <think> is reasoning;
+        # there is no final content yet.
+        if self.think_start_token in model_output:
+            _, _, after_think = model_output.partition(
+                self.think_start_token)
+            reasoning_content = after_think.strip()
+            return reasoning_content or None, None
+
         # --- Case 3: neither tag present -> thinking disabled or no
         # reasoning block at all ---
         return None, model_output
