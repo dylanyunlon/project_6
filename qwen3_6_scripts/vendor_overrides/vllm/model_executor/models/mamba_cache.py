@@ -36,11 +36,11 @@ class MambaCacheManager(ConstantSizeCache):
         # Initialize parent class
         super().__init__(max_batch_size)
 
-        conv_state = torch.empty(size=(num_mamba_layers, max_batch_size) +
+        conv_state = torch.zeros(size=(num_mamba_layers, max_batch_size) +
                                  conv_state_shape,
                                  dtype=dtype,
                                  device="cuda")
-        temporal_state = torch.empty(size=(num_mamba_layers, max_batch_size) +
+        temporal_state = torch.zeros(size=(num_mamba_layers, max_batch_size) +
                                      temporal_state_shape,
                                      dtype=dtype,
                                      device="cuda")
@@ -55,6 +55,16 @@ class MambaCacheManager(ConstantSizeCache):
         for cache_t in self.cache:
             cache_t[:, to_index].copy_(cache_t[:, from_index],
                                        non_blocking=True)
+
+    def _release_finished_requests(self, finished_seq_groups_req_ids):
+        """Override to zero out released cache slots."""
+        for req_id in finished_seq_groups_req_ids:
+            if req_id in self.cache_indices_mapping:
+                for cache_idx in self.cache_indices_mapping[req_id].values():
+                    # Zero out the released slot
+                    for cache_t in self.cache:
+                        cache_t[:, cache_idx].zero_()
+        super()._release_finished_requests(finished_seq_groups_req_ids)
 
     def current_run_tensors(self, **kwargs) -> MambaCacheParams:
         """

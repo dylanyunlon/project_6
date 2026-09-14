@@ -2881,25 +2881,14 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
         mamba_cache_params = self.mamba_cache.current_run_tensors(**kwargs)
         # New API returns MambaCacheParams with .conv_state, .ssm_state,
         # .state_indices_tensor; old API returned (conv_states, temporal_states)
+        _mamba_state_indices = None
         if hasattr(mamba_cache_params, 'conv_state'):
-            full_conv = mamba_cache_params.conv_state
-            full_temporal = mamba_cache_params.ssm_state
+            conv_states = mamba_cache_params.conv_state
+            temporal_states = mamba_cache_params.ssm_state
             if hasattr(mamba_cache_params, 'state_indices_tensor'):
-                indices = mamba_cache_params.state_indices_tensor.long()
-                batch_size = indices.shape[0]
-                # Copy active slots into positions 0..batch_size-1 so
-                # that GDN layers can modify them in-place through a
-                # simple slice view (matching old API behaviour).
-                for i in range(batch_size):
-                    src = indices[i].item()
-                    if src != i:
-                        full_conv[:, i].copy_(full_conv[:, src])
-                        full_temporal[:, i].copy_(full_temporal[:, src])
-                conv_states = full_conv[:, :batch_size]
-                temporal_states = full_temporal[:, :batch_size]
-            else:
-                conv_states = full_conv
-                temporal_states = full_temporal
+                _mamba_state_indices = mamba_cache_params.state_indices_tensor.long()
+                conv_states = conv_states[:, _mamba_state_indices].contiguous()
+                temporal_states = temporal_states[:, _mamba_state_indices].contiguous()
         else:
             conv_states, temporal_states = mamba_cache_params
 
@@ -2996,6 +2985,11 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
                 inputs_embeds=inputs_embeds,
                 gdn_capture_offsets=interior_capture_offsets,
                 gdn_segment_offsets=interior_segment_offsets)
+
+        # Scatter modified GDN states back into the full cache
+        if _mamba_state_indices is not None:
+            mamba_cache_params.conv_state[:, _mamba_state_indices] = conv_states
+            mamba_cache_params.ssm_state[:, _mamba_state_indices] = temporal_states
 
         for offset, capture_key in capture_keys.items():
             if offset == query_len:
