@@ -192,17 +192,12 @@ class Attention(nn.Module):
         """
         # BI100 compat: resolve kv_cache / attn_metadata from explicit args
         # first, falling back to forward_context when not provided.
-        if attn_metadata is None or kv_cache is None:
-            _fwd_ctx = get_forward_context()
-            if attn_metadata is None:
-                attn_metadata = _fwd_ctx.attn_metadata
-            if kv_cache is None:
-                kv_cache = self.kv_cache[_fwd_ctx.virtual_engine]
-            _kv_cache_scale = self.kv_cache_scale[_fwd_ctx.virtual_engine]
-        else:
-            # Explicit kv_cache provided — use a zero scale placeholder
-            _kv_cache_scale = torch.zeros(
-                1, dtype=query.dtype, device=query.device)
+        _fwd_ctx = get_forward_context()
+        if attn_metadata is None:
+            attn_metadata = _fwd_ctx.attn_metadata
+        if kv_cache is None:
+            kv_cache = self.kv_cache[_fwd_ctx.virtual_engine]
+        _kv_cache_scale = self.kv_cache_scale[_fwd_ctx.virtual_engine]
         if self.calculate_kv_scales:
             if attn_metadata.enable_kv_scales_calculation:
                 self.calc_kv_scales(query, key, value)
