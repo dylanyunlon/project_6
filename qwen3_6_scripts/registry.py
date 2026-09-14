@@ -314,10 +314,9 @@ class _LazyRegisteredModel(_BaseRegisteredModel):
     module_name: str
     class_name: str
 
-    # Performed in another process to avoid initializing CUDA
+    # BI100: skip subprocess to avoid free() crash from corex .so unload
     def inspect_model_cls(self) -> _ModelInfo:
-        return _run_in_subprocess(
-            lambda: _ModelInfo.from_model_cls(self.load_model_cls()))
+        return _ModelInfo.from_model_cls(self.load_model_cls())
 
     def load_model_cls(self) -> Type[nn.Module]:
         mod = importlib.import_module(self.module_name)

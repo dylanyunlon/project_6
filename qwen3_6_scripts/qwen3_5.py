@@ -184,6 +184,8 @@ def _load_xllm_prebuilt(name):
         # When patch_ops.sh copies this file into vllm package, __file__
         # points to vllm/model_executor/models/ — look back up to workspace
         f"/home/dylan/0814/project_6/qwen3_6_scripts/prebuilt/corex-3.2.3-ivcore10/{name}.so",
+        # .so installed to VLLM_ROOT by install_prebuilt_corex.sh
+        os.path.join(os.path.dirname(__file__), "..", "..", f"{name}.so"),
     ]
     for _p in _search:
         if os.path.isfile(_p):
@@ -2521,10 +2523,12 @@ class Qwen3_5DecoderLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 def _validate_qwen_kv_cache_count(configured_count, kv_caches):
-    if len(kv_caches) != configured_count:
+    # vllm allocates num_hidden_layers KV caches; we only use the first
+    # configured_count (full_attention layers). Accept >= instead of ==.
+    if len(kv_caches) < configured_count:
         raise RuntimeError(
-            "Qwen3.5 allocated KV cache count mismatch: "
-            f"configured {configured_count}, received {len(kv_caches)}")
+            "Qwen3.5 KV cache count insufficient: "
+            f"need {configured_count}, received {len(kv_caches)}")
 
 
 class Qwen3_5Model(nn.Module):
@@ -2700,11 +2704,8 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
             1 for lt in text_cfg.layer_types if lt == "linear_attention")
         self.num_attn_layers = sum(
             1 for lt in text_cfg.layer_types if lt == "full_attention")
-        layers_block_type = getattr(
-            config, "layers_block_type",
-            ["attention"] * text_cfg.num_hidden_layers)
-        self.num_kv_cache_layers = sum(
-            layer_type == "attention" for layer_type in layers_block_type)
+        # Use text_cfg.layer_types directly: only full_attention layers need KV cache
+        self.num_kv_cache_layers = self.num_attn_layers
         if self.num_kv_cache_layers < self.num_attn_layers:
             raise RuntimeError(
                 "Qwen3.5 KV accounting provides fewer caches than "

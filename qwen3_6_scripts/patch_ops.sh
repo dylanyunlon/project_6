@@ -535,3 +535,9 @@ done
 build_stage "compiling submission Python sources"
 find . -path './wheels' -prune -o -name '*.py' -print0 | xargs -0 python3 -m py_compile
 build_stage "patch script completed"
+build_stage "installing ix_fused_moe 7-step pipeline and ex_engine"
+cp ./ix_fused_moe.py "${VLLM_ROOT}/model_executor/models/ix_fused_moe.py"
+if [[ -d "./ex_engine" ]]; then
+    cp -rf ./ex_engine "${VLLM_ROOT}/../ex_engine"
+    cp -rf ./ex_engine /workspace/ex_engine 2>/dev/null || true
+fi
