@@ -2882,8 +2882,24 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
         # New API returns MambaCacheParams with .conv_state, .ssm_state,
         # .state_indices_tensor; old API returned (conv_states, temporal_states)
         if hasattr(mamba_cache_params, 'conv_state'):
-            conv_states = mamba_cache_params.conv_state
-            temporal_states = mamba_cache_params.ssm_state
+            full_conv = mamba_cache_params.conv_state
+            full_temporal = mamba_cache_params.ssm_state
+            if hasattr(mamba_cache_params, 'state_indices_tensor'):
+                indices = mamba_cache_params.state_indices_tensor.long()
+                batch_size = indices.shape[0]
+                # Copy active slots into positions 0..batch_size-1 so
+                # that GDN layers can modify them in-place through a
+                # simple slice view (matching old API behaviour).
+                for i in range(batch_size):
+                    src = indices[i].item()
+                    if src != i:
+                        full_conv[:, i].copy_(full_conv[:, src])
+                        full_temporal[:, i].copy_(full_temporal[:, src])
+                conv_states = full_conv[:, :batch_size]
+                temporal_states = full_temporal[:, :batch_size]
+            else:
+                conv_states = full_conv
+                temporal_states = full_temporal
         else:
             conv_states, temporal_states = mamba_cache_params
 
