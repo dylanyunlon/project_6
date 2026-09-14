@@ -203,6 +203,19 @@ class Qwen3ReasoningParser(ReasoningParser):
             reasoning_content = after_think.strip()
             return reasoning_content or None, None
 
-        # --- Case 3: neither tag present -> thinking disabled or no
-        # reasoning block at all ---
+        # --- Case 3: neither tag present ---
+        # When enable_thinking=True, the chat template injects <think>\n at
+        # the end of the prompt.  The model's output then starts directly
+        # with reasoning text.  If we reach here it means the model was
+        # truncated (finish_reason=length) before it could emit </think>.
+        # In that case the entire output is reasoning, not content.
+        _thinking_on = (
+            request is not None
+            and getattr(request, 'chat_template_kwargs', None) is not None
+            and request.chat_template_kwargs.get('enable_thinking', False))
+        if _thinking_on:
+            reasoning_content = model_output.strip()
+            return reasoning_content or None, None
+
+        # thinking disabled or no reasoning block at all
         return None, model_output
