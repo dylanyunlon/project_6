@@ -23,6 +23,7 @@ limitations under the License.
 
 // cuda_ops_api.h removed — pulls glog/tvm deps not available on corex
 #include "type_convert.cuh"
+#include "device_utils.cuh"
 // Lightweight CHECK for corex build (no glog/tvm)
 #include <iostream>
 #include <cstdlib>

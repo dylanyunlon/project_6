@@ -56,7 +56,7 @@ class _typeConvert<float> {
   }
 };
 
-#if defined(USE_DCU) || (defined(CUDA_VERSION) && (CUDA_VERSION >= 12000)) || \
+#if defined(USE_DCU) || defined(__ILUVATAR__) || (defined(CUDA_VERSION) && (CUDA_VERSION >= 12000)) || \
     defined(USE_MACA)
 // CUDA < 12.0 runs into issues with packed type conversion
 template <>

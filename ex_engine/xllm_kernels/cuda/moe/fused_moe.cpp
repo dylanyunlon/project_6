@@ -14,7 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include "cuda_ops_api.h"
-#include "kernels/cuda/utils.h"
+#include "utils.h"
 #include "platform/device.h"
 #include "platform/platform.h"
 
