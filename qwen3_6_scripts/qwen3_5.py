@@ -338,7 +338,7 @@ _USE_COREX_MOE_WEIGHT_GATHER = (
     and env_bool("BI100_MOE_COREX_WEIGHT_GATHER", True))
 _USE_COREX_MOE_DIRECT_ROUTED = (
     _corex_moe_direct_routed is not None
-    and env_bool("BI100_MOE_COREX_DIRECT_ROUTED", True))
+    and env_bool("BI100_MOE_COREX_DIRECT_ROUTED", False))
 _USE_COREX_BATCHED_GEMM = (
     _corex_batched_gemm is not None
     and env_bool("BI100_MOE_BATCHED_GEMM", True))
@@ -2032,11 +2032,11 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         # corex_batched_gemm.moe_decode_fused, which are purpose-built
         # fused kernels for single-token MoE dispatch.
         # ---------------------------------------------------------------
-        if _USE_IX_FUSED_MOE and hidden_states.shape[0] > 1:
+        if _USE_IX_FUSED_MOE:
             w13 = self.experts.w13_weight  # (E, 2*I, H)
             w2 = self.experts.w2_weight    # (E, H, I)
             return _ix_fused_moe.fused_moe_forward(
-                hidden_states, router_logits,
+                hidden_states, router_logits.float(),
                 w13, w2,
                 self.top_k, w13.shape[0],
                 True)  # renormalize
@@ -2054,7 +2054,7 @@ class Qwen3_5MoeSparseBlock(nn.Module):
             # topk routing (reuse existing corex/xllm/pytorch topk)
             if _USE_XLLM_MOE:
                 topk_weights, topk_ids = _xllm_moe.moe_fused_topk(
-                    router_logits, self.top_k, True, None, "softmax")
+                    router_logits.float(), self.top_k, True, None, "softmax")
                 topk_ids = topk_ids.to(torch.int64)
                 topk_weights = topk_weights.to(hidden_states.dtype)
             elif _USE_COREX_MOE_TOPK_SOFTMAX:
@@ -2080,7 +2080,7 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         # Source: xllm/core/kernels/cuda/moe/moe_topk_softmax_kernels.cuh
         if _USE_XLLM_MOE:
             topk_weights, topk_ids = _xllm_moe.moe_fused_topk(
-                router_logits, self.top_k, True, None, "softmax")
+                router_logits.float(), self.top_k, True, None, "softmax")
             topk_ids = topk_ids.to(torch.int64)
             topk_weights = topk_weights.to(hidden_states.dtype)
         elif _USE_COREX_MOE_TOPK_SOFTMAX:
@@ -2169,96 +2169,33 @@ class Qwen3_5MoeSparseBlock(nn.Module):
                     0, keepdim=True).to(hidden_states.dtype)   # (1, H)
             else:
                 # --- TP mode: all 8 experts are local ---
-                # --- corex_moe_direct_routed: zero-copy indexed GEMM (warp64) ---
-                # Compiled kernel constants: kHidden=2048, kExperts=256, kTopK=8
-                # w13 must be (256, 256, 2048), w2 must be (256, 2048, 128)
-                # eids MUST be int64 (verified on real hardware)
-                # act for w2_reduce must be (8, 128) not (1, 1024)
-                use_corex_direct = (
-                    _USE_COREX_MOE_DIRECT_ROUTED
-                    and hidden_states.dtype == torch.float16
-                    and w13.dtype == torch.float16
-                    and w2.dtype == torch.float16
-                    and hidden_states.is_cuda and w13.is_cuda
-                    and hidden_states.is_contiguous()
-                    and w13.is_contiguous() and w2.is_contiguous()
-                    and w13.shape == (256, 256, 2048)
-                    and w2.shape == (256, 2048, 128)
-                    and eids.numel() == 8)
-                if not hasattr(self, '_direct_routed_logged'):
-                    self._direct_routed_logged = True
-                    logger.info(
-                        "MoE T=1 direct_routed check: flag=%s match=%s ep=%s "
-                        "hs=%s w13=%s w2=%s eids=%s ws=%s dtype_eids=%s",
-                        _USE_COREX_MOE_DIRECT_ROUTED, use_corex_direct, _ep,
-                        tuple(hidden_states.shape), tuple(w13.shape),
-                        tuple(w2.shape), tuple(eids.shape), tuple(ws.shape),
-                        eids.dtype)
-                if use_corex_direct:
-                    eids_i64 = eids.to(torch.int64)  # kernel requires int64
-                    gate_up = _corex_moe_direct_routed.w13(
-                        hidden_states, w13, eids_i64)              # (8, 256)
-                    gate, up = gate_up.chunk(2, dim=-1)            # (8, 128) each
-                    act = (torch.nn.functional.silu(gate) * up).contiguous()  # (8, 128)
-                    return _corex_moe_direct_routed.w2_reduce(
-                        act, w2, eids_i64, ws)                     # (1, 2048)
-
-                # Tier 1.5: CUTLASS batched GEMM (verified 2.462ms, issue #68)
-                # 1 launch for 8 experts vs 8 launches for F.linear loop
-                if (_USE_COREX_BATCHED_GEMM
-                        and hidden_states.dtype == torch.float16
-                        and w13.dtype == torch.float16
-                        and w2.dtype == torch.float16):
-                    return _corex_batched_gemm.moe_decode_fused(
-                        hidden_states, w13[eids], w2[eids], ws)
-
-                use_corex_gather = (
-                    _USE_COREX_MOE_WEIGHT_GATHER
-                    and hidden_states.dtype == torch.float16
-                    and w13.dtype == torch.float16
-                    and w2.dtype == torch.float16
-                    and w13.is_cuda and w2.is_cuda and eids.is_cuda
-                    and w13.is_contiguous() and w2.is_contiguous()
-                    and eids.is_contiguous()
-                    and w13.dim() == 3 and w2.dim() == 3
-                    and eids.dim() == 1 and eids.numel() == self.top_k
-                    and w13.shape[0] == w2.shape[0]
-                    and w13.shape[2] == w2.shape[1]
-                    and w13.shape[1] == 2 * w2.shape[2]
-                    and w13.shape[1] * w13.shape[2] % 8 == 0
-                    and w2.shape[1] * w2.shape[2] % 8 == 0)
-                if use_corex_gather:
-                    w13_sel, w2_sel = _corex_moe_weight_gather.gather(
-                        w13, w2, eids)
-                else:
-                    w13_sel = w13[eids]                            # (K, 2*I, H)
-                    w2_sel = w2[eids]                              # (K, H, I)
-
-                K_actual = eids.shape[0]
+                # xllm warp64-safe path: gather weights → fused GEMM → combine
+                K = eids.shape[0]
                 H = hidden_states.shape[-1]
+                w13_sel = w13[eids]                                # (K, 2*I, H)
+                w2_sel = w2[eids]                                  # (K, H, I)
 
-                # FC1: single large GEMM via F.linear
-                # (1, H) @ (K_actual*2*I, H)^T → (1, K_actual*2*I)
+                # FC1: single large GEMM via _fast_linear (ix_moe_bridge GEMV)
                 gate_up = _fast_linear(
                     hidden_states,
-                    w13_sel.reshape(-1, H),                        # (K_actual*2*I, H)
-                )                                                  # (1, K_actual*2*I)
-                gate_up = gate_up.view(K_actual, -1)               # (K_actual, 2*I)
+                    w13_sel.reshape(-1, H),                        # (K*2*I, H)
+                )                                                  # (1, K*2*I)
+                gate_up = gate_up.view(K, -1)                      # (K, 2*I)
 
                 if _USE_FUSED_MOE_ACTIVATION:
-                    act = self.act_fn(gate_up)                      # (K_actual, I)
+                    act = self.act_fn(gate_up)                      # (K, I)
                 else:
                     gate, up = gate_up.chunk(2, dim=-1)
                     act = F.silu(gate) * up
 
-                # FC2: bmm (K_actual, H, I) @ (K_actual, I, 1) → (K_actual, H)
+                # FC2: bmm (K, H, I) @ (K, I, 1) → (K, H)
                 expert_out = torch.bmm(w2_sel, act.unsqueeze(-1)).squeeze(-1)
 
-                if (_USE_COREX_MOE_EXACT_REDUCE
-                        and expert_out.dtype == torch.float16
-                        and ws.dtype == torch.float16
-                        and expert_out.shape[0] == 8):
-                    out = _corex_moe_exact_reduce.serial_float(expert_out, ws)
+                # Combine: xllm fused kernel or PyTorch weighted sum
+                if _USE_XLLM_MOE:
+                    # expert_out is (K, H), need (1*K, H) for combine
+                    out = _xllm_moe.moe_combine_result(
+                        expert_out, ws.float().unsqueeze(0), 1, K) # (1, H)
                 else:
                     out = (expert_out * ws.unsqueeze(-1)).sum(
                         0, keepdim=True).to(hidden_states.dtype)   # (1, H)
