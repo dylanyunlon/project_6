@@ -34,7 +34,7 @@ namespace {
 
 using namespace xllm::kernel::cuda;
 
-#if defined(USE_DCU)
+#if defined(USE_DCU) || defined(__ILUVATAR__)
 static constexpr unsigned long long kSoftmaxFullMask = 0xffffffffffffffffULL;
 #else
 static constexpr unsigned int kSoftmaxFullMask = 0xffffffffU;

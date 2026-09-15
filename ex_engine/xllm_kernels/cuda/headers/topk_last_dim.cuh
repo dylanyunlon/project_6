@@ -60,9 +60,11 @@ namespace reduce_topk {
 namespace air_topk_stable {
 using WideT = float4;
 constexpr int VECTORIZED_READ_SIZE = 16;
+#if defined(__ILUVATAR__) || defined(__COREX__)
+constexpr int WARP_SIZE = 64;
+#else
 constexpr int WARP_SIZE = 32;
-
-// constexpr unsigned FULL_WARP_MASK = 0xffffffff;
+#endif
 
 template <typename IdxT>
 struct ComputeOffset {
@@ -1237,7 +1239,11 @@ __global__ void radix_topk_one_block_kernel(T const* in,
 namespace moe_topk {
 namespace cg = cooperative_groups;
 static constexpr int kBLOCK_SIZE = 1024;
+#if defined(__ILUVATAR__) || defined(__COREX__)
+static constexpr int kWARP_SIZE = 64;
+#else
 static constexpr int kWARP_SIZE = 32;
+#endif
 static constexpr int kWARPS_PER_BLOCK = kBLOCK_SIZE / kWARP_SIZE;
 
 template <typename T>

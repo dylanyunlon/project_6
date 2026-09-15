@@ -21,16 +21,25 @@ limitations under the License.
 #include <cmath>
 #include <type_traits>
 
-#include "cuda_ops_api.h"
+// cuda_ops_api.h removed — pulls glog/tvm deps not available on corex
 #include "type_convert.cuh"
-#include "utils.h"
+// Lightweight CHECK for corex build (no glog/tvm)
+#include <iostream>
+#include <cstdlib>
+#ifndef CHECK
+#define CHECK(cond) if(!(cond)) std::cerr << "CHECK FAILED: " << #cond << " " << __FILE__ << ":" << __LINE__ << std::endl; if(!(cond)) std::abort(); 
+#endif
 
 using at::device_of;
 
 // Borrowed from:
 // https://github.com/vllm-project/vllm/blob/022f3cea5327cc720a325c50931e1edcfdf2d32b/csrc/fused_qknorm_rope_kernel.cu
 
+#if defined(__ILUVATAR__) || defined(__COREX__)
+constexpr uint64_t kFinalMask = 0xffffffffffffffffULL;
+#else
 constexpr uint32_t kFinalMask = 0xffffffffu;
+#endif
 
 namespace {
 

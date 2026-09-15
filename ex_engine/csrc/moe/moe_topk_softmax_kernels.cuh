@@ -479,7 +479,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
     // butterfly reduce with (lane id ^ mask)
     thread_max = max(thread_max,
                      XLLM_SHFL_XOR_SYNC_WIDTH(
-                         0xffffffff, thread_max, mask, THREADS_PER_ROW));
+                         XLLM_FULL_MASK, thread_max, mask, THREADS_PER_ROW));
   }
 
   // From this point, thread max in all the threads have the max within the row.
@@ -497,7 +497,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
 #pragma unroll
   for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
     row_sum +=
-        XLLM_SHFL_XOR_SYNC_WIDTH(0xffffffff, row_sum, mask, THREADS_PER_ROW);
+        XLLM_SHFL_XOR_SYNC_WIDTH(XLLM_FULL_MASK, row_sum, mask, THREADS_PER_ROW);
   }
 
   // From this point, all threads have the max and the sum for their rows in the
@@ -551,9 +551,9 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
 #pragma unroll
     for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
       float other_max =
-          XLLM_SHFL_XOR_SYNC_WIDTH(0xffffffff, max_val, mask, THREADS_PER_ROW);
+          XLLM_SHFL_XOR_SYNC_WIDTH(XLLM_FULL_MASK, max_val, mask, THREADS_PER_ROW);
       int other_expert =
-          XLLM_SHFL_XOR_SYNC_WIDTH(0xffffffff, expert, mask, THREADS_PER_ROW);
+          XLLM_SHFL_XOR_SYNC_WIDTH(XLLM_FULL_MASK, expert, mask, THREADS_PER_ROW);
 
       // We want lower indices to "win" in every thread so we break ties this
       // way

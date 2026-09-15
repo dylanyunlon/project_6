@@ -21,7 +21,18 @@ limitations under the License.
 #else
 #include <c10/cuda/CUDAGuard.h>
 #endif
+#if __has_include(<glog/logging.h>)
 #include <glog/logging.h>
+#else
+#include <iostream>
+#include <cstdlib>
+#ifndef LOG
+#define LOG(severity) std::cerr << "[" #severity "] "
+#endif
+#ifndef CHECK
+#define CHECK(cond) if(!(cond)) { std::cerr << "CHECK failed: " #cond << std::endl; std::abort(); }
+#endif
+#endif
 #include <torch/torch.h>
 #if !defined(USE_DCU)
 #include <tvm/ffi/container/array.h>

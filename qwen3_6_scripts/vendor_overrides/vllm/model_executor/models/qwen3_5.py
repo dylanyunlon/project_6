@@ -533,6 +533,29 @@ _USE_NAIVE_BATCHED_MOE = (
     _HAS_NAIVE_BATCHED_MOE
     and env_bool("BI100_MOE_NAIVE_BATCHED", True))
 
+# --- Startup kernel availability summary ---
+print(
+    "[BI100 KERNEL SUMMARY]\n"
+    f"  GDN causal_conv:    {'ON' if _USE_COREX_GDN_CAUSAL_CONV else 'OFF'}\n"
+    f"  GDN gated_norm:     {'ON' if _USE_COREX_GDN_GATED_NORM else 'OFF'}\n"
+    f"  GDN beta_decay:     {'ON' if _USE_COREX_GDN_BETA_DECAY else 'OFF'}\n"
+    f"  GDN qk_map:         {'ON' if _USE_COREX_GDN_QK_MAP else 'OFF'}\n"
+    f"  GDN packed_decode:  {'ON' if _USE_COREX_GDN_PACKED_DECODE else 'OFF'}\n"
+    f"  GDN chunk_recur:    {'ON' if _HAS_COREX_GDN_CHUNK else 'OFF'}\n"
+    f"  ATTN head_rms_norm: {'ON' if _USE_COREX_ATTN_HEAD_RMS_NORM else 'OFF'}\n"
+    f"  MOE direct_routed:  {'ON' if _USE_COREX_MOE_DIRECT_ROUTED else 'OFF'}\n"
+    f"  MOE exact_reduce:   {'ON' if _USE_COREX_MOE_EXACT_REDUCE else 'OFF'}\n"
+    f"  MOE weight_gather:  {'ON' if _USE_COREX_MOE_WEIGHT_GATHER else 'OFF'}\n"
+    f"  MOE topk_softmax:   {'ON' if _USE_COREX_MOE_TOPK_SOFTMAX else 'OFF'}\n"
+    f"  MOE index_combine:  {'ON' if _USE_COREX_MOE_INDEX_COMBINE else 'OFF'}\n"
+    f"  MOE batched_gemm:   {'ON' if _USE_COREX_BATCHED_GEMM else 'OFF'}\n"
+    f"  MOE gemm_grouped:   {'ON' if _USE_GEMM_GROUPED else 'OFF'}\n"
+    f"  MOE xllm_moe:       {'ON' if _USE_XLLM_MOE else 'OFF'}\n"
+    f"  MOE ix_fused:       {'ON' if _USE_IX_FUSED_MOE else 'OFF'}\n"
+    f"  MOE naive_batched:  {'ON' if _USE_NAIVE_BATCHED_MOE else 'OFF'}\n"
+    f"  bridge_linear:      {'ON' if _HAS_BRIDGE_LINEAR else 'OFF'}",
+    file=sys.stderr, flush=True)
+
 
 # ---------------------------------------------------------------------------
 # Qwen3.6 vision tower and vLLM 0.6 multimodal input integration
@@ -1513,6 +1536,13 @@ class GatedDeltaNet(nn.Module):
                          .unsqueeze(-1)
                          .contiguous())
 
+            if not hasattr(self, '_gdn_conv_dispatch_logged'):
+                self._gdn_conv_dispatch_logged = True
+                logger.info(
+                    "[GDN_CONV] layer=%d path=%s",
+                    self.layer_idx,
+                    "corex_causal_conv" if _USE_COREX_GDN_CAUSAL_CONV
+                    else "pytorch_fallback")
             if _USE_COREX_GDN_CAUSAL_CONV:
                 mixed_qkv_conv = _corex_gdn_causal_conv.causal_conv_update(
                     conv_state.contiguous(), mixed_qkv, weight_2d)
@@ -1549,6 +1579,25 @@ class GatedDeltaNet(nn.Module):
                 and temporal_state.dtype == torch.float32
                 and temporal_state.shape == (1, 8, 128, 128)
                 and temporal_state.is_contiguous())
+            if not hasattr(self, '_gdn_decode_dispatch_logged'):
+                self._gdn_decode_dispatch_logged = True
+                logger.info(
+                    "[GDN_DECODE] layer=%d path=%s flag=%s "
+                    "num_seqs=%d local_k=%d local_v=%d "
+                    "kd=%d vd=%d qkv_shape=%s qkv_dtype=%s "
+                    "b_shape=%s a_shape=%s Alog_shape=%s Alog_dtype=%s "
+                    "dtbias_dtype=%s ts_shape=%s ts_dtype=%s",
+                    self.layer_idx,
+                    "corex_packed_decode" if use_corex_packed_decode
+                    else "pytorch_fallback",
+                    _USE_COREX_GDN_PACKED_DECODE,
+                    num_seqs, local_num_k, local_num_v,
+                    self.head_k_dim, self.head_v_dim,
+                    tuple(packed_mixed_qkv.shape), packed_mixed_qkv.dtype,
+                    tuple(b_all.shape), tuple(a_all.shape),
+                    tuple(self.A_log.shape), self.A_log.dtype,
+                    self.dt_bias.dtype,
+                    tuple(temporal_state.shape), temporal_state.dtype)
             if use_corex_packed_decode:
                 with bi100_timer(f"L{self.layer_idx}.gdn.decode"):
                     core_out = _corex_gdn_packed_decode.packed_decode(
@@ -1570,6 +1619,16 @@ class GatedDeltaNet(nn.Module):
                     and self.dt_bias.dtype == torch.float16
                     and b_all.is_contiguous()
                     and a_all.is_contiguous())
+                if not hasattr(self, '_gdn_sub_dispatch_logged'):
+                    self._gdn_sub_dispatch_logged = True
+                    logger.info(
+                        "[GDN_SUB] layer=%d beta_decay=%s qk_map=%s "
+                        "combined_qk=%s (packed_decode was OFF)",
+                        self.layer_idx,
+                        "corex" if use_corex_beta_decay else "pytorch",
+                        "corex" if _USE_COREX_GDN_QK_MAP else "pytorch",
+                        "corex" if _USE_COREX_GDN_COMBINED_QK_NORM
+                        else "pytorch")
                 if use_corex_beta_decay:
                     beta_decay = _corex_gdn_beta_decay.beta_decay(
                         b_all, a_all, self.A_log, self.dt_bias)
@@ -2231,10 +2290,9 @@ class Qwen3_5MoeSparseBlock(nn.Module):
                     w13_sel, w2_sel = _corex_moe_weight_gather.gather(
                         w13, w2, eids)
                 else:
-                    w13_sel = w13[eids]                            # (K, 2*I, H)
-                    w2_sel = w2[eids]                              # (K, H, I)
+                    w13_sel = w13[eids]                            # (K_actual, 2*I, H)
+                    w2_sel = w2[eids]                              # (K_actual, H, I)
 
-                K_actual = eids.shape[0]
                 H = hidden_states.shape[-1]
 
                 # FC1: single large GEMM via F.linear

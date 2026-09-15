@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "kernels/cuda/cuda_ops_api.h"
+#include "cuda_ops_api.h"
 #include "kernels/cuda/utils.h"
 #include "platform/device.h"
 #include "platform/platform.h"

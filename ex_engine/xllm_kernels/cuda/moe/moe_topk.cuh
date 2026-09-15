@@ -143,9 +143,14 @@ struct TopKRedType {
       return cg::reduce(warp, compValIdx, cg::greater<TypeCmp>{});
     } else {
       TypeCmp result;
+#if defined(__ILUVATAR__) || defined(__COREX__)
+      // BI-V100 warp64: use cooperative groups path instead of redux PTX
+      return cg::reduce(warp, compValIdx, cg::greater<TypeCmp>{});
+#else
       asm("redux.sync.max.u32 %0, %1, 0xffffffff;\n"
           : "=r"(result)
           : "r"(compValIdx));
+#endif
       return result;
     }
 #endif

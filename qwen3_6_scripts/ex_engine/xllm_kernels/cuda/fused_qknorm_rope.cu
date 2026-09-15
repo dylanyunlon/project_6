@@ -30,7 +30,11 @@ using at::device_of;
 // Borrowed from:
 // https://github.com/vllm-project/vllm/blob/022f3cea5327cc720a325c50931e1edcfdf2d32b/csrc/fused_qknorm_rope_kernel.cu
 
+#if defined(__ILUVATAR__) || defined(__COREX__)
+constexpr uint64_t kFinalMask = 0xffffffffffffffffULL;
+#else
 constexpr uint32_t kFinalMask = 0xffffffffu;
+#endif
 
 namespace {
 

@@ -23,8 +23,8 @@ limitations under the License.
 
 #include <cub/util_type.cuh>
 
-// <cuda/functional> requires CUDA 12+ (libcudacxx); BI-V100 runs CUDA 10.2
-// and does not ship that header.  The include is unused in this file anyway.
+#if !defined(USE_DCU) && !defined(USE_MACA)
+#endif
 
 #include "device_utils.cuh"
 
@@ -34,7 +34,7 @@ namespace {
 
 using namespace xllm::kernel::cuda;
 
-#if defined(USE_DCU)
+#if defined(USE_DCU) || defined(__ILUVATAR__)
 static constexpr unsigned long long kSoftmaxFullMask = 0xffffffffffffffffULL;
 #else
 static constexpr unsigned int kSoftmaxFullMask = 0xffffffffU;

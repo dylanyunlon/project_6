@@ -32,7 +32,7 @@ namespace {
 
 using namespace xllm::kernel::cuda;
 
-#if defined(USE_DCU)
+#if defined(USE_DCU) || defined(__ILUVATAR__)
 static constexpr unsigned long long kSigmoidFullMask = 0xffffffffffffffffULL;
 #else
 static constexpr unsigned int kSigmoidFullMask = 0xffffffffU;

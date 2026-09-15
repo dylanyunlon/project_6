@@ -19,7 +19,11 @@ limitations under the License.
 
 namespace xllm::kernel::cuda {
 
+#if defined(__ILUVATAR__) || defined(__COREX__) || defined(USE_ILUVATAR)
+#define WARP_SIZE 64
+#else
 #define WARP_SIZE 32
+#endif
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -33,6 +37,13 @@ template <typename T,
 class alignas(Alignment) AlignedArray {
   T data[N];
 };
+
+// Full-warp mask: 64-bit for warp64 (BI-V100 / DCU), 32-bit otherwise
+#if WARP_SIZE == 64
+#define XLLM_FULL_MASK 0xffffffffffffffffULL
+#else
+#define XLLM_FULL_MASK 0xffffffffU
+#endif
 
 #define XLLM_SHFL_XOR_SYNC(mask, var, lane_mask) \
   __shfl_xor_sync((mask), (var), (lane_mask))

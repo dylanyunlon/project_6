@@ -17,7 +17,18 @@ limitations under the License.
 
 #include <ATen/DynamicLibrary.h>
 #include <ATen/core/dispatch/Dispatcher.h>
+#if __has_include(<glog/logging.h>)
 #include <glog/logging.h>
+#else
+#include <iostream>
+#include <cstdlib>
+#ifndef LOG
+#define LOG(severity) std::cerr << "[" #severity "] "
+#endif
+#ifndef CHECK
+#define CHECK(cond) if(!(cond)) { std::cerr << "CHECK failed: " #cond << std::endl; std::abort(); }
+#endif
+#endif
 
 #include <optional>
 #include <tuple>
