@@ -46,11 +46,7 @@ class FlashAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_head_sizes() -> List[int]:
-        # NOTE(BI-V100): 256 removed — ixformer flash attention crashes or
-        # produces wrong output with head_dim=256 on BI-V100 (is_causal=True
-        # path hangs, attn_mask path gives incorrect results). Falls back to
-        # XFormers backend which uses _run_sdpa_fallback for head_dim > 128.
-        return [32, 64, 72, 80, 96, 128, 160, 192, 224]
+        return [32, 64, 72, 80, 96, 128, 160, 192, 224, 256]
 
     @staticmethod
     def get_name() -> str:

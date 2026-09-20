@@ -1466,6 +1466,10 @@ class ParallelConfig:
     data_parallel_master_ip: str = "127.0.0.1"
     data_parallel_master_port: int = 29500  # Port of the data parallel master.
     enable_expert_parallel: bool = False  # Use EP instead of TP for MoE layers.
+    # [PR #2269] EP all-to-all communication backend for MoE expert dispatch.
+    all2all_backend: str = "allgather_reducescatter"
+    # [PR #2269] Enable expert-parallel load balancing.
+    enable_eplb: bool = False
     num_virtual_engine: int = 1  # Number of virtual engines.
 
     # Maximum number of multiple batches
@@ -1566,6 +1570,12 @@ class ParallelConfig:
     def __post_init__(self) -> None:
         self.world_size = self.pipeline_parallel_size * \
             self.tensor_parallel_size
+
+        # [BI100-DP] Runtime attributes assigned per-worker during init_device
+        self.dp_rank: int = 0
+        self._dp_group = None
+        # [PR #2269] _ep_group is assigned per-worker during init_device
+        self._ep_group = None
 
         if self.data_parallel_size > 1:
             # Data parallel was specified in the engine args.
@@ -1830,8 +1840,6 @@ class SchedulerConfig:
             # BI100: auto-enable chunked prefill instead of raising.
             # max_num_batched_tokens < max_model_len is the normal
             # chunked-prefill use case (e.g. 4096 chunk for 131072 ctx).
-            # The original hard error blocks valid launch commands on
-            # BI-V100 where chunked prefill is the expected path.
             logger.warning(
                 "max_num_batched_tokens (%d) is smaller than "
                 "max_model_len (%d). Auto-enabling chunked prefill.",

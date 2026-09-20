@@ -170,11 +170,21 @@ class Qwen3CoderToolParser(ToolParser):
                 try:
                     return json.loads(param_value)
                 except (json.JSONDecodeError, TypeError, ValueError):
-                    pass
+                    logger.debug(
+                        "Could not JSON-decode parameter '%s' for tool '%s'; "
+                        "falling back to literal evaluation.",
+                        param_name,
+                        func_name,
+                        exc_info=True)
             try:
                 return ast.literal_eval(param_value)
             except (ValueError, SyntaxError, TypeError):
-                pass
+                logger.debug(
+                    "Could not literal-eval parameter '%s' for tool '%s'; "
+                    "returning string value.",
+                    param_name,
+                    func_name,
+                    exc_info=True)
             return param_value
 
     def _parse_xml_function_call(
@@ -442,8 +452,8 @@ class Qwen3CoderToolParser(ToolParser):
                 serialized = json.dumps(converted, ensure_ascii=False)
 
                 sep = "" if self.param_count == 0 else ", "
-                json_fragments.append(
-                    f'{sep}"{current_param_name}": {serialized}')
+                key = json.dumps(current_param_name, ensure_ascii=False)
+                json_fragments.append(f"{sep}{key}: {serialized}")
                 self.param_count += 1
 
             if json_fragments:

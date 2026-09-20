@@ -66,12 +66,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-
-def print_warning_once(msg: str) -> None:
-    # Set the stacklevel to 2 to print the caller's line info
-    logger.warning(msg, stacklevel=2)
-
-
 # Exception strings for non-implemented encoder/decoder scenarios
 
 # Reminder: Please update docs/source/features/compatibility_matrix.md
@@ -2608,3 +2602,38 @@ def sha256(input) -> int:
     input_bytes = pickle.dumps(input, protocol=pickle.HIGHEST_PROTOCOL)
     return int.from_bytes(hashlib.sha256(input_bytes).digest(),
                           byteorder="big")
+
+
+# ---------------------------------------------------------------------------
+# Backward-compat shims for base-image files (vllm 0.6.3) that are NOT
+# overridden by patch_ops.sh but still import these names from vllm.utils.
+# e.g. attention/selector.py, worker/cpu_worker.py, etc.
+# New code should use vllm.platforms directly.
+# ---------------------------------------------------------------------------
+def is_hip() -> bool:
+    from vllm.platforms import current_platform
+    return current_platform.is_rocm()
+
+def is_xpu() -> bool:
+    from vllm.platforms import current_platform
+    return current_platform.is_xpu()
+
+def is_neuron() -> bool:
+    from vllm.platforms import current_platform
+    return current_platform.is_neuron()
+
+def is_cpu() -> bool:
+    from vllm.platforms import current_platform
+    return current_platform.is_cpu()
+
+def is_openvino() -> bool:
+    from vllm.platforms import current_platform
+    return current_platform.is_openvino()
+
+def is_tpu() -> bool:
+    from vllm.platforms import current_platform
+    return current_platform.is_tpu()
+
+def seed_everything(seed: int) -> None:
+    from vllm.platforms import current_platform
+    current_platform.seed_everything(seed)

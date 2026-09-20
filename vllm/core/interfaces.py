@@ -1,6 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import enum
 from abc import ABC, abstractmethod
-from typing import List
+from typing import List, Optional
 from typing import Sequence as GenericSequence
 from typing import Tuple
 
@@ -28,13 +30,9 @@ class BlockSpaceManager(ABC):
     def get_block_space_manager_class(version: str):
         version = version.lower()
 
-        if version == "v1":
-            from vllm.core.block_manager_v1 import BlockSpaceManagerV1
-            return BlockSpaceManagerV1
-
-        if version == "v2":
-            from vllm.core.block_manager_v2 import BlockSpaceManagerV2
-            return BlockSpaceManagerV2
+        if version == "selfattn":
+            from vllm.core.block_manager import SelfAttnBlockSpaceManager
+            return SelfAttnBlockSpaceManager
 
         if version == "placeholder":
             from vllm.core.placeholder_block_space_manager import (
@@ -124,4 +122,13 @@ class BlockSpaceManager(ABC):
     @abstractmethod
     def get_prefix_cache_hit_rate(self, device: Device) -> float:
         """Prefix cache hit rate. -1 means not supported or disabled."""
+        pass
+
+    @abstractmethod
+    def reset_prefix_cache(self, device: Optional[Device] = None) -> bool:
+        """Reset prefix cache for specified or all devices."""
+        pass
+
+    @abstractmethod
+    def get_num_cached_tokens(self, seq: Sequence) -> int:
         pass

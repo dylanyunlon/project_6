@@ -121,6 +121,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         allocator: BlockAllocator,
         block_id: Optional[int] = None,
         computed: bool = False,
+        extra_hash: Optional[int] = None,
     ) -> Block:
         # Bind block to self.
         allocator = self
@@ -132,6 +133,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
             block_id=block_id,
             allocator=allocator,
             computed=computed,
+            extra_hash=extra_hash,
         )
 
     def allocate_immutable_block(self,
@@ -689,6 +691,41 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         for (block, _, _, _), block_id in zip(swap_plan, allocated_ids):
             block.block_id = block_id
 
+    def reset_prefix_cache(self) -> bool:
+        """Reset prefix cache by clearing all cached block mappings and
+        evictor state."""
+        # Clear cached block hash -> block_id mapping
+        self._cached_blocks.clear()
+        # Reset evictor to free all eviction tracking
+        if hasattr(self, 'evictor'):
+            from vllm.core.evictor_v2 import make_evictor
+            self.evictor = make_evictor(self.evictor.eviction_policy
+                                        if hasattr(self.evictor,
+                                                   'eviction_policy')
+                                        else None)
+        # Reset metrics
+        if hasattr(self, 'metric_data'):
+            self.metric_data.query = 0
+            self.metric_data.hit = 0
+        return True
+
+    def find_cached_blocks_prefix(
+        self,
+        block_hashes: List[int],
+    ) -> List[int]:
+        """Find the prefix of block hashes that are cached.
+
+        Returns a list of block IDs for the longest prefix of block_hashes
+        that are all present in the cache.
+        """
+        cached_block_ids: List[int] = []
+        for block_hash in block_hashes:
+            if block_hash in self._cached_blocks:
+                cached_block_ids.append(self._cached_blocks[block_hash])
+            else:
+                break
+        return cached_block_ids
+
 
 class PrefixCachingBlock(Block):
     """A block implementation that supports prefix caching.
@@ -718,6 +755,7 @@ class PrefixCachingBlock(Block):
         allocator: BlockAllocator,
         block_id: Optional[int] = None,
         computed: bool = False,
+        extra_hash: Optional[int] = None,
     ):
         assert isinstance(allocator, PrefixCachingBlockAllocator), (
             "Currently this class is only tested with "
@@ -731,6 +769,7 @@ class PrefixCachingBlock(Block):
         self._allocator = allocator
         self._last_accessed: float = _DEFAULT_LAST_ACCESSED_TIME
         self._computed = computed
+        self._extra_hash = extra_hash
 
         # On the first time, we create the block object, and next we only
         # reinitialize it
@@ -740,13 +779,15 @@ class PrefixCachingBlock(Block):
                 token_ids=token_ids,
                 block_size=block_size,
                 block_id=block_id,
-                allocator=self._allocator)
+                allocator=self._allocator,
+                extra_hash=extra_hash)
         else:
             self._block = NaiveBlock(prev_block=prev_block,
                                      token_ids=token_ids,
                                      block_size=block_size,
                                      block_id=block_id,
-                                     allocator=self._allocator)
+                                     allocator=self._allocator,
+                                     extra_hash=extra_hash)
 
         self._update_num_tokens_total()
 
@@ -841,6 +882,10 @@ class PrefixCachingBlock(Block):
         return self._prev_block
 
     @property
+    def extra_hash(self) -> Optional[int]:
+        return self._extra_hash
+
+    @property
     def content_hash(self) -> Optional[int]:
         """Return the content-based hash of the current block, or None if it is
         not yet defined.
@@ -870,17 +915,17 @@ class PrefixCachingBlock(Block):
         self._cached_content_hash = PrefixCachingBlock.hash_block_tokens(
             is_first_block,
             prev_block_hash,
-            cur_block_token_ids=self.token_ids)
+            cur_block_token_ids=self.token_ids,
+            extra_hash=self._extra_hash)
         return self._cached_content_hash
 
     @staticmethod
     def hash_block_tokens(is_first_block: bool, prev_block_hash: Optional[int],
-                          cur_block_token_ids: List[int]) -> int:
+                          cur_block_token_ids: List[int],
+                          extra_hash: Optional[int] = None) -> int:
         """Computes a hash value corresponding to the contents of a block and
         the contents of the preceding block(s). The hash value is used for
         prefix caching.
-
-        NOTE: Content-based hashing does not yet support LoRA.
 
         Parameters:
         - is_first_block (bool): A flag indicating if the block is the first in
@@ -889,12 +934,15 @@ class PrefixCachingBlock(Block):
             if this is the first block.
         - cur_block_token_ids (List[int]): A list of token ids in the current
             block. The current block is assumed to be full.
+        - extra_hash (Optional[int]): An optional extra hash (e.g. LoRA adapter
+            id) to include in the content hash for disambiguation.
 
         Returns:
         - int: The computed hash value for the block.
         """
         assert (prev_block_hash is None) == is_first_block
-        return hash((is_first_block, prev_block_hash, *cur_block_token_ids))
+        return hash((is_first_block, prev_block_hash, extra_hash,
+                     *cur_block_token_ids))
 
 
 class ComputedBlocksTracker:

@@ -29,28 +29,28 @@ JSON_GRAMMAR = r"""
 
 ?value: object
 | array
-| UNESCAPED_STRING
+| JSON_STRING
 | SIGNED_NUMBER      -> number
 | "true"             -> true
 | "false"            -> false
 | "null"             -> null
 
-array  : "[" [value ("," value)*] "]"
-object : "{" [pair ("," pair)*] "}"
-pair   : UNESCAPED_STRING ":" value
+array  : "[" _ws [value (_ws "," _ws value)*] _ws "]"
+object : "{" _ws [pair (_ws "," _ws pair)*] _ws "}"
+pair   : JSON_STRING _ws ":" _ws value
+_ws    : JSON_WS?
 
-%import common.UNESCAPED_STRING
+JSON_STRING: /"(\\["\\/bfnrt]|\\u[0-9a-fA-F]{4}|[^"\\\x00-\x1f])*"/
+JSON_WS: /[ \t\r\n]{1,4}/
 %import common.SIGNED_NUMBER
-%import common.WS
-
-%ignore WS
 """
 
 global_thread_pool = None  # used for generating logits processor fsm
 
 
 async def get_outlines_guided_decoding_logits_processor(
-    guided_params: GuidedDecodingParams, tokenizer: PreTrainedTokenizerBase
+    guided_params: GuidedDecodingParams, tokenizer: PreTrainedTokenizerBase,
+    reasoner=None,
 ) -> Union[JSONLogitsProcessor, RegexLogitsProcessor, CFGLogitsProcessor,
            None]:
     """
@@ -71,11 +71,13 @@ async def get_outlines_guided_decoding_logits_processor(
 
     return await loop.run_in_executor(global_thread_pool,
                                       _get_logits_processor, guide, tokenizer,
-                                      mode, guided_params.whitespace_pattern)
+                                      mode, guided_params.whitespace_pattern,
+                                      reasoner)
 
 
 def get_local_outlines_guided_decoding_logits_processor(
-    guided_params: GuidedDecodingParams, tokenizer: PreTrainedTokenizerBase
+    guided_params: GuidedDecodingParams, tokenizer: PreTrainedTokenizerBase,
+    reasoner=None,
 ) -> Union[JSONLogitsProcessor, RegexLogitsProcessor, CFGLogitsProcessor,
            None]:
     """
@@ -89,7 +91,7 @@ def get_local_outlines_guided_decoding_logits_processor(
         return None
 
     return _get_logits_processor(guide, tokenizer, mode,
-                                 guided_params.whitespace_pattern)
+                                 guided_params.whitespace_pattern, reasoner)
 
 
 def _get_guide_and_mode(
@@ -121,13 +123,14 @@ def _get_guide_and_mode(
 
 def _get_logits_processor(
     guide: str, tokenizer: PreTrainedTokenizerBase, mode: GuidedDecodingMode,
-    whitespace_pattern: Union[str, None]
+    whitespace_pattern: Union[str, None], reasoner=None,
 ) -> Union[JSONLogitsProcessor, RegexLogitsProcessor, CFGLogitsProcessor]:
     if mode == GuidedDecodingMode.JSON:
-        return JSONLogitsProcessor(guide, tokenizer, whitespace_pattern)
+        return JSONLogitsProcessor(guide, tokenizer, whitespace_pattern,
+                                   reasoner)
     elif mode == GuidedDecodingMode.REGEX or mode == GuidedDecodingMode.CHOICE:
-        return RegexLogitsProcessor(guide, tokenizer)
+        return RegexLogitsProcessor(guide, tokenizer, reasoner)
     elif mode == GuidedDecodingMode.GRAMMAR:
-        return CFGLogitsProcessor(guide, tokenizer)
+        return CFGLogitsProcessor(guide, tokenizer, reasoner)
     else:
         raise ValueError(f"Unknown guided decoding mode {mode}")

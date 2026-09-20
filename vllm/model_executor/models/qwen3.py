@@ -21,15 +21,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Qwen3 model compatible with HuggingFace weights."""
-from typing import Iterable, List, Optional, Set, Tuple, Union
+from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
 from transformers import Qwen3Config
 
-from vllm.attention import Attention, AttentionMetadata, AttentionType
+from vllm.attention import Attention, AttentionType
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, LoRAConfig#VllmConfig
+from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -38,7 +38,7 @@ from vllm.model_executor.layers.linear import (QKVParallelLinear,
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.sampler import SamplerOutput, Sampler
+from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
@@ -120,7 +120,7 @@ class Qwen3Attention(nn.Module):
                               cache_config=cache_config,
                               quant_config=quant_config,
                               prefix=f"{prefix}.attn",
-                              )#attn_type=attn_type)
+                              attn_type=attn_type)
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
@@ -128,22 +128,20 @@ class Qwen3Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         # Add qk-norm
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim,
                            self.head_dim)
-        q_by_head = self.q_norm.forward_cuda(q_by_head.contiguous())
+        q_by_head = self.q_norm.forward_native(q_by_head)
         q = q_by_head.view(q.shape)
         k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim,
                            self.head_dim)
-        k_by_head = self.k_norm.forward_cuda(k_by_head.contiguous())
+        k_by_head = self.k_norm.forward_native(k_by_head)
         k = k_by_head.view(k.shape)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -192,7 +190,7 @@ class Qwen3DecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            #prefix=f"{prefix}.mlp",
+            prefix=f"{prefix}.mlp",
         )
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
@@ -203,8 +201,6 @@ class Qwen3DecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
@@ -217,8 +213,6 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
-            kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
         )
 
         # Fully Connected
@@ -244,14 +238,8 @@ ALL_DECODER_LAYER_TYPES = {
     })
 class Qwen3Model(Qwen2Model):
 
-    def __init__(self, *, 
-                 config: Qwen3Config, 
-                 cache_config: Optional[CacheConfig] = None, 
-                 quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = ""):
-        super().__init__(config=config,
-                         cache_config=cache_config,
-                         quant_config=quant_config,
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__(vllm_config=vllm_config,
                          prefix=prefix,
                          decoder_layer_type=Qwen3DecoderLayer)
 
@@ -269,30 +257,17 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         ],
     }
 
-    # LoRA specific attributes
-    supported_lora_modules = [
-        "qkv_proj",
-        "o_proj",
-        "gate_up_proj",
-        "down_proj",
-    ]
-    embedding_modules = {}
-    embedding_padding_modules = []
-    def __init__(self, *, 
-                config: Qwen3Config,
-                cache_config: Optional[CacheConfig] = None, 
-                quant_config: Optional[QuantizationConfig] = None,
-                lora_config: Optional[LoRAConfig] = None, 
-                prefix: str = ""):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+        lora_config = vllm_config.lora_config
 
         self.config = config
         self.lora_config = lora_config
 
         self.quant_config = quant_config
-        self.model = Qwen3Model(config=config,
-                                cache_config=cache_config,
-                                quant_config=quant_config,
+        self.model = Qwen3Model(vllm_config=vllm_config,
                                 prefix=maybe_prefix(prefix, "model"))
 
         if get_pp_group().is_last_rank:
@@ -308,7 +283,7 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.sampler = Sampler()
+        self.sampler = get_sampler()
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
@@ -320,13 +295,10 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        hidden_states = self.model(input_ids, positions, kv_caches,
-                                   attn_metadata, intermediate_tensors,
+        hidden_states = self.model(input_ids, positions, intermediate_tensors,
                                    inputs_embeds)
         return hidden_states
 

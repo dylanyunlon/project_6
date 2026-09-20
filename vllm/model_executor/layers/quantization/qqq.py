@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -37,6 +39,7 @@ class QQQConfig(QuantizationConfig):
         group_size: int,
         is_sym: bool = True,
     ) -> None:
+        super().__init__()
         self.weight_bits = weight_bits
         self.group_size = group_size
         self.is_sym = is_sym
@@ -86,7 +89,7 @@ class QQQConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
-        return [torch.bfloat16, torch.half]
+        return [torch.half]
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -111,9 +114,6 @@ class QQQConfig(QuantizationConfig):
         if isinstance(layer, LinearBase):
             return QQQLinearMethod(self)
         return None
-
-    def get_scaled_act_names(self) -> List[str]:
-        return []
 
 
 class QQQLinearMethod(LinearMethodBase):

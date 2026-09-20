@@ -291,6 +291,13 @@ class RequestOutput:
             prompt_logprobs = None
         finished_time = time.time() if finished else None
         seq_group.set_finished_time(finished_time)
+        if finished_time is not None:
+            cache_trace_emit = getattr(
+                seq_group, "_bi100_cache_trace_emit", None)
+            if callable(cache_trace_emit):
+                cache_trace_emit(seq_group)
+                delattr(seq_group, "_bi100_cache_trace_emit")
+                delattr(seq_group, "_bi100_cache_trace_seq_id")
 
         init_kwargs = {
             "request_id": seq_group.request_id,

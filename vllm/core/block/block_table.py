@@ -44,6 +44,7 @@ class BlockTable:
         block_allocator: DeviceAwareBlockAllocator,
         _blocks: Optional[List[Block]] = None,
         max_block_sliding_window: Optional[int] = None,
+        cache_namespace: Optional[bytes] = None,
     ):
         self._block_size = block_size
         self._allocator = block_allocator
@@ -53,6 +54,7 @@ class BlockTable:
 
         self._max_block_sliding_window = max_block_sliding_window
         self._num_full_slots = self._get_num_token_ids()
+        self._cache_namespace = cache_namespace
 
     @staticmethod
     def get_num_required_blocks(token_ids: List[int],
@@ -329,6 +331,21 @@ class BlockTable:
     @property
     def blocks(self) -> List[Block]:
         return self._blocks.list()
+
+    def get_content_hashes(self) -> List[bytes]:
+        """Return the content hash of each full block as raw bytes.
+
+        Used by BI100 prefix-cache tracing to fingerprint block contents.
+        Blocks without a hash (mutable / partially filled) are skipped.
+        """
+        import hashlib
+        hashes: List[bytes] = []
+        for block in self._blocks.list():
+            if block.content_hash is not None:
+                h = hashlib.sha256(
+                    str(block.content_hash).encode()).digest()
+                hashes.append(h)
+        return hashes
 
     @property
     def _num_empty_slots(self) -> int:

@@ -439,6 +439,21 @@ class OpenAIServingChat(OpenAIServing):
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(str(e))
 
+        # [DEBUG] Log rendered prompt to diagnose model quality issues
+        if engine_prompts:
+            ep0 = engine_prompts[0]
+            if isinstance(ep0, dict):
+                _p = ep0.get('prompt')
+                _ids = ep0.get('prompt_token_ids')
+            else:
+                _p = getattr(ep0, 'prompt', None)
+                _ids = getattr(ep0, 'prompt_token_ids', None)
+            if _p:
+                logger.info("[DEBUG_PROMPT] text=%r", _p[:500])
+            if _ids:
+                logger.info("[DEBUG_PROMPT] token_ids len=%d last20=%s",
+                            len(_ids), _ids[-20:])
+
         # tool_choice = "required" is not supported on BI-V100
         if request.tool_choice == "required":
             return self.create_error_response(
@@ -481,14 +496,27 @@ class OpenAIServingChat(OpenAIServing):
                 default_max_tokens = min(
                     self.max_model_len - _prompt_len, _adaptive_cap)
 
-                # [BI100] Qwen3 tool calling fix: greedy decoding causes
-                # thinking to degrade; force temperature>=0.6 when tools active.
-                if (request.tools and request.tool_choice in ("auto", None)
-                        and (request.temperature is None
-                             or request.temperature < 0.6)):
-                    request.temperature = 0.6
+                # [BI100] Qwen3 thinking-mode sampling fix: greedy / low
+                # temperature causes degenerate repeats after empty <think>.
+                # Official recommendation: temperature >= 0.6 when thinking.
+                # Also set min_tokens to prevent premature EOS right after
+                # <think> — the BI-V100 fp16 precision causes <|im_end|>
+                # to rank abnormally high in the logits distribution.
+                _thinking_on = (
+                    request.chat_template_kwargs is not None
+                    and request.chat_template_kwargs.get(
+                        "enable_thinking", False))
+                if _thinking_on:
+                    if (request.temperature is None
+                            or request.temperature < 0.6):
+                        logger.info(
+                            "[BI100] Forcing temperature 0.6 (was %s) for "
+                            "thinking mode", request.temperature)
+                        request.temperature = 0.6
                     if request.top_p is None or request.top_p > 0.95:
                         request.top_p = 0.95
+                    if request.min_tokens == 0:
+                        request.min_tokens = 16
                 if request.use_beam_search:
                     sampling_params = request.to_beam_search_params(
                         default_max_tokens, self.default_sampling_params)
@@ -497,6 +525,12 @@ class OpenAIServingChat(OpenAIServing):
                         default_max_tokens,
                         self.model_config.logits_processor_pattern,
                         self.default_sampling_params)
+
+                logger.info(
+                    "[BI100_DEBUG] sampling: temp=%.2f top_p=%.2f "
+                    "max_tokens=%s thinking=%s",
+                    sampling_params.temperature, sampling_params.top_p,
+                    sampling_params.max_tokens, _thinking_on)
 
                 self._log_inputs(request_id,
                                  request_prompts[i],
@@ -1279,6 +1313,9 @@ class OpenAIServingChat(OpenAIServing):
         created_time = int(time.time())
         final_res: Optional[RequestOutput] = None
 
+        should_stream_with_reasoning_parsing = (
+            self._should_stream_with_reasoning_parsing(request))
+
         # [BI100] Disconnect watcher for non-streaming
         _disconnect_watcher: Optional[asyncio.Task] = None
         if raw_request is not None:
@@ -1345,9 +1382,17 @@ class OpenAIServingChat(OpenAIServing):
                 except RuntimeError as e:
                     logger.exception("Error in reasoning parser creation.")
                     return self.create_error_response(str(e))
+                logger.info(
+                    "[DEBUG_REASONING] raw output.text=%r token_ids=%s",
+                    output.text[:200] if output.text else output.text,
+                    list(output.token_ids[:20]) if output.token_ids else [])
                 reasoning_content, extracted = (
                     reasoning_parser.extract_reasoning_content(
                         output.text, request=request))
+                logger.info(
+                    "[DEBUG_REASONING] after parse: reasoning=%r content=%r",
+                    reasoning_content[:200] if reasoning_content else reasoning_content,
+                    extracted[:200] if extracted else extracted)
                 output_text = extracted or ""
                 if isinstance(request.tool_choice,
                               ChatCompletionNamedToolChoiceParam):
@@ -1359,6 +1404,7 @@ class OpenAIServingChat(OpenAIServing):
                 output_text = output.text
 
             named_tool_called = False
+            auto_tools_called = False
 
             # if auto tools are not enabled, and a named tool choice using
             #   outlines is not being used

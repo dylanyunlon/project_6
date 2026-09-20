@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -66,7 +68,7 @@ class MarlinConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
-        return [torch.bfloat16, torch.half]
+        return [torch.half]
 
     @classmethod
     # Need to figure it out
@@ -109,9 +111,6 @@ class MarlinConfig(QuantizationConfig):
             (isinstance(layer, ParallelLMHead) and self.lm_head_quantized)):
             return MarlinLinearMethod(self)
         return None
-
-    def get_scaled_act_names(self) -> List[str]:
-        return []
 
 
 class MarlinLinearMethod(LinearMethodBase):

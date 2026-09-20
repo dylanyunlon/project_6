@@ -1,4 +1,5 @@
-# coding=utf-8
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/llama/modeling_llama.py
 # Copyright 2024 The ModelBest team.
@@ -22,15 +23,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only MiniCPM3 model compatible with HuggingFace weights."""
-from typing import Any, Dict, Optional, Union, List, Tuple
-import math
+from typing import Any, Dict, Optional
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from vllm.attention import Attention, AttentionMetadata
-from vllm.config import CacheConfig
+from vllm.attention import Attention
+from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
@@ -41,10 +41,9 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.minicpm import (MiniCPMDecoderLayer,
                                                 MiniCPMForCausalLM,
                                                 MiniCPMModel)
-from vllm.sequence import IntermediateTensors
-from vllm.distributed import get_pp_group
 
 from .utils import make_layers
+import ixformer.inference.functions as ops
 
 
 class MiniCPM3Attention(nn.Module):
@@ -64,6 +63,7 @@ class MiniCPM3Attention(nn.Module):
         max_position_embeddings: int = 8192,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -118,13 +118,14 @@ class MiniCPM3Attention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
+        self.k = self.rotary_emb.original_max_position_embeddings
         self.attn = Attention(self.num_local_heads,
                               self.qk_head_dim,
                               self.scaling,
                               num_kv_heads=self.num_local_heads,
                               cache_config=cache_config,
-                              quant_config=quant_config)
-        self.merge_q_kv_a = False
+                              quant_config=quant_config,
+                              prefix=f"{prefix}.attn")
 
     def forward(
         self,
@@ -132,67 +133,37 @@ class MiniCPM3Attention(nn.Module):
         hidden_states: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        long_prompt_offset: torch.Tensor,
-        long_short_cos_sin_cache: torch.Tensor,
-    ) -> torch.Tensor:
-        import ixformer.inference.functions as ixf
-        if hidden_states.dtype == torch.float16 or hidden_states.dtype == torch.bfloat16:
-            if not self.merge_q_kv_a:
-                self.qkv_weight = torch.cat([self.q_a_proj.weight, self.kv_a_proj_with_mqa.weight], dim=0)
-                del self.q_a_proj
-                del self.kv_a_proj_with_mqa
-                self.merge_q_kv_a = True
-            q_latent_cache = ixf.linear(hidden_states, self.qkv_weight)
-            q, latent_cache = q_latent_cache.split([self.q_lora_rank, 
-                                                    self.kv_lora_rank + self.qk_rope_head_dim], 
-                                                    dim=-1)
-        else:
-            q, _ = self.q_a_proj(hidden_states)
-            latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
-
+        long_offset: torch.Tensor,
+    ) -> torch.Tensor:        
+        q_latent_kpe, _ = self.q_a_proj(hidden_states)
+        q, kv_a, k_pe = q_latent_kpe.split([self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], dim=1)
+        
         q = self.q_a_layernorm(q)
         q, _ = self.q_b_proj(q)
         q = q.view(-1, self.num_local_heads, self.qk_head_dim)
-        _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim],
-                          dim=-1)
+        _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         
-        kv_a, _ = latent_cache.split(
-            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        latent_cache = latent_cache.unsqueeze(1)
         kv_a = self.kv_a_layernorm(kv_a)
         kv, _ = self.kv_b_proj(kv_a)
-        kv = kv.view(-1, self.num_local_heads,
-                     self.qk_nope_head_dim + self.v_head_dim)
-        k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-       
-        q_pe, k_pe = ixf.minicpm3_fused_rope(
-            positions,
-            long_prompt_offset,
-            long_short_cos_sin_cache,
-            q_pe, latent_cache[:, :, self.kv_lora_rank:],
-            out_query = q[..., self.qk_nope_head_dim:]
-        )
-
-        q = q.view(-1, self.num_local_heads * self.qk_head_dim)
+        kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope, v_nope = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         
-        k, v = ixf.minicpm3_fused_copy_kv(k_nope, k_pe, v)
-       
+        k = torch.empty_like(q)
+        v = torch.empty_like(q)
+        ops.mla_rope_phi(positions, q_pe, k_pe, k[...,self.qk_nope_head_dim:], self.rotary_emb.long_short_cos_sin_cache, long_offset, self.k)
+        ops.mla_copy_kv(k_nope, v_nope, k, v)
+        
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
-        attn_output = attn_output.view(-1, self.num_local_heads, self.qk_head_dim)
-        new_attn_output = attn_output.new_empty([attn_output.shape[0], attn_output.shape[1], self.v_head_dim])
-        new_attn_output[:, :, :] = attn_output[:, :, :self.v_head_dim]
-        attn_output = new_attn_output.view(-1, self.num_local_heads * self.v_head_dim)
+        attn_output = attn_output.view(
+            -1, self.num_local_heads,
+            self.qk_head_dim)[..., :self.v_head_dim].reshape(
+                -1, self.num_local_heads * self.v_head_dim)
 
         output, _ = self.o_proj(attn_output)
         return output
 
 
 class MiniCPM3DecoderLayer(MiniCPMDecoderLayer):
-    def __init__(self, config: PretrainedConfig, 
-                 cache_config: CacheConfig | None = None, 
-                 quant_config: QuantizationConfig | None = None) -> None:
-        super().__init__(config, cache_config, quant_config)
-        self.hidden_scale = config.scale_depth / math.sqrt(config.num_hidden_layers)
 
     def _init_attn_block(self):
         self.input_layernorm = RMSNorm(self.config.hidden_size,
@@ -211,39 +182,8 @@ class MiniCPM3DecoderLayer(MiniCPMDecoderLayer):
             max_position_embeddings=self.max_position_embeddings,
             cache_config=self.cache_config,
             quant_config=self.quant_config,
+            prefix=f"{self.prefix}.self_attn",
         )
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        residual: Optional[torch.Tensor],
-        long_prompt_offset: Optional[torch.Tensor],
-        long_short_cos_sin_cache: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(residual, hidden_states, self.hidden_scale)
-
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
-            long_prompt_offset=long_prompt_offset,
-            long_short_cos_sin_cache=long_short_cos_sin_cache,
-        )
-
-        hidden_states, residual = self.post_attention_layernorm(residual, hidden_states, self.hidden_scale)
-        
-        hidden_states = self.mlp(hidden_states)
-       
-        return hidden_states, residual
 
 
 class MiniCPM3Model(MiniCPMModel):
@@ -257,56 +197,9 @@ class MiniCPM3Model(MiniCPMModel):
     ):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: MiniCPM3DecoderLayer(config, cache_config,
-                                                quant_config),
+            lambda prefix: MiniCPM3DecoderLayer(
+                config, cache_config, quant_config, prefix=prefix),
             prefix=f"{prefix}.layers")
-        
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
-        k = self.layers[self.start_layer].self_attn.rotary_emb.original_max_position_embeddings
-        long_prompt_offset = (torch.any(positions > k).float() *
-                              torch.full_like(positions, k)).long()
-        long_short_cos_sin_cache = (
-            self.layers[self.start_layer].self_attn.rotary_emb.long_short_cos_sin_cache.to(input_ids.device))
-
-
-        if get_pp_group().is_first_rank:
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
-            else:
-                hidden_states = self.get_input_embeddings(input_ids)
-            residual = None
-        else:
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
-
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                kv_caches[i - self.start_layer],
-                attn_metadata,
-                residual,
-                long_prompt_offset=long_prompt_offset,
-                long_short_cos_sin_cache=long_short_cos_sin_cache,
-            )
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors({
-                "hidden_states": hidden_states,
-                "residual": residual
-            })
-        
-        hidden_states, residual = self.norm(residual, hidden_states, self.layers[self.start_layer].hidden_scale)
-       
-        return hidden_states
 
 
 class MiniCPM3ForCausalLM(MiniCPMForCausalLM):
@@ -317,24 +210,5 @@ class MiniCPM3ForCausalLM(MiniCPMForCausalLM):
         ],
     }
 
-    # LoRA specific attributes
-    supported_lora_modules = [
-        "kv_a_proj_with_mqa",
-        "q_a_proj",
-        "q_b_proj",
-        "kv_b_proj",
-        "o_proj",
-        "gate_up_proj",
-        "down_proj",
-        "embed_tokens",
-        "lm_head",
-    ]
-
-    # `embedding_modules` and `embedding_padding_modules`
-    # are inherited from MiniCPMForCausalLM
-
-    def _init_model(self):
-        self.model = MiniCPM3Model(config=self.config,
-                                   cache_config=self.cache_config,
-                                   quant_config=self.quant_config,
-                                   lora_config=self.lora_config)
+    def _init_model(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        return MiniCPM3Model(vllm_config=vllm_config, prefix=prefix)

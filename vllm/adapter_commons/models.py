@@ -1,7 +1,5 @@
-# SPDX-License-Identifier: Apache-2.0
-
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, Optional, TypeVar
+from typing import Any, Callable, Dict, Hashable, Optional, TypeVar
 
 from torch import nn
 
@@ -26,13 +24,14 @@ class AdapterModel(ABC):
 T = TypeVar('T')
 
 
-class AdapterLRUCache(LRUCache[int, T]):
+class AdapterLRUCache(LRUCache[T]):
 
-    def __init__(self, capacity: int, deactivate_fn: Callable[[int], object]):
+    def __init__(self, capacity: int, deactivate_fn: Callable[[Hashable],
+                                                              None]):
         super().__init__(capacity)
         self.deactivate_fn = deactivate_fn
 
-    def _on_remove(self, key: int, value: Optional[T]):
+    def _on_remove(self, key: Hashable, value: Optional[T]):
         logger.debug("Removing adapter int id: %d", key)
         self.deactivate_fn(key)
         return super()._on_remove(key, value)

@@ -1,12 +1,13 @@
-from typing import List, Literal, Sequence, TypedDict, Union, overload
+# SPDX-License-Identifier: Apache-2.0
+from collections.abc import Sequence
+from typing import Literal, Optional, TypedDict, Union, cast, overload
 
 from typing_extensions import TypeIs
 
 from vllm.utils import is_list_of
 
-from .data import (EncoderDecoderLLMInputs, ExplicitEncoderDecoderPrompt,
-                   LLMInputs, PromptType, SingletonPrompt, TextPrompt,
-                   TokensPrompt)
+from .data import (ExplicitEncoderDecoderPrompt, ProcessorInputs, PromptType,
+                   SingletonInputs, SingletonPrompt, TextPrompt, TokensPrompt)
 
 
 class ParsedText(TypedDict):
@@ -15,24 +16,24 @@ class ParsedText(TypedDict):
 
 
 class ParsedTokens(TypedDict):
-    content: List[int]
+    content: list[int]
     is_tokens: Literal[True]
 
 
 @overload
 def parse_and_batch_prompt(
-        prompt: Union[str, List[str]]) -> Sequence[ParsedText]:
+        prompt: Union[str, list[str]]) -> Sequence[ParsedText]:
     ...
 
 
 @overload
 def parse_and_batch_prompt(
-        prompt: Union[List[int], List[List[int]]]) -> Sequence[ParsedTokens]:
+        prompt: Union[list[int], list[list[int]]]) -> Sequence[ParsedTokens]:
     ...
 
 
 def parse_and_batch_prompt(
-    prompt: Union[str, List[str], List[int], List[List[int]]],
+    prompt: Union[str, list[str], list[int], list[list[int]]],
 ) -> Union[Sequence[ParsedText], Sequence[ParsedTokens]]:
     if isinstance(prompt, str):
         # case 1: a string
@@ -44,13 +45,16 @@ def parse_and_batch_prompt(
 
         if is_list_of(prompt, str):
             # case 2: array of strings
+            prompt = cast(list[str], prompt)
             return [
                 ParsedText(content=elem, is_tokens=False) for elem in prompt
             ]
         if is_list_of(prompt, int):
             # case 3: array of tokens
+            prompt = cast(list[int], prompt)
             return [ParsedTokens(content=prompt, is_tokens=True)]
         if is_list_of(prompt, list):
+            prompt = cast(list[list[int]], prompt)
             if len(prompt[0]) == 0:
                 raise ValueError("please provide at least one prompt")
 
@@ -95,12 +99,23 @@ def parse_singleton_prompt(
     raise TypeError("inputs must be a string, TextPrompt, or TokensPrompt")
 
 
+def is_token_prompt(prompt: PromptType) -> TypeIs[TokensPrompt]:
+    return isinstance(prompt, dict) and "prompt_token_ids" in prompt
+
+
 def is_explicit_encoder_decoder_prompt(
         prompt: PromptType) -> TypeIs[ExplicitEncoderDecoderPrompt]:
     return isinstance(prompt, dict) and "encoder_prompt" in prompt
 
 
-def is_valid_encoder_decoder_llm_inputs(
-    inputs: Union[LLMInputs, EncoderDecoderLLMInputs],
-) -> TypeIs[EncoderDecoderLLMInputs]:
-    return "encoder_prompt_token_ids" in inputs
+def split_enc_dec_inputs(
+    inputs: ProcessorInputs,
+) -> tuple[Optional[SingletonInputs], SingletonInputs]:
+    if "encoder" in inputs and "decoder" in inputs:
+        # NOTE: This passes pyright but not mypy
+        return (
+            inputs["encoder"],  # type: ignore[typeddict-item]
+            inputs["decoder"],  # type: ignore[typeddict-item]
+        )
+
+    return None, inputs

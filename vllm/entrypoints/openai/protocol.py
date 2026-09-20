@@ -406,7 +406,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     # Default sampling parameters for chat completion requests
     _DEFAULT_SAMPLING_PARAMS: dict = {
-        "repetition_penalty": 1.0,
+        "repetition_penalty": 1.05,
         "temperature": 1.0,
         "top_p": 1.0,
         "top_k": -1,
@@ -996,7 +996,7 @@ class CompletionRequest(OpenAIBaseModel):
 
     # Default sampling parameters for completion requests
     _DEFAULT_SAMPLING_PARAMS: dict = {
-        "repetition_penalty": 1.0,
+        "repetition_penalty": 1.05,
         "temperature": 1.0,
         "top_p": 1.0,
         "top_k": -1,

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -36,6 +38,7 @@ class GPTQMarlin24Config(QuantizationConfig):
         weight_bits: int,
         group_size: int,
     ) -> None:
+        super().__init__()
         quant_type = {
             4: scalar_types.uint4b8,
             8: scalar_types.uint8b128,
@@ -87,7 +90,7 @@ class GPTQMarlin24Config(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
-        return [torch.bfloat16, torch.half]
+        return [torch.half]
 
     @classmethod
     # Need to figure it out
@@ -126,9 +129,6 @@ class GPTQMarlin24Config(QuantizationConfig):
         if isinstance(layer, LinearBase):
             return GPTQMarlin24LinearMethod(self)
         return None
-
-    def get_scaled_act_names(self) -> List[str]:
-        return []
 
 
 class GPTQMarlin24LinearMethod(LinearMethodBase):

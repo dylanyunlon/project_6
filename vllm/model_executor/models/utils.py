@@ -1,22 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import itertools
 from dataclasses import dataclass, field
-from typing import (Any, Dict, Iterable, List, Literal, Mapping, Optional,
-                    Protocol, Tuple, Union, overload)
+from typing import (Callable, Dict, Iterable, List, Literal, Mapping, Optional,
+                    Protocol, Set, Tuple, Union, overload)
 
 import torch
 import torch.nn as nn
 from torch.func import functional_call
 from transformers import PretrainedConfig
 
-from vllm.config import (CacheConfig, LoRAConfig, MultiModalConfig,
-                         SchedulerConfig)
-from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.model_loader.loader import build_model
+import vllm.envs as envs
+from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models import ModelRegistry
-from vllm.multimodal.base import NestedTensors
+from vllm.multimodal import MultiModalPlaceholderMap, NestedTensors
 from vllm.sequence import IntermediateTensors
-from vllm.utils import is_pin_memory_available
+from vllm.utils import (get_cuda_view_from_cpu_tensor, is_pin_memory_available,
+                        is_uva_available)
+
+logger = init_logger(__name__)
 
 WeightsMapping = Mapping[str, Optional[str]]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""
@@ -72,6 +75,9 @@ class AutoWeightsLoader:
 
     Similarly, the weight loading logic for individual parameters can be
     overridden by defining a ``weight_loader`` method.
+
+    Detailed weight loading information can be viewed by setting the
+    environment variable ``VLLM_LOGGING_LEVEL=DEBUG``.
     """
 
     def __init__(
@@ -124,31 +130,60 @@ class AutoWeightsLoader:
         base_prefix: str,
         param: nn.Parameter,
         weights: Iterable[Tuple[str, torch.Tensor]],
-    ) -> None:
+    ) -> Iterable[str]:
         for weight_name, weight_data in weights:
             weight_qualname = self._get_qualname(base_prefix, weight_name)
 
             if self._can_skip(weight_qualname):
+                logger.debug("Skipping weight %s", weight_qualname)
+
                 continue
 
             if weight_name != "":
-                if not self._can_ignore_unexpected(weight_qualname):
-                    raise ValueError(
-                        f"Attempted to load nested weight '{weight_qualname}' "
-                        f"into a single parameter '{base_prefix}'")
+                if self._can_ignore_unexpected(weight_qualname):
+                    logger.debug("Ignoring weight %s", weight_qualname)
 
-                continue
+                    continue
+
+                raise ValueError(
+                    f"Attempted to load nested weight '{weight_qualname}' "
+                    f"into a single parameter '{base_prefix}'")
 
             weight_loader = getattr(param, "weight_loader",
                                     default_weight_loader)
             weight_loader(param, weight_data)
+
+            logger.debug("Loaded weight %s with shape %s", weight_qualname,
+                         param.shape)
+
+            yield weight_qualname
+
+    def _add_loadable_non_param_tensors(self, module: nn.Module,
+                                        child_params: Dict[str, torch.Tensor]):
+        """
+        Add tensor names that are not in the model params that may be in the
+        safetensors, e.g., batch normalization stats.
+        """
+        if isinstance(module, (
+                nn.BatchNorm1d,
+                nn.BatchNorm2d,
+                nn.BatchNorm3d,
+                nn.LazyBatchNorm1d,
+                nn.LazyBatchNorm2d,
+                nn.LazyBatchNorm3d,
+                nn.SyncBatchNorm,
+        )):
+            module_state_dict = module.state_dict()
+            for stat_name in ("running_mean", "running_var",
+                              "num_batches_tracked"):
+                child_params[stat_name] = module_state_dict[stat_name]
 
     def _load_module(
         self,
         base_prefix: str,
         module: nn.Module,
         weights: Iterable[Tuple[str, torch.Tensor]],
-    ) -> None:
+    ) -> Iterable[str]:
         if isinstance(module, PPMissingLayer):
             return
 
@@ -157,65 +192,98 @@ class AutoWeightsLoader:
         if module != self.module:
             module_load_weights = getattr(module, "load_weights", None)
             if callable(module_load_weights):
-                module_load_weights(weights)
-                return
+                loaded_params = module_load_weights(weights)
+                if loaded_params is None:
+                    logger.warning(
+                        "Unable to collect loaded parameters "
+                        "for module %s", module)
+                else:
+                    yield from map(
+                        lambda x: self._get_qualname(base_prefix, x),
+                        loaded_params,
+                    )
 
         child_modules = dict(module.named_children())
         child_params = dict(module.named_parameters(recurse=False))
 
+        # Add missing tensors the weight loader needs to be able to load
+        # that aren't registered as params, e.g., batchnorm statistics.
+        self._add_loadable_non_param_tensors(module, child_params)
+
         for child_prefix, child_weights in self._groupby_prefix(weights):
             prefix = self._get_qualname(base_prefix, child_prefix)
 
-            if self._can_skip(prefix):
-                continue
-
             if child_prefix in child_modules:
-                self._load_module(prefix, child_modules[child_prefix],
-                                  child_weights)
+                if self._can_skip(prefix + "."):
+                    logger.debug("Skipping module %s", prefix)
+
+                    continue
+
+                yield from self._load_module(prefix,
+                                             child_modules[child_prefix],
+                                             child_weights)
             elif child_prefix in child_params:
-                self._load_param(prefix, child_params[child_prefix],
-                                 child_weights)
+                if self._can_skip(prefix):
+                    logger.debug("Skipping param %s", prefix)
+
+                    continue
+
+                yield from self._load_param(prefix, child_params[child_prefix],
+                                            child_weights)
             else:
-                if not self._can_ignore_unexpected(prefix):
-                    msg = f"There is no module or parameter named '{prefix}'"
-                    raise ValueError(msg)
+                can_skip_module = self._can_skip(prefix + ".")
+                can_skip_param = self._can_skip(prefix)
+                if can_skip_module or can_skip_param:
+                    logger.debug("Skipping missing %s", prefix)
+
+                    continue
+
+                can_ignore_module = self._can_ignore_unexpected(prefix + ".")
+                can_ignore_param = self._can_ignore_unexpected(prefix)
+                if can_ignore_module or can_ignore_param:
+                    logger.debug("Ignoring missing %s", prefix)
+
+                    continue
+
+                msg = (f"There is no module or parameter named '{prefix}' "
+                       f"in {type(self.module).__name__}")
+                raise ValueError(msg)
 
     def load_weights(
         self,
         weights: Iterable[Tuple[str, torch.Tensor]],
         *,
         mapper: Optional[WeightsMapper] = None,
-    ) -> None:
+    ) -> Set[str]:
         if mapper is not None:
             weights = mapper.apply(weights)
 
-        self._load_module("", self.module, weights)
+        autoloaded_weights = set(self._load_module("", self.module, weights))
+        return autoloaded_weights
 
 
 def init_vllm_registered_model(
-    hf_config: PretrainedConfig,
-    cache_config: Optional[CacheConfig],
-    quant_config: Optional[QuantizationConfig],
+    vllm_config: VllmConfig,
     *,
-    lora_config: Optional[LoRAConfig] = None,
-    multimodal_config: Optional[MultiModalConfig] = None,
-    scheduler_config: Optional[SchedulerConfig] = None,
+    prefix: str = "",
+    hf_config: Optional[PretrainedConfig] = None,
+    architectures: Optional[list[str]] = None,
 ) -> nn.Module:
     """
     Helper function to initialize an inner model registered to vLLM,
     based on the arguments passed to the outer vLLM model.
     """
-    model_class, _ = ModelRegistry.resolve_model_cls(hf_config.architectures)
+    from vllm.model_executor.model_loader.loader import _initialize_model
 
-    return build_model(
-        model_class,
-        hf_config,
-        cache_config,
-        quant_config,
-        lora_config=lora_config,
-        multimodal_config=multimodal_config,
-        scheduler_config=scheduler_config,
-    )
+    if hf_config is None and architectures is not None:
+        # So that the architectures field is overridden
+        hf_config = vllm_config.model_config.hf_config
+
+    if hf_config is not None:
+        vllm_config = vllm_config.with_hf_config(hf_config,
+                                                 architectures=architectures)
+
+    return _initialize_model(vllm_config=vllm_config, prefix=prefix)
 
 
 @overload
@@ -234,6 +302,15 @@ def flatten_bn(
     *,
     concat: Literal[True],
 ) -> torch.Tensor:
+    ...
+
+
+@overload
+def flatten_bn(
+    x: Union[List[torch.Tensor], torch.Tensor],
+    *,
+    concat: bool = False,
+) -> Union[List[torch.Tensor], torch.Tensor]:
     ...
 
 
@@ -282,10 +359,27 @@ def _embedding_count_expression(embeddings: NestedTensors) -> str:
         _embedding_count_expression(inner) for inner in embeddings)
 
 
-def merge_multimodal_embeddings(input_ids: torch.Tensor,
-                                inputs_embeds: torch.Tensor,
-                                multimodal_embeddings: NestedTensors,
-                                placeholder_token_id: int) -> torch.Tensor:
+def merge_multimodal_embeddings_from_map(
+        inputs_embeds: torch.Tensor, multimodal_embeddings: NestedTensors,
+        placeholder_map: MultiModalPlaceholderMap.IndexMap) -> torch.Tensor:
+    """
+    Merge ``multimodal_embeddings`` into ``inputs_embeds`` using the provided 
+    placeholder map .
+
+    Note:
+        This updates ``inputs_embeds`` in place.
+    """
+    flattened_embeddings = _flatten_embeddings(multimodal_embeddings)
+    inputs_embeds[placeholder_map.dest] = flattened_embeddings[
+        placeholder_map.src]
+    return inputs_embeds
+
+
+def _merge_multimodal_embeddings(
+    inputs_embeds: torch.Tensor,
+    is_multimodal: torch.Tensor,
+    multimodal_embeddings: NestedTensors,
+) -> torch.Tensor:
     """
     Merge ``multimodal_embeddings`` into ``inputs_embeds`` by overwriting the
     positions in ``inputs_embeds`` corresponding to placeholder tokens in
@@ -294,8 +388,7 @@ def merge_multimodal_embeddings(input_ids: torch.Tensor,
     Note:
         This updates ``inputs_embeds`` in place.
     """
-    mask = (input_ids == placeholder_token_id)
-    num_expected_tokens = mask.sum().item()
+    num_expected_tokens = is_multimodal.sum().item()
     assert isinstance(num_expected_tokens, int)
 
     flattened = _flatten_embeddings(multimodal_embeddings)
@@ -305,8 +398,91 @@ def merge_multimodal_embeddings(input_ids: torch.Tensor,
             f"Attempted to assign {expr} = {flattened.shape[0]} "
             f"multimodal tokens to {num_expected_tokens} placeholders")
 
-    inputs_embeds[mask] = flattened
+    inputs_embeds[is_multimodal] = flattened
     return inputs_embeds
+
+
+def embed_multimodal(
+    input_ids: torch.Tensor,
+    multimodal_token_id: int,
+    get_text_embeds: Callable[[torch.Tensor], torch.Tensor],
+    multimodal_embeds: NestedTensors,
+) -> torch.Tensor:
+    """
+    Embed token IDs and multimodal inputs and combine their embeddings.
+
+    ``multimodal_token_id`` is used to determine whether a token ID should
+    be embedded using ``get_text_embeds`` or ``get_multimodal_embeds``.
+
+    Compared to ``merge_multimodal_embeddings`, this avoids running
+    ``get_text_embeds`` on ``input_ids[input_ids == multimodal_token_id]``
+    which causes issues when the placeholder token ID exceeds the
+    vocabulary size of the language model.
+    """
+    is_multimodal = input_ids == multimodal_token_id
+    is_text = ~is_multimodal
+
+    text_embeds = get_text_embeds(input_ids[is_text])
+    merged_embeds = torch.empty(
+        (input_ids.shape[0], text_embeds.shape[1]),
+        dtype=text_embeds.dtype,
+        device=text_embeds.device,
+    )
+
+    merged_embeds[is_text] = text_embeds
+
+    return _merge_multimodal_embeddings(
+        merged_embeds,
+        is_multimodal,
+        multimodal_embeds,
+    )
+
+
+def merge_multimodal_embeddings(
+    input_ids: torch.Tensor,
+    inputs_embeds: torch.Tensor,
+    multimodal_embeddings: NestedTensors,
+    placeholder_token_id: Union[int, List[int]],
+) -> torch.Tensor:
+    """
+    Merge ``multimodal_embeddings`` into ``inputs_embeds`` by overwriting the
+    positions in ``inputs_embeds`` corresponding to placeholder tokens in
+    ``input_ids``.
+    
+    ``placeholder_token_id`` can be a list of token ids (e.g, token ids 
+    of img_start, img_break, and img_end tokens) when needed: This means 
+    the order of these tokens in the ``input_ids`` MUST MATCH the order of 
+    their embeddings in ``multimodal_embeddings`` since we need to 
+    slice-merge instead of individually scattering.
+
+    For example, if input_ids is "TTTTTSIIIBIIIBIIIETTT", where
+    - T is text token
+    - S is image start token
+    - I is image embedding token
+    - B is image break token
+    - E is image end token.
+    
+    Then the image embeddings (that correspond to I's) from vision encoder 
+    must be padded with embeddings of S, B, and E in the same order of 
+    input_ids for a correct embedding merge.
+
+    Note:
+        This updates ``inputs_embeds`` in place.
+    """
+    if isinstance(placeholder_token_id, list):
+        placeholder_token_id = torch.tensor(placeholder_token_id,
+                                            device=input_ids.device)
+        return _merge_multimodal_embeddings(
+            inputs_embeds,
+            torch.isin(input_ids, placeholder_token_id),
+            multimodal_embeddings,
+        )
+
+    return _merge_multimodal_embeddings(
+        inputs_embeds,
+        (input_ids == placeholder_token_id),
+        multimodal_embeddings,
+    )
 
 
 class LayerFn(Protocol):
@@ -322,6 +498,16 @@ class PPMissingLayer(torch.nn.Identity):
 
     def __init__(self, *args, **kwargs):
         super().__init__()
+        self.return_tuple = kwargs.get("return_tuple", False)
+
+    def forward(self, *args, **kwargs):
+        """
+        Return the first arg from args or the first value from kwargs.
+
+        Wraps the input in a tuple if `self.return_tuple` is True.
+        """
+        input = args[0] if args else next(iter(kwargs.values()))
+        return (input, ) if self.return_tuple else input
 
 
 _CPU_OFFLOAD_BYTES = 0
@@ -335,7 +521,10 @@ def set_cpu_offload_max_bytes(max_bytes: int) -> None:
 
 
 def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
-    device = next(module.parameters()).device
+    if (params := next(module.parameters(), None)) is None:
+        return module
+
+    device = params.device
 
     if device == torch.device("cpu"):
         return module
@@ -345,6 +534,14 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
         return module
 
     pin_memory = is_pin_memory_available()
+    uva_available = is_uva_available()
+
+    if envs.VLLM_USE_V1:
+        assert uva_available, ("V1 CPU offloading requires"
+                               " uva (pin memory) support")
+        uva_offloading = True
+    else:
+        uva_offloading = False
 
     # offload parameters to CPU
     # use pin_memory if possible, which helps cudagraph capture speed
@@ -363,11 +560,16 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
                                        device='cpu',
                                        pin_memory=pin_memory)
         cpu_data.copy_(p.data)
-        p.data = cpu_data
+        if not uva_offloading:
+            p.data = cpu_data
+        else:
+            # keep the cpu data alive
+            p._vllm_offloaded_cpu_data = cpu_data
+            p.data = get_cuda_view_from_cpu_tensor(cpu_data)
         _CPU_OFFLOAD_BYTES += p.data.numel() * p.data.element_size()
         offloaded_parameters = True
 
-    if offloaded_parameters:
+    if offloaded_parameters and not uva_offloading:
         original_forward = module.forward
 
         def forward(*args, **kwargs):
@@ -451,25 +653,26 @@ def make_empty_intermediate_tensors_factory(keys: List[str], hidden_size: int):
         device: torch.device,
     ) -> IntermediateTensors:
         return IntermediateTensors({
-            key: torch.zeros((batch_size, hidden_size),
-                             dtype=dtype,
-                             device=device)
+            key:
+            torch.zeros((batch_size, hidden_size), dtype=dtype, device=device)
             for key in keys
         })
 
     return make_empty_intermediate_tensors
 
+
 def maybe_prefix(prefix: str, name: str) -> str:
-     """Add a prefix to a name if the prefix is non-empty.
- 
-     Args:
-         prefix: The prefix to add. If empty, no prefix will be added.
-         name: The name to potentially prefix.
- 
-     Returns:
-         The string "prefix.name" if prefix was non-empty, otherwise just "name".
-     """
-     return name if not prefix else f"{prefix}.{name}"
+    """Add a prefix to a name if the prefix is non-empty.
+
+    Args:
+        prefix: The prefix to add. If empty, no prefix will be added.
+        name: The name to potentially prefix.
+
+    Returns:
+        The string "prefix.name" if prefix was non-empty, otherwise just "name".
+    """
+    return name if not prefix else f"{prefix}.{name}"
+
 
 def extract_layer_index(layer_name: str) -> int:
     """
@@ -490,26 +693,13 @@ def extract_layer_index(layer_name: str) -> int:
     assert len(int_vals) == 1, (f"layer name {layer_name} should"
                                 " only contain one integer")
     return int_vals[0]
-    
-class LLMWrapper(nn.Module):
-    """
-    To align with the key names of LoRA trained with PEFT, we need to add an 
-    additional layer to the llm's implementation.
-    """
 
-    def __init__(self, llm: nn.Module, name: str) -> None:
-        super().__init__()
-        self.model_name = name
-        setattr(self, name, llm)
 
-    def __getattr__(self, key: str):
-        llm = super().__getattr__(self.model_name)
-        if key == self.model_name:
-            return llm
-
-        return getattr(llm, key)
-
-    # We need to explicitly override this
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        llm = super().__getattr__(self.model_name)
-        return llm(*args, **kwargs)
+def cast_overflow_tensors(
+    tensors: torch.Tensor,
+    offset: float = 1000,
+) -> torch.Tensor:
+    if tensors.isinf().any() or tensors.isnan().any():
+        clamp_value = torch.finfo(tensors.dtype).max - offset
+        tensors = torch.clamp(tensors, min=-clamp_value, max=clamp_value)
+    return tensors

@@ -538,6 +538,20 @@ _USE_NAIVE_BATCHED_MOE = (
 # Qwen3.6 vision tower and vLLM 0.6 multimodal input integration
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Hot path patch: replace vllm ops with xllm .so (THE performance fix)
+# Source: ex_engine/python/patch_vllm_hot_path.py
+# Savings: ~12.2ms/token from linear alone (F.linear 115µs → bridge 31µs)
+# ---------------------------------------------------------------------------
+if env_bool("BI100_HOT_PATH_PATCH", True):
+    try:
+        from ex_engine.python.patch_vllm_hot_path import apply as _apply_hot_path
+        _hot_path_count = _apply_hot_path(strict=False)
+        print(f"[xllm] hot path: {_hot_path_count} patches applied",
+              file=sys.stderr, flush=True)
+    except Exception as _e:
+        print(f"[xllm] hot path patch FAILED: {_e}", file=sys.stderr, flush=True)
+
 _MAX_IMAGE_TOKENS = 1280
 
 
@@ -2035,11 +2049,29 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         if _USE_IX_FUSED_MOE:
             w13 = self.experts.w13_weight  # (E, 2*I, H)
             w2 = self.experts.w2_weight    # (E, H, I)
-            return _ix_fused_moe.fused_moe_forward(
+            _ix_cnt = getattr(self, '_ix_diag_cnt', 0)
+            _in_nan = hidden_states.isnan().any().item()
+            if _ix_cnt < 5 or (_in_nan and _ix_cnt < 200):
+                self._ix_diag_cnt = _ix_cnt + 1
+                logger.info(
+                    "[IX_MOE] call=%d T=%d in_nan=%s in_norm=%.4f "
+                    "logits_range=[%.4f,%.4f] w13=%s",
+                    _ix_cnt, hidden_states.shape[0], _in_nan,
+                    hidden_states.float().norm().item() if not _in_nan else -1,
+                    router_logits.min().item() if not _in_nan else -1,
+                    router_logits.max().item() if not _in_nan else -1,
+                    list(w13.shape))
+            out = _ix_fused_moe.fused_moe_forward(
                 hidden_states, router_logits.float(),
                 w13, w2,
                 self.top_k, w13.shape[0],
                 True)  # renormalize
+            if _ix_cnt < 5:
+                logger.info(
+                    "[IX_MOE] call=%d out_nan=%s out_norm=%.4f",
+                    _ix_cnt, bool(out.isnan().any()),
+                    out.float().norm().item() if not out.isnan().any() else -1)
+            return out
 
         # ---------------------------------------------------------------
         # Tier 0.5: NaiveBatchedExperts from ds_vllm

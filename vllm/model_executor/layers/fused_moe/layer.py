@@ -21,7 +21,10 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.platforms.interface import CpuArchEnum
-from vllm.utils import direct_register_custom_op
+try:
+    from vllm.utils import direct_register_custom_op
+except ImportError:
+    direct_register_custom_op = None
 
 if current_platform.is_cuda_alike():
     from .fused_moe import fused_experts
@@ -958,10 +961,11 @@ def moe_forward_fake(hidden_states: torch.Tensor, router_logits: torch.Tensor,
     return torch.empty_like(hidden_states)
 
 
-direct_register_custom_op(
-    op_name="moe_forward",
-    op_func=moe_forward,
-    mutates_args=[],
-    fake_impl=moe_forward_fake,
-    dispatch_key=current_platform.dispatch_key,
-)
+if direct_register_custom_op is not None:
+    direct_register_custom_op(
+        op_name="moe_forward",
+        op_func=moe_forward,
+        mutates_args=[],
+        fake_impl=moe_forward_fake,
+        dispatch_key=current_platform.dispatch_key,
+    )

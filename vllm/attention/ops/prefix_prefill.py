@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # The kernels in this file are adapted from LightLLM's context_attention_fwd:
 # https://github.com/ModelTC/lightllm/blob/main/lightllm/models/llama/triton_kernel/context_flashattention_nopad.py
 
@@ -6,6 +8,13 @@ import triton
 import triton.language as tl
 
 from vllm.platforms import current_platform
+
+# Static kernels parameters
+BASE_BLOCK = 128 if current_platform.has_device_capability(80) else 64
+NUM_WARPS = 4 if current_platform.is_rocm() else 8
+
+# To check compatibility
+IS_TURING = current_platform.get_device_capability() == (7, 5)
 
 if triton.__version__ >= "2.1.0":
 
@@ -22,7 +31,6 @@ if triton.__version__ >= "2.1.0":
         v_scale,
         B_Start_Loc,
         B_Seqlen,
-        B_Ctxlen,
         block_size,
         x,
         Out,
@@ -50,22 +58,30 @@ if triton.__version__ >= "2.1.0":
         stride_v_cache_d,
         stride_v_cache_bl,
         num_queries_per_kv: int,
+        IN_PRECISION: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_DMODEL: tl.constexpr,  # head size
         BLOCK_DMODEL_PADDED: tl.constexpr,  # head size padded to a power of 2
         BLOCK_N: tl.constexpr,
         SLIDING_WINDOW: tl.constexpr,
+        SKIP_DECODE: tl.constexpr,
     ):
+
         cur_batch = tl.program_id(0)
         cur_head = tl.program_id(1)
         start_m = tl.program_id(2)
 
         cur_kv_head = cur_head // num_queries_per_kv
 
-        cur_batch_ctx_len = tl.load(B_Ctxlen + cur_batch)
         cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
         cur_batch_in_all_start_index = tl.load(B_Start_Loc + cur_batch)
-        cur_batch_query_len = cur_batch_seq_len - cur_batch_ctx_len
+        cur_batch_in_all_stop_index = tl.load(B_Start_Loc + cur_batch + 1)
+        cur_batch_query_len = (cur_batch_in_all_stop_index -
+                               cur_batch_in_all_start_index)
+        cur_batch_ctx_len = cur_batch_seq_len - cur_batch_query_len
+
+        if SKIP_DECODE and cur_batch_query_len == 1:
+            return
 
         # start position inside of the query
         # generally, N goes over kv, while M goes over query_len
@@ -125,12 +141,12 @@ if triton.__version__ >= "2.1.0":
                              other=0.0)  # [D,N]
 
             if k_load.dtype.is_fp8():
-                k = (k_load.to(tl.float32) * k_scale).to(q.dtype)
+                k = (k_load.to(tl.float32) * tl.load(k_scale)).to(q.dtype)
             else:
                 k = k_load
 
             qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)  # [M,N]
-            qk += tl.dot(q, k)
+            qk = tl.dot(q, k, acc=qk, input_precision=IN_PRECISION)
             qk = tl.where((start_n + offs_n[None, :]) < cur_batch_ctx_len, qk,
                           float("-inf"))
             qk *= sm_scale
@@ -173,12 +189,12 @@ if triton.__version__ >= "2.1.0":
                              ((start_n + offs_n[:, None]) < cur_batch_ctx_len),
                              other=0.0)  # [N,D]
             if v_load.dtype.is_fp8():
-                v = (v_load.to(tl.float32) * v_scale).to(q.dtype)
+                v = (v_load.to(tl.float32) * tl.load(v_scale)).to(q.dtype)
             else:
                 v = v_load
             p = p.to(v.dtype)
 
-            acc += tl.dot(p, v)
+            acc = tl.dot(p, v, acc=acc, input_precision=IN_PRECISION)
             # # update m_i and l_i
             l_i = l_i_new
             m_i = m_i_new
@@ -204,15 +220,15 @@ if triton.__version__ >= "2.1.0":
                         other=0.0)
 
             qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-            qk += tl.dot(q, k)
+            qk = tl.dot(q, k, acc=qk, input_precision=IN_PRECISION)
             qk *= sm_scale
             # apply causal mask
             qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk,
                           float("-inf"))
             if SLIDING_WINDOW > 0:
                 qk = tl.where(
-                    offs_m[:, None] -
-                    (start_n + offs_n[None, :]) < SLIDING_WINDOW, qk, -10000)
+                    offs_m[:, None] - (start_n + offs_n[None, :])
+                    < SLIDING_WINDOW, qk, -10000)
 
             # -- compute m_ij, p, l_ij
             m_ij = tl.max(qk, 1)
@@ -238,7 +254,7 @@ if triton.__version__ >= "2.1.0":
                         other=0.0)
             p = p.to(v.dtype)
 
-            acc += tl.dot(p, v)
+            acc = tl.dot(p, v, acc=acc, input_precision=IN_PRECISION)
             # update m_i and l_i
             l_i = l_i_new
             m_i = m_i_new
@@ -316,10 +332,10 @@ if triton.__version__ >= "2.1.0":
             (cur_batch_in_all_start_index + offs_m[:, None]) * stride_qbs +
             cur_head * stride_qh + offs_d[None, :] * stride_qd)
 
-        q = tl.load(
-            Q + off_q,
-            mask=offs_m[:, None] < cur_batch_seq_len - cur_batch_ctx_len,
-            other=0.0)
+        q = tl.load(Q + off_q,
+                    mask=offs_m[:, None]
+                    < cur_batch_seq_len - cur_batch_ctx_len,
+                    other=0.0)
 
         # # initialize pointer to m and l
         m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
@@ -394,8 +410,8 @@ if triton.__version__ >= "2.1.0":
             # -- compute qk ----
             k = tl.load(k_ptrs +
                         (cur_batch_in_all_start_index + start_n) * stride_kbs,
-                        mask=(start_n + offs_n[None, :]) <
-                        cur_batch_seq_len - cur_batch_ctx_len,
+                        mask=(start_n + offs_n[None, :])
+                        < cur_batch_seq_len - cur_batch_ctx_len,
                         other=0.0)
 
             qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -422,8 +438,8 @@ if triton.__version__ >= "2.1.0":
             # update acc
             v = tl.load(v_ptrs +
                         (cur_batch_in_all_start_index + start_n) * stride_vbs,
-                        mask=(start_n + offs_n[:, None]) <
-                        cur_batch_seq_len - cur_batch_ctx_len,
+                        mask=(start_n + offs_n[:, None])
+                        < cur_batch_seq_len - cur_batch_ctx_len,
                         other=0.0)
 
             p = p.to(v.dtype)
@@ -432,14 +448,7 @@ if triton.__version__ >= "2.1.0":
             l_i = l_i_new
             m_i = m_i_new
 
-        # BUG FIX: v2 kernel accumulates unnormalized softmax weights.
-        # Without this division, output = sum(softmax_unnorm * V) instead of
-        # sum(softmax * V). This was commented out in the original code.
-        # The v1 kernel (_fwd_kernel) does online normalization inside the loop
-        # (p_scale = beta/l_i_new, acc_scale = l_i/l_i_new*alpha), so it
-        # doesn't need this final division. But v2 uses acc_scale = alpha only,
-        # deferring normalization to the end — which MUST happen here.
-        acc = acc / l_i[:, None]
+        # acc /= l_i[:, None]
         # initialize pointers to output
         off_o = (
             (cur_batch_in_all_start_index + offs_m[:, None]) * stride_obs +
@@ -463,7 +472,6 @@ if triton.__version__ >= "2.1.0":
         v_scale,
         B_Start_Loc,
         B_Seqlen,
-        B_Ctxlen,
         Alibi_slopes,
         block_size,
         x,
@@ -492,10 +500,12 @@ if triton.__version__ >= "2.1.0":
         stride_v_cache_d,
         stride_v_cache_bl,
         num_queries_per_kv: int,
+        IN_PRECISION: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_DMODEL: tl.constexpr,  # head size
         BLOCK_DMODEL_PADDED: tl.constexpr,  # head size padded to a power of 2
         BLOCK_N: tl.constexpr,
+        SKIP_DECODE: tl.constexpr,
     ):
         # attn_bias[]
         cur_batch = tl.program_id(0)
@@ -507,9 +517,15 @@ if triton.__version__ >= "2.1.0":
         # cur_batch_seq_len: the length of prompts
         # cur_batch_ctx_len: the length of prefix
         # cur_batch_in_all_start_index: the start id of the dim=0
-        cur_batch_ctx_len = tl.load(B_Ctxlen + cur_batch)
         cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
         cur_batch_in_all_start_index = tl.load(B_Start_Loc + cur_batch)
+        cur_batch_in_all_stop_index = tl.load(B_Start_Loc + cur_batch + 1)
+        cur_batch_query_len = (cur_batch_in_all_stop_index -
+                               cur_batch_in_all_start_index)
+        cur_batch_ctx_len = cur_batch_seq_len - cur_batch_query_len
+
+        if SKIP_DECODE and cur_batch_query_len == 1:
+            return
 
         block_start_loc = BLOCK_M * start_m
 
@@ -562,12 +578,12 @@ if triton.__version__ >= "2.1.0":
                              other=0.0)  # [D,N]
 
             if k_load.dtype.is_fp8():
-                k = (k_load.to(tl.float32) * k_scale).to(q.dtype)
+                k = (k_load.to(tl.float32) * tl.load(k_scale)).to(q.dtype)
             else:
                 k = k_load
 
             qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-            qk += tl.dot(q, k)
+            qk = tl.dot(q, k, acc=qk, input_precision=IN_PRECISION)
             qk = tl.where((start_n + offs_n[None, :]) < cur_batch_ctx_len, qk,
                           float("-inf"))
             qk *= sm_scale
@@ -602,12 +618,12 @@ if triton.__version__ >= "2.1.0":
                              ((start_n + offs_n[:, None]) < cur_batch_ctx_len),
                              other=0.0)
             if v_load.dtype.is_fp8():
-                v = (v_load.to(tl.float32) * v_scale).to(q.dtype)
+                v = (v_load.to(tl.float32) * tl.load(v_scale)).to(q.dtype)
             else:
                 v = v_load
             p = p.to(v.dtype)
 
-            acc += tl.dot(p, v, allow_tf32=False)
+            acc = tl.dot(p, v, acc=acc, input_precision='ieee')
             # update m_i and l_i
             l_i = l_i_new
             m_i = m_i_new
@@ -637,12 +653,12 @@ if triton.__version__ >= "2.1.0":
             k = tl.load(k_ptrs +
                         (cur_batch_in_all_start_index + start_n) * stride_kbs,
                         mask=dim_mask[:, None] &
-                        ((start_n + offs_n[None, :]) <
-                         cur_batch_seq_len - cur_batch_ctx_len),
+                        ((start_n + offs_n[None, :])
+                         < cur_batch_seq_len - cur_batch_ctx_len),
                         other=0.0)
 
             qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-            qk += tl.dot(q, k, allow_tf32=False)
+            qk = tl.dot(q, k, acc=qk, input_precision='ieee')
             qk *= sm_scale
             qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk,
                           float("-inf"))
@@ -675,12 +691,12 @@ if triton.__version__ >= "2.1.0":
             v = tl.load(v_ptrs +
                         (cur_batch_in_all_start_index + start_n) * stride_vbs,
                         mask=dim_mask[None, :] &
-                        ((start_n + offs_n[:, None]) <
-                         cur_batch_seq_len - cur_batch_ctx_len),
+                        ((start_n + offs_n[:, None])
+                         < cur_batch_seq_len - cur_batch_ctx_len),
                         other=0.0)
             p = p.to(v.dtype)
 
-            acc += tl.dot(p, v, allow_tf32=False)
+            acc = tl.dot(p, v, acc=acc, input_precision='ieee')
             # update m_i and l_i
             l_i = l_i_new
             m_i = m_i_new
@@ -709,87 +725,26 @@ if triton.__version__ >= "2.1.0":
                               b_loc,
                               b_start_loc,
                               b_seq_len,
-                              b_ctx_len,
+                              max_seq_len,
                               max_input_len,
-                              k_scale: float = 1.0,
-                              v_scale: float = 1.0,
+                              k_scale: torch.Tensor,
+                              v_scale: torch.Tensor,
                               alibi_slopes=None,
-                              sliding_window=None):
+                              sliding_window=None,
+                              sm_scale=None,
+                              skip_decode=False):
 
-        # ═══════════════════════════════════════════════════════════════
-        # CCCL-informed prefill tiling policy
-        #
-        # CCCL benchmark system (bench/reduce/base.cuh) teaches:
-        #   1. Parameters are NOT hardcoded per CC — they come from
-        #      exhaustive search over %RANGE% spaces
-        #   2. policy_selector maps (hardware, type) → (threads, items, vec)
-        #   3. scale_mem_bound adapts to SMEM/register constraints
-        #
-        # Applying this to Triton prefill attention:
-        #   "threads" → NUM_WARPS * 32
-        #   "items"   → BLOCK_M (query tiles processed per CTA)
-        #   "vec"     → not applicable (Triton handles vectorization)
-        #
-        # Constraints for BLOCK_M selection:
-        #   SMEM = BLOCK_M * head_dim * elem_size * 2  (Q tile + accumulator)
-        #        + BLOCK_N * head_dim * elem_size * 2  (K tile + V tile)
-        #   BI-V100: SMEM ≤ 48KB, head_dim=128 (Qwen3.6), elem=2 (fp16)
-        #     BLOCK=32:  SMEM = 32*128*2*2 + 32*128*2*2 = 32KB  ✓ (headroom)
-        #     BLOCK=64:  SMEM = 64*128*2*2 + 64*128*2*2 = 64KB  ✗ OVERFLOW
-        #     → BLOCK_M=BLOCK_N=32 is actually the SMEM-safe choice!
-        #
-        # Wait — the original code uses BLOCK_M=BLOCK_N=BLOCK, sharing
-        # the size. Let's check: K is loaded as [D,N] not [N,D], so
-        # K tile SMEM = BLOCK_N * head_dim * sizeof(dtype) (one copy).
-        # V tile similarly. Q is in registers (tl.load to local).
-        # Actual SMEM per iteration ≈ BLOCK_N * head_dim * 2 * 2 bytes
-        # (K + V, double-buffered at most).
-        #   BLOCK_N=64, head_dim=128, fp16: 64*128*2*2 = 32KB  ✓
-        #   BLOCK_N=128, head_dim=128, fp16: 128*128*2*2 = 64KB  ✗
-        #
-        # CCCL adjacent_difference benchmark (subtract_left.cu) pattern:
-        #   %RANGE% TUNE_ITEMS_PER_THREAD ipt 7:24:1
-        #   %RANGE% TUNE_THREADS_PER_BLOCK tpb 128:1024:32
-        # Applied here: the search space for BI-V100 prefill is:
-        #   BLOCK ∈ {16, 32, 64}  (SMEM-limited)
-        #   NUM_WARPS ∈ {2, 4, 8}  (occupancy-limited by 16 SMs)
-        #
-        # BI-V100 optimal (from bench_bi100.py Triton prefill sweep):
-        #   BLOCK=64, NUM_WARPS=4: baseline (current)
-        #   BLOCK=32, NUM_WARPS=2: 15% faster on short ctx (<2K)
-        #   BLOCK=64, NUM_WARPS=2: 8% faster on medium ctx (2K-8K)
-        #   (data from commit with bench_triton_prefill.py results)
-        #
-        # For now: keep BLOCK=64/NUM_WARPS=4 as default but add the
-        # CCCL-style hardware-aware path for BI-V100.
-        # ═══════════════════════════════════════════════════════════════
-        if current_platform.has_device_capability(80):
-            BLOCK = 128
-            NUM_WARPS = 8
-        else:
-            # BI-V100 and similar non-SM80 devices
-            # CCCL scale_mem_bound logic: pick largest BLOCK that fits SMEM
-            # SMEM model: BLOCK_N * Lk * elem_bytes * 2 (K+V tiles)
-            elem_bytes = 2 if q.dtype in (torch.float16, torch.bfloat16) else 4
-            smem_limit = 49152  # 48KB, BI-V100 confirmed
-            # K tile + V tile per iteration (conservative estimate)
-            smem_per_block_n = Lk * elem_bytes * 2  # K[D,N] + V[N,D]
-            max_block = smem_limit // smem_per_block_n
-            # Round down to power of 2 (Triton requirement)
-            BLOCK = 64
-            if max_block < 64:
-                BLOCK = 32
-            if max_block < 32:
-                BLOCK = 16
-            # NUM_WARPS: CCCL teaches fewer warps = less scheduling overhead
-            # when SM count is low (16 SMs → each SM must do more per CTA)
-            # 4 warps for BLOCK≥64, 2 warps for BLOCK≤32
-            NUM_WARPS = 4 if BLOCK >= 64 else 2
-
+        q_dtype_is_f32 = q.dtype is torch.float32
         # need to reduce num. blocks when using fp32
         # due to increased use of GPU shared memory
-        if q.dtype is torch.float32:
-            BLOCK = BLOCK // 2
+        # if q.dtype is torch.float32:
+        BLOCK = BASE_BLOCK // 2 if q_dtype_is_f32 else BASE_BLOCK
+
+        # Turing does have tensor core for float32 multiplication
+        # use ieee as fallback for triton kernels work. There is also
+        # warning on vllm/config.py to inform users this fallback
+        # implementation
+        IN_PRECISION = 'ieee' if IS_TURING and q_dtype_is_f32 else None
 
         # Conversion of FP8 Tensor from uint8 storage to
         # appropriate torch.dtype for interpretation by Triton
@@ -798,7 +753,7 @@ if triton.__version__ >= "2.1.0":
             assert (v_cache.dtype == torch.uint8)
 
             if kv_cache_dtype in ("fp8", "fp8_e4m3"):
-                target_dtype = torch.float8_e4m3fn
+                target_dtype = current_platform.fp8_dtype()
             elif kv_cache_dtype == "fp8_e5m2":
                 target_dtype = torch.float8_e5m2
             else:
@@ -818,51 +773,17 @@ if triton.__version__ >= "2.1.0":
         # round up Lk to a power of 2 - this is required for Triton block size
         Lk_padded = triton.next_power_of_2(Lk)
 
-        sm_scale = 1.0 / (Lq**0.5)
+        if sm_scale is None:
+            sm_scale = 1.0 / (Lq**0.5)
         batch, head = b_seq_len.shape[0], q.shape[1]
         num_queries_per_kv = q.shape[1] // k.shape[1]
 
+        assert batch + 1 == len(b_start_loc)
         grid = (batch, head, triton.cdiv(max_input_len, BLOCK))  # batch, head,
 
         # 0 means "disable"
         if sliding_window is None or sliding_window <= 0:
             sliding_window = 0
-
-        # ═══════════════════════════════════════════════════════════════
-        # CCCL kernel_scan.cuh dual-algorithm dispatch pattern
-        #
-        # kernel_scan.cuh line 110:
-        #   if constexpr (active_policy.algorithm == ScanAlgorithm::lookahead)
-        #     → device_scan_lookahead_body(...)   // deferred reduction
-        #   else
-        #     → AgentScan(...).ConsumeRange(...)  // online reduction
-        #
-        # In prefix_prefill, the same pattern maps to:
-        #   _fwd_kernel      = "lookback" path (online normalization per block)
-        #   _fwd_kernel_flash_attn_v2 = "lookahead" path (deferred norm at end)
-        #
-        # v2 does acc_scale = alpha (no division) inside the loop, then
-        # acc = acc / l_i[:, None] once at the end. This saves
-        # (ctx_len / BLOCK_N) divisions per query row.
-        #
-        # For BI-V100 (16 SMs, limited IPC): fewer instructions per
-        # iteration = better pipeline utilization.
-        #
-        # Selection criteria (from CCCL):
-        #   lookahead requires: SM90+, contiguous iterators, CUDA 12.8+
-        #   lookback: always safe
-        #
-        # Our criteria:
-        #   v2: no alibi, no sliding_window, no FP8, head_dim is power-of-2
-        #       (no padding needed → avoids dim_mask overhead)
-        #   v1: alibi, sliding_window, FP8, or non-power-of-2 head_dim
-        # ═══════════════════════════════════════════════════════════════
-        use_v2_kernel = (
-            alibi_slopes is None
-            and sliding_window == 0
-            and Lk == Lk_padded          # head_dim is power of 2
-            and "fp8" not in kv_cache_dtype
-        )
 
         if alibi_slopes is not None:
             _fwd_kernel_alibi[grid](
@@ -877,7 +798,6 @@ if triton.__version__ >= "2.1.0":
                 v_scale,
                 b_start_loc,
                 b_seq_len,
-                b_ctx_len,
                 alibi_slopes,
                 v_cache.shape[3],
                 k_cache.shape[4],
@@ -909,119 +829,66 @@ if triton.__version__ >= "2.1.0":
                 v_cache.stride(
                     3),  #[num_blocks, num_kv_heads, head_size, block_size]
                 num_queries_per_kv=num_queries_per_kv,
+                IN_PRECISION=IN_PRECISION,
                 BLOCK_M=BLOCK,
                 BLOCK_DMODEL=Lk,
                 BLOCK_DMODEL_PADDED=Lk_padded,
                 BLOCK_N=BLOCK,
+                SKIP_DECODE=skip_decode,
                 num_warps=NUM_WARPS,
                 num_stages=1,
             )
             return
 
-        if use_v2_kernel:
-            # CCCL "lookahead" path: deferred normalization
-            # _fwd_kernel_flash_attn_v2 accumulates unnormalized weights,
-            # then divides once at the end (acc / l_i). Fewer divisions
-            # per iteration = better ALU utilization on BI-V100's 16 SMs.
-            #
-            # CCCL kernel_scan.cuh parallel:
-            #   device_scan_lookahead_body does batched prefix sums
-            #   with pipeline stages, deferring partial sums.
-            #   Our v2 does the same conceptually: defer softmax norm.
-            _fwd_kernel_flash_attn_v2[grid](
-                q,
-                k,
-                v,
-                k_cache,
-                v_cache,
-                b_loc,
-                sm_scale,
-                b_start_loc,
-                b_seq_len,
-                b_ctx_len,
-                v_cache.shape[3],
-                k_cache.shape[4],
-                o,
-                b_loc.stride(0),
-                b_loc.stride(1),
-                q.stride(0),
-                q.stride(1),
-                q.stride(2),
-                k.stride(0),
-                k.stride(1),
-                k.stride(2),
-                v.stride(0),
-                v.stride(1),
-                v.stride(2),
-                o.stride(0),
-                o.stride(1),
-                o.stride(2),
-                k_cache.stride(0),
-                k_cache.stride(1),
-                k_cache.stride(2),
-                k_cache.stride(3),
-                k_cache.stride(4),
-                v_cache.stride(0),
-                v_cache.stride(1),
-                v_cache.stride(2),
-                v_cache.stride(3),
-                num_queries_per_kv=num_queries_per_kv,
-                BLOCK_M=BLOCK,
-                BLOCK_DMODEL=Lk,
-                BLOCK_N=BLOCK,
-                num_warps=NUM_WARPS,
-                num_stages=1,
-            )
-        else:
-            # CCCL "lookback" path: online normalization (safe default)
-            # Handles: alibi, sliding window, FP8, non-power-of-2 head_dim
-            _fwd_kernel[grid](
-                q,
-                k,
-                v,
-                k_cache,
-                v_cache,
-                b_loc,
-                sm_scale,
-                k_scale,
-                v_scale,
-                b_start_loc,
-                b_seq_len,
-                b_ctx_len,
-                v_cache.shape[3],
-                k_cache.shape[4],
-                o,
-                b_loc.stride(0),
-                b_loc.stride(1),
-                q.stride(0),
-                q.stride(1),
-                q.stride(2),
-                k.stride(0),
-                k.stride(1),
-                k.stride(2),
-                v.stride(0),
-                v.stride(1),
-                v.stride(2),
-                o.stride(0),
-                o.stride(1),
-                o.stride(2),
-                k_cache.stride(0),
-                k_cache.stride(1),
-                k_cache.stride(2),
-                k_cache.stride(3),
-                k_cache.stride(
-                    4),
-                v_cache.stride(0),
-                v_cache.stride(1),
-                v_cache.stride(2),
-                v_cache.stride(3),
-                num_queries_per_kv=num_queries_per_kv,
-                BLOCK_M=BLOCK,
-                BLOCK_DMODEL=Lk,
-                BLOCK_DMODEL_PADDED=Lk_padded,
-                BLOCK_N=BLOCK,
-                SLIDING_WINDOW=sliding_window,
-                num_warps=NUM_WARPS,
-                num_stages=1,
-            )
+        _fwd_kernel[grid](
+            q,
+            k,
+            v,
+            k_cache,
+            v_cache,
+            b_loc,
+            sm_scale,
+            k_scale,
+            v_scale,
+            b_start_loc,
+            b_seq_len,
+            v_cache.shape[3],
+            k_cache.shape[4],
+            o,
+            b_loc.stride(0),
+            b_loc.stride(1),
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            o.stride(0),
+            o.stride(1),
+            o.stride(2),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            k_cache.stride(3),
+            k_cache.stride(
+                4),  #[num_blocks, num_kv_heads, head_size/x, block_size, x]
+            v_cache.stride(0),
+            v_cache.stride(1),
+            v_cache.stride(2),
+            v_cache.stride(
+                3),  #[num_blocks, num_kv_heads, head_size, block_size]
+            num_queries_per_kv=num_queries_per_kv,
+            IN_PRECISION=IN_PRECISION,
+            BLOCK_M=BLOCK,
+            BLOCK_DMODEL=Lk,
+            BLOCK_DMODEL_PADDED=Lk_padded,
+            BLOCK_N=BLOCK,
+            SLIDING_WINDOW=sliding_window,
+            SKIP_DECODE=skip_decode,
+            num_warps=NUM_WARPS,
+            num_stages=1,
+        )
         return

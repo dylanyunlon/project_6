@@ -55,7 +55,7 @@ if not hasattr(_qwen2_vl_image_processing, "make_batched_videos"):
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import (CacheConfig, LoRAConfig, MultiModalConfig,
-                         SchedulerConfig, VllmConfig)
+                         SchedulerConfig)
 from vllm.distributed import (get_tensor_model_parallel_rank,
                                get_tensor_model_parallel_world_size,
                                tensor_model_parallel_all_reduce)
@@ -184,6 +184,8 @@ def _load_xllm_prebuilt(name):
         # When patch_ops.sh copies this file into vllm package, __file__
         # points to vllm/model_executor/models/ — look back up to workspace
         f"/home/dylan/0814/project_6/qwen3_6_scripts/prebuilt/corex-3.2.3-ivcore10/{name}.so",
+        # .so installed to VLLM_ROOT by install_prebuilt_corex.sh
+        os.path.join(os.path.dirname(__file__), "..", "..", f"{name}.so"),
     ]
     for _p in _search:
         if os.path.isfile(_p):
@@ -256,6 +258,53 @@ logger = init_logger(__name__)
 
 _bi100_model_trace("qwen3_5 runtime imports complete")
 
+# ---------------------------------------------------------------------------
+# BI100 flash_attn compatibility patch
+# The corex flash_attn_cuda.varlen_fwd kernel has a different signature than
+# upstream flash_attn >= 2.5.  We monkey-patch flash_attn.flash_attn_interface
+# so that flash_attn_varlen_func works transparently on BI100.
+# ---------------------------------------------------------------------------
+_flash_attn_patched = False
+
+
+def _patch_flash_attn_varlen_for_bi100():
+    """Patch flash_attn for BI100 corex compatibility.
+
+    The BI100 corex flash_attn package adds three extra required parameters
+    to both ``_flash_attn_varlen_forward`` and ``flash_attn_varlen_func``:
+        use_alibi (bool), alibi_mode (int), imp_mode (int)
+    Upstream callers (e.g. qwen2_vl.py) don't pass these, so we wrap the
+    low-level ``_flash_attn_varlen_forward`` to supply defaults.
+    """
+    global _flash_attn_patched
+    if _flash_attn_patched:
+        return
+    _flash_attn_patched = True
+
+    import flash_attn.flash_attn_interface as _fai
+
+    _orig = _fai._flash_attn_varlen_forward
+
+    def _compat_flash_attn_varlen_forward(
+        q, k, v, cu_seqlens_q, cu_seqlens_k,
+        max_seqlen_q, max_seqlen_k,
+        dropout_p, softmax_scale, causal,
+        window_size=(-1, -1), alibi_slopes=None,
+        return_softmax=False,
+        use_alibi=False, alibi_mode=1, imp_mode=0,
+    ):
+        return _orig(
+            q, k, v, cu_seqlens_q, cu_seqlens_k,
+            max_seqlen_q, max_seqlen_k,
+            dropout_p, softmax_scale, causal,
+            window_size, alibi_slopes, return_softmax,
+            use_alibi, alibi_mode, imp_mode,
+        )
+
+    _fai._flash_attn_varlen_forward = _compat_flash_attn_varlen_forward
+    logger.info("BI100: patched _flash_attn_varlen_forward — "
+                "added use_alibi/alibi_mode/imp_mode defaults")
+
 _ALLOW_GDN_NAN_ZERO = env_bool("BI100_GDN_ALLOW_NAN_ZERO", False)
 _GDN_FINITE_CHECK = (env_bool("BI100_GDN_FINITE_CHECK", False)
                      or _ALLOW_GDN_NAN_ZERO)
@@ -289,7 +338,7 @@ _USE_COREX_MOE_WEIGHT_GATHER = (
     and env_bool("BI100_MOE_COREX_WEIGHT_GATHER", True))
 _USE_COREX_MOE_DIRECT_ROUTED = (
     _corex_moe_direct_routed is not None
-    and env_bool("BI100_MOE_COREX_DIRECT_ROUTED", True))
+    and env_bool("BI100_MOE_COREX_DIRECT_ROUTED", False))
 _USE_COREX_BATCHED_GEMM = (
     _corex_batched_gemm is not None
     and env_bool("BI100_MOE_BATCHED_GEMM", True))
@@ -489,6 +538,20 @@ _USE_NAIVE_BATCHED_MOE = (
 # Qwen3.6 vision tower and vLLM 0.6 multimodal input integration
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Hot path patch: replace vllm ops with xllm .so (THE performance fix)
+# Source: ex_engine/python/patch_vllm_hot_path.py
+# Savings: ~12.2ms/token from linear alone (F.linear 115µs → bridge 31µs)
+# ---------------------------------------------------------------------------
+if env_bool("BI100_HOT_PATH_PATCH", True):
+    try:
+        from ex_engine.python.patch_vllm_hot_path import apply as _apply_hot_path
+        _hot_path_count = _apply_hot_path(strict=False)
+        print(f"[xllm] hot path: {_hot_path_count} patches applied",
+              file=sys.stderr, flush=True)
+    except Exception as _e:
+        print(f"[xllm] hot path patch FAILED: {_e}", file=sys.stderr, flush=True)
+
 _MAX_IMAGE_TOKENS = 1280
 
 
@@ -641,14 +704,24 @@ class Qwen3_5VisionBlock(nn.Module):
             projection_size=dim,
             quant_config=quant_config,
         )
+        # BI100: keep FLASH_ATTN backend but patch flash_attn_cuda.varlen_fwd
+        # to be compatible with the corex kernel signature.
+        from vllm.platforms import _Backend as _Bk
+        if hasattr(self.attn, 'attn_backend'):
+            self.attn.attn_backend = _Bk.FLASH_ATTN
+            _patch_flash_attn_varlen_for_bi100()
         self.mlp = Qwen3_5VisionMLP(vision_config, quant_config)
 
     def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor,
-                rotary_pos_emb: torch.Tensor) -> torch.Tensor:
+                rotary_pos_emb: torch.Tensor,
+                max_seqlen: Optional[int] = None,
+                seqlens: Optional[list] = None) -> torch.Tensor:
         x = x + self.attn(
             self.norm1(x),
             cu_seqlens=cu_seqlens,
             rotary_pos_emb=rotary_pos_emb,
+            max_seqlen=max_seqlen,
+            seqlens=seqlens,
         )
         return x + self.mlp(self.norm2(x))
 
@@ -745,8 +818,12 @@ class Qwen3_5VisionTransformer(nn.Module):
         ).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
         x = x.unsqueeze(1)
+        # Pre-compute seqlens for xformers attn mask
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
         for block in self.blocks:
-            x = block(x, cu_seqlens, rotary_pos_emb)
+            x = block(x, cu_seqlens, rotary_pos_emb,
+                      max_seqlen=max_seqlen, seqlens=seqlens)
         return self.merger(x)
 
 
@@ -844,6 +921,7 @@ def dummy_data_for_qwen36(
     ctx: InputContext,
     seq_len: int,
     mm_counts: Mapping[str, int],
+    **kwargs,
 ) -> "DummyData":
     from vllm.inputs.registry import DummyData
     num_images = mm_counts.get("image", 0)
@@ -1817,7 +1895,9 @@ class Qwen3_5FullAttention(nn.Module):
 
         with bi100_timer("full_attn.attention"):
             with bi100_timer(f"L{self.layer_idx}.full_attn"):
-                attn_out = self.attn(q, k, v, kv_cache, attn_metadata)
+                attn_out = self.attn(q, k, v,
+                                     kv_cache=kv_cache,
+                                     attn_metadata=attn_metadata)
 
         with bi100_timer("full_attn.gate"):
             attn_out = (attn_out
@@ -1966,14 +2046,32 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         # corex_batched_gemm.moe_decode_fused, which are purpose-built
         # fused kernels for single-token MoE dispatch.
         # ---------------------------------------------------------------
-        if _USE_IX_FUSED_MOE and hidden_states.shape[0] > 1:
+        if _USE_IX_FUSED_MOE:
             w13 = self.experts.w13_weight  # (E, 2*I, H)
             w2 = self.experts.w2_weight    # (E, H, I)
-            return _ix_fused_moe.fused_moe_forward(
-                hidden_states, router_logits,
+            _ix_cnt = getattr(self, '_ix_diag_cnt', 0)
+            _in_nan = hidden_states.isnan().any().item()
+            if _ix_cnt < 5 or (_in_nan and _ix_cnt < 200):
+                self._ix_diag_cnt = _ix_cnt + 1
+                logger.info(
+                    "[IX_MOE] call=%d T=%d in_nan=%s in_norm=%.4f "
+                    "logits_range=[%.4f,%.4f] w13=%s",
+                    _ix_cnt, hidden_states.shape[0], _in_nan,
+                    hidden_states.float().norm().item() if not _in_nan else -1,
+                    router_logits.min().item() if not _in_nan else -1,
+                    router_logits.max().item() if not _in_nan else -1,
+                    list(w13.shape))
+            out = _ix_fused_moe.fused_moe_forward(
+                hidden_states, router_logits.float(),
                 w13, w2,
                 self.top_k, w13.shape[0],
                 True)  # renormalize
+            if _ix_cnt < 5:
+                logger.info(
+                    "[IX_MOE] call=%d out_nan=%s out_norm=%.4f",
+                    _ix_cnt, bool(out.isnan().any()),
+                    out.float().norm().item() if not out.isnan().any() else -1)
+            return out
 
         # ---------------------------------------------------------------
         # Tier 0.5: NaiveBatchedExperts from ds_vllm
@@ -1988,7 +2086,7 @@ class Qwen3_5MoeSparseBlock(nn.Module):
             # topk routing (reuse existing corex/xllm/pytorch topk)
             if _USE_XLLM_MOE:
                 topk_weights, topk_ids = _xllm_moe.moe_fused_topk(
-                    router_logits, self.top_k, True, None, "softmax")
+                    router_logits.float(), self.top_k, True, None, "softmax")
                 topk_ids = topk_ids.to(torch.int64)
                 topk_weights = topk_weights.to(hidden_states.dtype)
             elif _USE_COREX_MOE_TOPK_SOFTMAX:
@@ -2014,7 +2112,7 @@ class Qwen3_5MoeSparseBlock(nn.Module):
         # Source: xllm/core/kernels/cuda/moe/moe_topk_softmax_kernels.cuh
         if _USE_XLLM_MOE:
             topk_weights, topk_ids = _xllm_moe.moe_fused_topk(
-                router_logits, self.top_k, True, None, "softmax")
+                router_logits.float(), self.top_k, True, None, "softmax")
             topk_ids = topk_ids.to(torch.int64)
             topk_weights = topk_weights.to(hidden_states.dtype)
         elif _USE_COREX_MOE_TOPK_SOFTMAX:
@@ -2103,95 +2201,33 @@ class Qwen3_5MoeSparseBlock(nn.Module):
                     0, keepdim=True).to(hidden_states.dtype)   # (1, H)
             else:
                 # --- TP mode: all 8 experts are local ---
-                # --- corex_moe_direct_routed: zero-copy indexed GEMM (warp64) ---
-                # Compiled kernel constants: kHidden=2048, kExperts=256, kTopK=8
-                # w13 must be (256, 256, 2048), w2 must be (256, 2048, 128)
-                # eids MUST be int64 (verified on real hardware)
-                # act for w2_reduce must be (8, 128) not (1, 1024)
-                use_corex_direct = (
-                    _USE_COREX_MOE_DIRECT_ROUTED
-                    and hidden_states.dtype == torch.float16
-                    and w13.dtype == torch.float16
-                    and w2.dtype == torch.float16
-                    and hidden_states.is_cuda and w13.is_cuda
-                    and hidden_states.is_contiguous()
-                    and w13.is_contiguous() and w2.is_contiguous()
-                    and w13.shape == (256, 256, 2048)
-                    and w2.shape == (256, 2048, 128)
-                    and eids.numel() == 8)
-                if not hasattr(self, '_direct_routed_logged'):
-                    self._direct_routed_logged = True
-                    logger.info(
-                        "MoE T=1 direct_routed check: flag=%s match=%s ep=%s "
-                        "hs=%s w13=%s w2=%s eids=%s ws=%s dtype_eids=%s",
-                        _USE_COREX_MOE_DIRECT_ROUTED, use_corex_direct, _ep,
-                        tuple(hidden_states.shape), tuple(w13.shape),
-                        tuple(w2.shape), tuple(eids.shape), tuple(ws.shape),
-                        eids.dtype)
-                if use_corex_direct:
-                    eids_i64 = eids.to(torch.int64)  # kernel requires int64
-                    gate_up = _corex_moe_direct_routed.w13(
-                        hidden_states, w13, eids_i64)              # (8, 256)
-                    gate, up = gate_up.chunk(2, dim=-1)            # (8, 128) each
-                    act = (torch.nn.functional.silu(gate) * up).contiguous()  # (8, 128)
-                    return _corex_moe_direct_routed.w2_reduce(
-                        act, w2, eids_i64, ws)                     # (1, 2048)
-
-                # Tier 1.5: CUTLASS batched GEMM (verified 2.462ms, issue #68)
-                # 1 launch for 8 experts vs 8 launches for F.linear loop
-                if (_USE_COREX_BATCHED_GEMM
-                        and hidden_states.dtype == torch.float16
-                        and w13.dtype == torch.float16
-                        and w2.dtype == torch.float16):
-                    return _corex_batched_gemm.moe_decode_fused(
-                        hidden_states, w13[eids], w2[eids], ws)
-
-                use_corex_gather = (
-                    _USE_COREX_MOE_WEIGHT_GATHER
-                    and hidden_states.dtype == torch.float16
-                    and w13.dtype == torch.float16
-                    and w2.dtype == torch.float16
-                    and w13.is_cuda and w2.is_cuda and eids.is_cuda
-                    and w13.is_contiguous() and w2.is_contiguous()
-                    and eids.is_contiguous()
-                    and w13.dim() == 3 and w2.dim() == 3
-                    and eids.dim() == 1 and eids.numel() == self.top_k
-                    and w13.shape[0] == w2.shape[0]
-                    and w13.shape[2] == w2.shape[1]
-                    and w13.shape[1] == 2 * w2.shape[2]
-                    and w13.shape[1] * w13.shape[2] % 8 == 0
-                    and w2.shape[1] * w2.shape[2] % 8 == 0)
-                if use_corex_gather:
-                    w13_sel, w2_sel = _corex_moe_weight_gather.gather(
-                        w13, w2, eids)
-                else:
-                    w13_sel = w13[eids]                            # (K_actual, 2*I, H)
-                    w2_sel = w2[eids]                              # (K_actual, H, I)
-
+                # xllm warp64-safe path: gather weights → fused GEMM → combine
+                K = eids.shape[0]
                 H = hidden_states.shape[-1]
+                w13_sel = w13[eids]                                # (K, 2*I, H)
+                w2_sel = w2[eids]                                  # (K, H, I)
 
-                # FC1: single large GEMM via F.linear
-                # (1, H) @ (K_actual*2*I, H)^T → (1, K_actual*2*I)
+                # FC1: single large GEMM via _fast_linear (ix_moe_bridge GEMV)
                 gate_up = _fast_linear(
                     hidden_states,
-                    w13_sel.reshape(-1, H),                        # (K_actual*2*I, H)
-                )                                                  # (1, K_actual*2*I)
-                gate_up = gate_up.view(K_actual, -1)               # (K_actual, 2*I)
+                    w13_sel.reshape(-1, H),                        # (K*2*I, H)
+                )                                                  # (1, K*2*I)
+                gate_up = gate_up.view(K, -1)                      # (K, 2*I)
 
                 if _USE_FUSED_MOE_ACTIVATION:
-                    act = self.act_fn(gate_up)                      # (K_actual, I)
+                    act = self.act_fn(gate_up)                      # (K, I)
                 else:
                     gate, up = gate_up.chunk(2, dim=-1)
                     act = F.silu(gate) * up
 
-                # FC2: bmm (K_actual, H, I) @ (K_actual, I, 1) → (K_actual, H)
+                # FC2: bmm (K, H, I) @ (K, I, 1) → (K, H)
                 expert_out = torch.bmm(w2_sel, act.unsqueeze(-1)).squeeze(-1)
 
-                if (_USE_COREX_MOE_EXACT_REDUCE
-                        and expert_out.dtype == torch.float16
-                        and ws.dtype == torch.float16
-                        and expert_out.shape[0] == 8):
-                    out = _corex_moe_exact_reduce.serial_float(expert_out, ws)
+                # Combine: xllm fused kernel or PyTorch weighted sum
+                if _USE_XLLM_MOE:
+                    # expert_out is (K, H), need (1*K, H) for combine
+                    out = _xllm_moe.moe_combine_result(
+                        expert_out, ws.float().unsqueeze(0), 1, K) # (1, H)
                 else:
                     out = (expert_out * ws.unsqueeze(-1)).sum(
                         0, keepdim=True).to(hidden_states.dtype)   # (1, H)
@@ -2457,10 +2493,12 @@ class Qwen3_5DecoderLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 def _validate_qwen_kv_cache_count(configured_count, kv_caches):
-    if len(kv_caches) != configured_count:
+    # vllm allocates num_hidden_layers KV caches; we only use the first
+    # configured_count (full_attention layers). Accept >= instead of ==.
+    if len(kv_caches) < configured_count:
         raise RuntimeError(
-            "Qwen3.5 allocated KV cache count mismatch: "
-            f"configured {configured_count}, received {len(kv_caches)}")
+            "Qwen3.5 KV cache count insufficient: "
+            f"need {configured_count}, received {len(kv_caches)}")
 
 
 class Qwen3_5Model(nn.Module):
@@ -2587,16 +2625,26 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
 
     def __init__(
         self,
-        vllm_config: VllmConfig,
+        config=None,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        lora_config: Optional[LoRAConfig] = None,
+        scheduler_config: Optional[SchedulerConfig] = None,
+        multimodal_config: Optional[MultiModalConfig] = None,
         prefix: str = "",
+        vllm_config=None,
+        **kwargs,
     ) -> None:
-        config = vllm_config.model_config.hf_config
-        cache_config = vllm_config.cache_config
-        quant_config = vllm_config.quant_config
-        lora_config = vllm_config.lora_config
-        scheduler_config = vllm_config.scheduler_config
-        multimodal_config = getattr(vllm_config.model_config,
-                                    'multimodal_config', None)
+        # BI100: support both new-style (vllm_config=) and old-style init
+        if vllm_config is not None:
+            config = config or vllm_config.model_config.hf_config
+            cache_config = cache_config or vllm_config.cache_config
+            quant_config = quant_config or getattr(vllm_config, 'quant_config', None)
+            lora_config = lora_config or getattr(vllm_config, 'lora_config', None)
+            scheduler_config = scheduler_config or vllm_config.scheduler_config
+            multimodal_config = multimodal_config or getattr(
+                vllm_config, 'multimodal_config',
+                getattr(vllm_config.model_config, 'multimodal_config', None))
         # Apply ix_bridge operator patches on first model init (safe: GPU is ready)
         try:
             from vllm import ix_startup_patch
@@ -2605,8 +2653,8 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
             pass
         _bi100_model_trace("Qwen3_5ForCausalLM initialization begin")
         super().__init__()
+        self._vllm_config = vllm_config  # kept for new-style MambaCacheManager
         self.config = config
-        self.vllm_config = vllm_config
         self.scheduler_config = scheduler_config
         self.multimodal_config = multimodal_config
 
@@ -2626,11 +2674,8 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
             1 for lt in text_cfg.layer_types if lt == "linear_attention")
         self.num_attn_layers = sum(
             1 for lt in text_cfg.layer_types if lt == "full_attention")
-        layers_block_type = getattr(
-            config, "layers_block_type",
-            ["attention"] * text_cfg.num_hidden_layers)
-        self.num_kv_cache_layers = sum(
-            layer_type == "attention" for layer_type in layers_block_type)
+        # Use text_cfg.layer_types directly: only full_attention layers need KV cache
+        self.num_kv_cache_layers = self.num_attn_layers
         if self.num_kv_cache_layers < self.num_attn_layers:
             raise RuntimeError(
                 "Qwen3.5 KV accounting provides fewer caches than "
@@ -2773,23 +2818,50 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
             self._startup_forward_traced = True
             _bi100_model_trace("first model forward entered")
         if self.mamba_cache is None:
-            self.mamba_cache = MambaCacheManager(
-                self.vllm_config,
-                torch.float32,
-                self.num_linear_layers,
-                *self._get_mamba_cache_shape(),
-            )
+            conv_shape, temporal_shape = self._get_mamba_cache_shape()
+            # New-style MambaCacheManager takes (vllm_config, dtype,
+            # num_mamba_layers, conv_state_shape, temporal_state_shape)
+            import inspect as _inspect
+            _mcm_params = list(
+                _inspect.signature(MambaCacheManager.__init__).parameters)
+            if "vllm_config" in _mcm_params:
+                self.mamba_cache = MambaCacheManager(
+                    self._vllm_config,
+                    torch.float32,
+                    self.num_linear_layers,
+                    conv_shape,
+                    temporal_shape,
+                )
+            else:
+                if self.scheduler_config is not None:
+                    max_batch_size = self.scheduler_config.max_num_seqs
+                else:
+                    max_batch_size = 256
+                self.mamba_cache = MambaCacheManager(
+                    torch.float32,
+                    self.num_linear_layers,
+                    max_batch_size,
+                    *self._get_mamba_cache_shape(),
+                )
 
         gdn_restore_key = kwargs.pop("gdn_restore_key", None)
         gdn_capture_points = kwargs.pop("gdn_capture_points", None) or []
         gdn_evict_keys = kwargs.pop("gdn_evict_keys", None) or []
         gdn_segment_offsets = kwargs.pop("gdn_segment_offsets", None) or []
 
-        mamba_params = self.mamba_cache.current_run_tensors(**kwargs)
-        # conv_states:     (num_linear_layers, batch, local_conv_dim, kernel-1)
-        # temporal_states: (num_linear_layers, batch, local_num_v, k_dim, v_dim)
-        conv_states = mamba_params.conv_state
-        temporal_states = mamba_params.ssm_state
+        mamba_cache_params = self.mamba_cache.current_run_tensors(**kwargs)
+        # New API returns MambaCacheParams with .conv_state, .ssm_state,
+        # .state_indices_tensor; old API returned (conv_states, temporal_states)
+        _mamba_state_indices = None
+        if hasattr(mamba_cache_params, 'conv_state'):
+            conv_states = mamba_cache_params.conv_state
+            temporal_states = mamba_cache_params.ssm_state
+            if hasattr(mamba_cache_params, 'state_indices_tensor'):
+                _mamba_state_indices = mamba_cache_params.state_indices_tensor.long()
+                conv_states = conv_states[:, _mamba_state_indices].contiguous()
+                temporal_states = temporal_states[:, _mamba_state_indices].contiguous()
+        else:
+            conv_states, temporal_states = mamba_cache_params
 
         _is_single_seq_prefill = (
             attn_metadata is not None
@@ -2884,6 +2956,11 @@ class Qwen3_5ForCausalLM(nn.Module, HasInnerState, SupportsLoRA,
                 inputs_embeds=inputs_embeds,
                 gdn_capture_offsets=interior_capture_offsets,
                 gdn_segment_offsets=interior_segment_offsets)
+
+        # Scatter modified GDN states back into the full cache
+        if _mamba_state_indices is not None:
+            mamba_cache_params.conv_state[:, _mamba_state_indices] = conv_states
+            mamba_cache_params.ssm_state[:, _mamba_state_indices] = temporal_states
 
         for offset, capture_key in capture_keys.items():
             if offset == query_len:

@@ -21,15 +21,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only GLM-4-0414 model compatible with HuggingFace weights."""
-from typing import Iterable, Optional, Set, Tuple, Union, List
+from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
 from transformers import Glm4Config
 
-from vllm.attention import Attention, AttentionType, AttentionMetadata
+from vllm.attention import Attention, AttentionType
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig , LoRAConfig #, VllmConfig
+from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (QKVParallelLinear,
@@ -37,7 +37,6 @@ from vllm.model_executor.layers.linear import (QKVParallelLinear,
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.sampler import SamplerOutput, Sampler #get_sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
@@ -46,6 +45,7 @@ from .interfaces import SupportsLoRA, SupportsPP
 from .llama import LlamaMLP as Glm4MLP
 from .llama import LlamaModel
 from .utils import AutoWeightsLoader, PPMissingLayer, maybe_prefix
+from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 
 
 class Glm4Attention(nn.Module):
@@ -82,7 +82,7 @@ class Glm4Attention(nn.Module):
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 0.5)
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         self.head_dim = head_dim or hidden_size // self.total_num_heads
-        self.rotary_dim = self.head_dim #int(partial_rotary_factor * self.head_dim)
+        self.rotary_dim = self.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -112,35 +112,24 @@ class Glm4Attention(nn.Module):
             partial_rotary_factor=partial_rotary_factor,
             is_neox_style=False,
         )
-        # self.attn = Attention(self.num_heads,
-        #                       self.head_dim,
-        #                       self.scaling,
-        #                       num_kv_heads=self.num_kv_heads,
-        #                       cache_config=cache_config,
-        #                       quant_config=quant_config,
-        #                       prefix=f"{prefix}.attn",
-        #                       attn_type=attn_type)
         self.attn = Attention(self.num_heads,
                               self.head_dim,
                               self.scaling,
                               num_kv_heads=self.num_kv_heads,
                               cache_config=cache_config,
                               quant_config=quant_config,
-                              prefix=f"{prefix}.attn")
-
-
+                              prefix=f"{prefix}.attn",
+                              attn_type=attn_type)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -194,8 +183,6 @@ class Glm4DecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
@@ -205,31 +192,18 @@ class Glm4DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
-
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
-            kv_cache=kv_cache,
-            attn_metadata=attn_metadata
         )
 
         hidden_states = self.post_self_attn_layernorm(hidden_states)
-        # hidden_states = residual + hidden_states
 
         # Fully Connected
-        # hidden_states = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_mlp_layernorm(hidden_states)
-        # hidden_states = residual + hidden_states
-
-        # Fully Connected
-        # residual = hidden_states
-        # hidden_states = self.post_attention_layernorm(hidden_states)
-        # hidden_states = self.mlp(hidden_states)
-        # hidden_states = self.post_mlp_layernorm(hidden_states)
-        # hidden_states = residual + hidden_states
 
         return hidden_states, residual
 
@@ -248,21 +222,8 @@ ALL_DECODER_LAYER_TYPES = {
     })
 class Glm4Model(LlamaModel):
 
-    # def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-    #     super().__init__(vllm_config=vllm_config,
-    #                      prefix=prefix,
-    #                      layer_type=Glm4DecoderLayer)
-
-    def __init__(self, *, 
-                config: Glm4Config, 
-                cache_config: Optional[CacheConfig] = None, 
-                quant_config: Optional[QuantizationConfig] = None,
-                lora_config: Optional[LoRAConfig] = None,
-                prefix: str = ""):
-        super().__init__(config=config,
-                         cache_config=cache_config,
-                         quant_config=quant_config,
-                         lora_config=lora_config,
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__(vllm_config=vllm_config,
                          prefix=prefix,
                          layer_type=Glm4DecoderLayer)
 
@@ -280,25 +241,17 @@ class Glm4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         ],
     }
 
-    def __init__(self, *,
-                config: Glm4Config, 
-                cache_config: Optional[CacheConfig] = None, 
-                quant_config: Optional[QuantizationConfig] = None,
-                lora_config: Optional[LoRAConfig] = None, 
-                prefix: str = ""):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        # config = vllm_config.model_config.hf_config
-        # quant_config = vllm_config.quant_config
-        # lora_config = vllm_config.lora_config
+        config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+        lora_config = vllm_config.lora_config
 
         self.config = config
         self.lora_config = lora_config
 
         self.quant_config = quant_config
-        self.model = Glm4Model(config=config, 
-                               cache_config=cache_config, 
-                               quant_config=quant_config, 
-                               lora_config=lora_config,
+        self.model = Glm4Model(vllm_config=vllm_config,
                                prefix=maybe_prefix(prefix, "model"))
 
         if get_pp_group().is_last_rank:
@@ -313,8 +266,8 @@ class Glm4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         else:
             self.lm_head = PPMissingLayer()
 
+        self.sampler = get_sampler()    
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.sampler = Sampler()
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
@@ -326,12 +279,10 @@ class Glm4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        hidden_states = self.model(input_ids, positions, kv_caches, attn_metadata, intermediate_tensors,
+        hidden_states = self.model(input_ids, positions, intermediate_tensors,
                                    inputs_embeds)
         return hidden_states
 
@@ -346,11 +297,11 @@ class Glm4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
     def sample(
         self,
-        logits: torch.Tensor,
+        logits: Optional[torch.Tensor],
         sampling_metadata: SamplingMetadata,
     ) -> Optional[SamplerOutput]:
         next_tokens = self.sampler(logits, sampling_metadata)
-        return next_tokens
+        return next_tokens    
 
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> Set[str]:

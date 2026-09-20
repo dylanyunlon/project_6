@@ -15,8 +15,47 @@ except ModuleNotFoundError:
     import ixformer.functions as ops
 from ixformer.distributed import _distributed as cdist
 
+import importlib.util
+import os
 
 logger = init_logger(__name__)
+
+_log_count = {}
+def _log_once(tag, max_n=3):
+    _log_count[tag] = _log_count.get(tag, 0) + 1
+    if _log_count[tag] <= max_n:
+        logger.info("============== change{%s} [%d/%d] ==============", tag, _log_count[tag], max_n)
+
+# 加载 ix_moe_bridge.so
+_bridge = None
+_here = os.path.dirname(os.path.abspath(__file__))
+for _p in [os.path.join(_here, "ix_moe_bridge.so"),
+           "/usr/local/corex/lib64/python3/dist-packages/vllm/ix_moe_bridge.so"]:
+    if os.path.isfile(_p):
+        try:
+            _spec = importlib.util.spec_from_file_location("ix_moe_bridge", _p)
+            _bridge = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_bridge)
+            logger.info("ix_moe_bridge loaded from %s", _p)
+            break
+        except Exception as _e:
+            logger.warning("ix_moe_bridge load failed from %s: %s", _p, _e)
+            _bridge = None
+
+# 加载 xllm_cache.so
+_xllm_cache = None
+for _p in [os.path.join(_here, "xllm_cache.so"),
+           "/usr/local/corex/lib64/python3/dist-packages/vllm/xllm_cache.so"]:
+    if os.path.isfile(_p):
+        try:
+            _spec = importlib.util.spec_from_file_location("xllm_cache", _p)
+            _xllm_cache = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_xllm_cache)
+            logger.info("xllm_cache loaded from %s", _p)
+            break
+        except Exception as _e:
+            logger.warning("xllm_cache load failed from %s: %s", _p, _e)
+            _xllm_cache = None
 
 supports_moe_ops = True
 
@@ -26,7 +65,12 @@ def register_fake(fn):
 
 # activation ops
 def silu_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
-    ops.silu_and_mul(x, out)
+    if _bridge is not None:
+        _log_once("silu_and_mul: bridge path, out.copy_")
+        out.copy_(_bridge.silu_and_mul(x))
+    else:
+        _log_once("silu_and_mul: ixf_F path")
+        ops.silu_and_mul(x, out)
 
 
 def gelu_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
@@ -64,23 +108,20 @@ def paged_attention_v1(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
-    num_kv_heads: int,
+    head_mapping: torch.Tensor,
     scale: float,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     block_size: int,
     max_seq_len: int,
-    alibi_slopes: Optional[torch.Tensor],
-    kv_cache_dtype: str,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
-    tp_rank: int = 0,
-    blocksparse_local_blocks: int = 0,
-    blocksparse_vert_stride: int = 0,
-    blocksparse_block_size: int = 64,
-    blocksparse_head_sliding_step: int = 0,
+    alibi_slopes: Optional[torch.Tensor] = None,
 ) -> None:
-    raise NotImplementedError("Do not use this in our implement")
+    _log_once("paged_attention_v1: ixf_F vllm_single_query_cached_kv_attention")
+    import ixformer.functions as _ixf
+    _ixf.vllm_single_query_cached_kv_attention(
+        out, query, key_cache, value_cache,
+        head_mapping, scale, block_tables, seq_lens,
+        block_size, max_seq_len, alibi_slopes)
 
 
 def paged_attention_v2(
@@ -107,7 +148,16 @@ def paged_attention_v2(
     blocksparse_block_size: int = 64,
     blocksparse_head_sliding_step: int = 0,
 ) -> None:
-    raise NotImplementedError("Do not use this in our implement")
+    if hasattr(ops, 'vllm_single_query_cached_kv_attention_v2'):
+        _log_once("paged_attention_v2: ixf_F v2 path")
+        ops.vllm_single_query_cached_kv_attention_v2(
+            out, exp_sum, max_logits, tmp_out, query,
+            key_cache, value_cache, num_kv_heads, scale,
+            block_tables, seq_lens, block_size, max_seq_len,
+            alibi_slopes)
+        return
+    _log_once("paged_attention_v2: NOT AVAILABLE, raise")
+    raise NotImplementedError("paged_attention_v2 not available in this ixformer build")
 
 
 def paged_attention_rocm(
@@ -176,7 +226,14 @@ def rms_norm(out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor,
 def fused_add_rms_norm(input: torch.Tensor, residual: torch.Tensor,
                        weight: torch.Tensor, epsilon: float,
                        residual_alpha: Optional[float] = 1) -> None:
-    ops.residual_rms_norm(input=input, weight=weight, residual=residual, eps=epsilon, residual_alpha=residual_alpha)
+    if _bridge is not None:
+        _log_once("fused_add_rms_norm: bridge path")
+        if residual_alpha is not None and residual_alpha != 1:
+            residual.mul_(residual_alpha)
+        _bridge.fused_add_rms_norm(input, residual, weight, epsilon)
+    else:
+        _log_once("fused_add_rms_norm: ixf_F residual_rms_norm")
+        ops.residual_rms_norm(input=input, weight=weight, residual=residual, eps=epsilon, residual_alpha=residual_alpha)
 
 
 def advance_step_flashattn(num_seqs: int, num_queries: int, block_size: int,
@@ -1140,14 +1197,22 @@ def moe_wna16_gemm(input: torch.Tensor, output: torch.Tensor,
 def topk_softmax(topk_weights: torch.Tensor, topk_ids: torch.Tensor,
                  token_expert_indicies: torch.Tensor,
                  gating_output: torch.Tensor) -> None:
-    # BI-V100 ixformer 3.2.3 lacks vllm_moe_topk_softmax.
-    # Dispatch chain: ops .so → corex .so → PyTorch fallback (never crash).
+    # 三级 fallback: bridge(.float()) → ixf_F → corex → PyTorch
+    if _bridge is not None:
+        _log_once("topk_softmax: bridge path, gating.float()")
+        topk = topk_weights.shape[-1]
+        w, ids, _tei = _bridge.topk_softmax(gating_output.float(), topk, True)
+        topk_weights.copy_(w)
+        topk_ids.copy_(ids.to(topk_ids.dtype))
+        return
     if hasattr(ops, 'vllm_moe_topk_softmax'):
+        _log_once("topk_softmax: ixf_F path")
         ops.vllm_moe_topk_softmax(topk_weights, topk_ids,
                                   token_expert_indicies, gating_output)
         return
     try:
         from vllm import corex_moe_topk_softmax as _cmts
+        _log_once("topk_softmax: corex path")
         topk = topk_weights.shape[-1]
         w, ids = _cmts.moe_topk_softmax(gating_output, topk, True)
         topk_weights.copy_(w)
@@ -1156,6 +1221,7 @@ def topk_softmax(topk_weights: torch.Tensor, topk_ids: torch.Tensor,
     except (ImportError, Exception):
         pass
     # Pure PyTorch fallback
+    _log_once("topk_softmax: PyTorch fallback")
     topk = topk_weights.shape[-1]
     scores = torch.softmax(gating_output.float(), dim=-1)
     tw, ti = torch.topk(scores, topk, dim=-1)
@@ -1193,7 +1259,25 @@ def reshape_and_cache(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
 ) -> None:
-    raise NotImplementedError("Do not use this in our implement")
+    import ixformer.functions as _ixf
+    if hasattr(_ixf, 'vllm_cache_ops_reshape_and_cache'):
+        _log_once("reshape_and_cache: ixformer.functions path")
+        _ixf.vllm_cache_ops_reshape_and_cache(key, value, key_cache,
+                                               value_cache, slot_mapping.to(torch.int32))
+    elif _xllm_cache is not None:
+        _log_once("reshape_and_cache: xllm_cache path, slot_i32 first")
+        slot_mapping_i32 = slot_mapping.flatten().to(torch.int32)
+        _xllm_cache.reshape_paged_cache(slot_mapping_i32, key, value,
+                                        key_cache, value_cache)
+    elif _bridge is not None:
+        _log_once("reshape_and_cache: bridge path, slot_i32")
+        slot_mapping_i32 = slot_mapping.flatten().to(torch.int32)
+        _bridge.reshape_and_cache(key, value, key_cache, value_cache,
+                                 slot_mapping_i32)
+    else:
+        _log_once("reshape_and_cache: ops fallback")
+        ops.vllm_cache_ops_reshape_and_cache(key, value, key_cache,
+                                             value_cache, slot_mapping)
 
 
 def reshape_and_cache_flash(
@@ -1593,4 +1677,4 @@ def sbgmv_shrink(x: torch.Tensor,
 def dynamic_scaled_quant_dynamic_int8(x, input_scales=None, int8_out=None, scales=None):
     return ops.dynamic_scaled_quant_smoothquant(x, input_scales, int8_out, scales)
 
-weak_ref_tensor = ops.weak_ref_tensor
+weak_ref_tensor = getattr(ops, 'weak_ref_tensor', None)

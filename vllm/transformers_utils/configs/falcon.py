@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapted from
 # https://huggingface.co/tiiuae/falcon-7b/blob/main/configuration_RW.py
 # Copyright 2023 The vLLM team.
@@ -34,7 +36,6 @@ class RWConfig(PretrainedConfig):
         hidden_size=64,
         n_layer=2,
         n_head=8,
-        num_ln_in_parallel_attn=None,
         layer_norm_epsilon=1e-5,
         initializer_range=0.02,
         use_cache=True,
@@ -74,7 +75,6 @@ class RWConfig(PretrainedConfig):
         if self.hidden_size == 8192:
             # Hack for falcon-40b
             self.new_decoder_architecture = True
-        self.num_ln_in_parallel_attn = num_ln_in_parallel_attn
 
         super().__init__(bos_token_id=bos_token_id,
                          eos_token_id=eos_token_id,

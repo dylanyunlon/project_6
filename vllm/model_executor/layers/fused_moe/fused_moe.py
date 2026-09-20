@@ -18,7 +18,10 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size)
 from vllm.model_executor.layers.fused_moe.utils import _fp8_quantize
 from vllm.platforms import current_platform
-from vllm.utils import direct_register_custom_op
+try:
+    from vllm.utils import direct_register_custom_op
+except ImportError:
+    direct_register_custom_op = None
 import vllm._custom_ops as ops
 
 from .rocm_aiter_fused_moe import (is_rocm_aiter_moe_enabled,
@@ -1001,12 +1004,13 @@ def inplace_fused_experts_fake(
     pass
 
 
-direct_register_custom_op(
-    op_name="inplace_fused_experts",
-    op_func=inplace_fused_experts,
-    mutates_args=["hidden_states"],
-    fake_impl=inplace_fused_experts_fake,
-)
+if direct_register_custom_op is not None:
+    direct_register_custom_op(
+        op_name="inplace_fused_experts",
+        op_func=inplace_fused_experts,
+        mutates_args=["hidden_states"],
+        fake_impl=inplace_fused_experts_fake,
+    )
 
 
 def outplace_fused_experts(
@@ -1059,12 +1063,13 @@ def outplace_fused_experts_fake(
     return torch.empty_like(hidden_states)
 
 
-direct_register_custom_op(
-    op_name="outplace_fused_experts",
-    op_func=outplace_fused_experts,
-    mutates_args=[],
-    fake_impl=outplace_fused_experts_fake,
-)
+if direct_register_custom_op is not None:
+    direct_register_custom_op(
+        op_name="outplace_fused_experts",
+        op_func=outplace_fused_experts,
+        mutates_args=[],
+        fake_impl=outplace_fused_experts_fake,
+    )
 
 
 def torch_vllm_inplace_fused_experts(**kwargs) -> torch.Tensor:

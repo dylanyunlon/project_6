@@ -289,6 +289,10 @@ def validate_parsed_serve_args(args: argparse.Namespace):
         raise TypeError("Error: --enable-reasoning requires "
                         "--reasoning-parser")
 
+    # BI100 compat: auto-enable reasoning when --reasoning-parser is provided
+    if args.reasoning_parser and not args.enable_reasoning:
+        args.enable_reasoning = True
+
 
 def create_parser_for_docs() -> FlexibleArgumentParser:
     parser_for_docs = FlexibleArgumentParser(

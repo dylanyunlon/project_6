@@ -101,6 +101,34 @@ class ReasoningParser:
         previously been parsed and extracted (see constructor)
         """
 
+    def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
+        """Count the number of tokens that belong to reasoning content.
+
+        The default implementation looks for a ``think_end_token_id``
+        attribute (set by concrete parsers such as ``Qwen3ReasoningParser``).
+        Everything up to and including the end marker is counted as reasoning.
+        Sub-classes may override for more precise counting.
+
+        Parameters:
+            token_ids: Complete output token sequence for one choice.
+
+        Returns:
+            Number of tokens classified as reasoning.
+        """
+        end_id = getattr(self, "think_end_token_id", None)
+        if end_id is None:
+            return 0
+        try:
+            idx = list(token_ids).index(end_id)
+            # +1 to include the end-marker itself
+            return idx + 1
+        except ValueError:
+            # No end marker found — either all reasoning or none.
+            start_id = getattr(self, "think_start_token_id", None)
+            if start_id is not None and start_id in token_ids:
+                return len(token_ids)
+            return 0
+
 
 class ReasoningParserManager:
     reasoning_parsers: dict[str, type] = {}

@@ -21,15 +21,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from vllm.attention import Attention, AttentionMetadata
+from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig#, VllmConfig
+from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (get_pp_group,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
@@ -44,7 +44,7 @@ from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.sampler import SamplerOutput, Sampler
+from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -68,17 +68,20 @@ class Qwen3MoeMLP(nn.Module):
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size, [intermediate_size] * 2,
             bias=False,
-            quant_config=quant_config)
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj")
         self.down_proj = RowParallelLinear(intermediate_size,
                                            hidden_size,
                                            bias=False,
                                            quant_config=quant_config,
-                                           reduce_results=reduce_results)
+                                           reduce_results=reduce_results,
+                                           prefix=f"{prefix}.down_proj")
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. "
                              "Only silu is supported for now.")
@@ -97,6 +100,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -112,12 +116,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                                 intermediate_size=config.moe_intermediate_size,
                                 reduce_results=False,
                                 renormalize=config.norm_topk_prob,
-                                quant_config=quant_config)
+                                quant_config=quant_config,
+                                prefix=f"{prefix}.experts")
 
         self.gate = ReplicatedLinear(config.hidden_size,
                                      config.num_experts,
                                      bias=False,
-                                     quant_config=None)
+                                     quant_config=None,
+                                     prefix=f"{prefix}.gate")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
@@ -182,12 +188,14 @@ class Qwen3MoeAttention(nn.Module):
                                           self.total_num_heads,
                                           self.total_num_kv_heads,
                                           bias=qkv_bias,
-                                          quant_config=quant_config)
+                                          quant_config=quant_config,
+                                          prefix=f"{prefix}.qkv_proj")
 
         self.o_proj = RowParallelLinear(self.total_num_heads * self.head_dim,
                                         hidden_size,
                                         bias=False,
-                                        quant_config=quant_config)
+                                        quant_config=quant_config,
+                                        prefix=f"{prefix}.o_proj")
 
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -211,8 +219,6 @@ class Qwen3MoeAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -227,7 +233,7 @@ class Qwen3MoeAttention(nn.Module):
         k_by_head = self.k_norm.forward_native(k_by_head)
         k = k_by_head.view(k.shape)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -270,12 +276,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 config.num_experts > 0 and
             (layer_idx + 1) % config.decoder_sparse_step == 0):
             self.mlp = Qwen3MoeSparseMoeBlock(config=config,
-                                              quant_config=quant_config)
+                                              quant_config=quant_config,
+                                              prefix=f"{prefix}.mlp")
         else:
             self.mlp = Qwen3MoeMLP(hidden_size=config.hidden_size,
                                    intermediate_size=config.intermediate_size,
                                    hidden_act=config.hidden_act,
-                                   quant_config=quant_config)
+                                   quant_config=quant_config,
+                                   prefix=f"{prefix}.mlp")
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
@@ -285,8 +293,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
@@ -299,8 +305,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
-            kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
         )
 
         # Fully Connected
@@ -309,14 +313,16 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
+
+@support_torch_compile
 class Qwen3MoeModel(nn.Module):
 
-    def __init__(self, *, 
-                 config: PretrainedConfig,
-                 cache_config: Optional[CacheConfig] = None,
-                 quant_config: Optional[QuantizationConfig] = None,                 
-                 prefix: str = ""):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+
+        config = vllm_config.model_config.hf_config
+        cache_config = vllm_config.cache_config
+        quant_config = vllm_config.quant_config
 
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -324,7 +330,7 @@ class Qwen3MoeModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-        )
+            prefix=f"{prefix}.embed_tokens")
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: Qwen3MoeDecoderLayer(config=config,
@@ -345,8 +351,6 @@ class Qwen3MoeModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
@@ -362,9 +366,7 @@ class Qwen3MoeModel(nn.Module):
             residual = intermediate_tensors["residual"]
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            hidden_states, residual = layer(positions, hidden_states,
-                                            kv_caches[i - self.start_layer],
-                                            attn_metadata, residual)
+            hidden_states, residual = layer(positions, hidden_states, residual)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,
@@ -378,19 +380,13 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP):
 
     fall_back_to_pt_during_load = False
 
-    def __init__(self, *, 
-                 config: PretrainedConfig,
-                 cache_config: Optional[CacheConfig] = None,
-                 quant_config: Optional[QuantizationConfig] = None, 
-                 prefix: str = ""):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-
+        config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
-        
-        self.model = Qwen3MoeModel(config=config,
-                                   cache_config=cache_config,
-                                   quant_config=quant_config,
+        self.model = Qwen3MoeModel(vllm_config=vllm_config,
                                    prefix=maybe_prefix(prefix, "model"))
         self.lm_head = ParallelLMHead(config.vocab_size,
                                       config.hidden_size,
@@ -398,7 +394,7 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP):
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.sampler = Sampler()
+        self.sampler = get_sampler()
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
 
@@ -409,13 +405,10 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        hidden_states = self.model(input_ids, positions, kv_caches,
-                                   attn_metadata, intermediate_tensors,
+        hidden_states = self.model(input_ids, positions, intermediate_tensors,
                                    inputs_embeds)
         return hidden_states
 

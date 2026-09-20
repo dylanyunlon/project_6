@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# SPDX-License-Identifier: Apache-2.0
 """
 Fused Attention
 ===============
@@ -301,124 +302,6 @@ def _attn_fwd_inner(
             },
             num_stages=1,
             num_warps=4,
-        ),
-        # BI-V100 (SM=16, SMEM≤48KB): smaller BLOCK_M maintains occupancy,
-        # asymmetric M/N trades Q-tile for longer K/V sweeps per CTA.
-        # Autotune will discard these if they're slower — zero risk.
-        triton.Config(
-            {
-                "BLOCK_M": 64,
-                "BLOCK_N": 32,
-                "waves_per_eu": 2,
-                "PRE_LOAD_V": False,
-            },
-            num_stages=1,
-            num_warps=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_M": 32,
-                "BLOCK_N": 64,
-                "waves_per_eu": 2,
-                "PRE_LOAD_V": False,
-            },
-            num_stages=1,
-            num_warps=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_M": 64,
-                "BLOCK_N": 64,
-                "waves_per_eu": 2,
-                "PRE_LOAD_V": False,
-            },
-            num_stages=1,
-            num_warps=4,
-        ),
-        # BI-V100 num_stages=2 variants:
-        # CCCL transform benchmark (babelstream.cu) found bif=8 (64KB prefetch)
-        # dominates bif=0 (32KB) on BI-V100. Physical explanation:
-        #   BW_per_SM × memory_latency = 56 GB/s × 1100ns ≈ 62KB
-        # Triton's num_stages controls software pipelining depth, which is
-        # the same concept as CCCL's bytes_in_flight. num_stages=2 doubles
-        # the prefetch window, matching the 64KB sweet spot.
-        # Source: cccl_upstream/cub/benchmarks/bench/transform/babelstream.cu
-        triton.Config(
-            {
-                "BLOCK_M": 64,
-                "BLOCK_N": 64,
-                "waves_per_eu": 2,
-                "PRE_LOAD_V": False,
-            },
-            num_stages=2,
-            num_warps=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_M": 32,
-                "BLOCK_N": 64,
-                "waves_per_eu": 2,
-                "PRE_LOAD_V": True,
-            },
-            num_stages=2,
-            num_warps=4,
-        ),
-        # BI-V100 minimal tile: highest occupancy for short sequences.
-        # CCCL scan benchmark found no_delay optimal (dcid=0) because
-        # 16 SMs → ~32 CTAs → tile_status fits in 6MB L2 → no contention.
-        # Same logic: small tiles + many CTAs maximize SM utilization.
-        # Source: cccl_upstream/cub/benchmarks/bench/scan/exclusive/sum.cu
-        triton.Config(
-            {
-                "BLOCK_M": 32,
-                "BLOCK_N": 32,
-                "waves_per_eu": 4,
-                "PRE_LOAD_V": False,
-            },
-            num_stages=2,
-            num_warps=2,
-        ),
-        # BI-V100 warp-uniform optimization (from make_warp_uniform.cuh):
-        # With 16 SMs and small CTAs (num_warps=2 → 64 threads), we can
-        # run 16+ CTAs simultaneously. All threads in each warp access
-        # the same batch/head (uniform control flow) → zero divergence.
-        # num_stages=2 doubles prefetch window → matches 64KB BIF sweet spot.
-        # PRE_LOAD_V=True: pre-load V tile into registers before score
-        # computation. Safe for small BLOCK_N because register pressure is:
-        #   Q: BLOCK_M×BLOCK_D = 32×256 = 8K regs (fp16)
-        #   V: BLOCK_N×BLOCK_D = 32×256 = 8K regs (fp16)
-        #   Total: 16K regs << 64K regs/SM available on BI-V100
-        # This mirrors CCCL agent_reduce ConsumeFullTile vectorized path
-        # which loads VectorT into registers before applying reduction.
-        triton.Config(
-            {
-                "BLOCK_M": 32,
-                "BLOCK_N": 32,
-                "waves_per_eu": 4,
-                "PRE_LOAD_V": True,
-            },
-            num_stages=2,
-            num_warps=2,
-        ),
-        triton.Config(
-            {
-                "BLOCK_M": 64,
-                "BLOCK_N": 32,
-                "waves_per_eu": 2,
-                "PRE_LOAD_V": True,
-            },
-            num_stages=2,
-            num_warps=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_M": 16,
-                "BLOCK_N": 32,
-                "waves_per_eu": 4,
-                "PRE_LOAD_V": True,
-            },
-            num_stages=2,
-            num_warps=2,
         ),
     ],
     key=['IS_CAUSAL', 'dropout_p', 'BLOCK_DMODEL'],
@@ -745,8 +628,8 @@ def attn_fwd(
                                         causal_start_idx,
                                         dtype=tl.int32)
             mask_m_offsets = start_m_idx + tl.arange(0, BLOCK_M)
-            out_ptrs_mask = (mask_m_offsets[:, None] >=
-                             out_mask_boundary[None, :])
+            out_ptrs_mask = (mask_m_offsets[:, None]
+                             >= out_mask_boundary[None, :])
             z = 0.0
             acc = tl.where(out_ptrs_mask, acc, z.to(acc.type.element_ty))
     # write back LSE
