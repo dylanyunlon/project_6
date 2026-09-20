@@ -7,3 +7,5 @@ pkgs/
 enginex_base/
 __pycache__/
 *.pyc
+diagnose_empty_response.py
+fix_reasoning_v1.tar.gz

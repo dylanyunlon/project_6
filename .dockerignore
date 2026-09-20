@@ -3,8 +3,6 @@
 **/.git
 cccl_upstream/
 upstream_ref/
-vllm/
-ixformer_sdk/
 muh/
 ex_engine/fla_kernels/
 ex_engine/moe/

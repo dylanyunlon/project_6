@@ -177,6 +177,45 @@ class LinearMethodBase(QuantizeMethodBase):
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
 
+    # Lazy-loaded ix_moe_bridge.so for fp16 GEMV acceleration.
+    # ix_moe_bridge.linear: 31μs vs F.linear: 115μs on BI-V100 (M=1 decode).
+    _bridge = None
+    _bridge_checked = False
+
+    @classmethod
+    def _get_bridge(cls):
+        if cls._bridge_checked:
+            return cls._bridge
+        cls._bridge_checked = True
+        import os, importlib.util
+        search = []
+        try:
+            import vllm as _vllm
+            search.append(os.path.join(
+                os.path.dirname(_vllm.__file__), "ix_moe_bridge.so"))
+        except ImportError:
+            pass
+        search.append(
+            "/workspace/qwen3_6_scripts/prebuilt/"
+            "corex-3.2.3-ivcore10/ix_moe_bridge.so")
+        for p in search:
+            if os.path.isfile(p):
+                try:
+                    spec = importlib.util.spec_from_file_location(
+                        "ix_moe_bridge", p)
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    if hasattr(mod, "linear"):
+                        cls._bridge = mod
+                        logger.info(
+                            "UnquantizedLinearMethod: ix_moe_bridge.linear "
+                            "loaded from %s", p)
+                        return cls._bridge
+                except Exception as e:
+                    logger.debug(
+                        "ix_moe_bridge load failed from %s: %s", p, e)
+        return None
+
     def create_weights(self, layer: torch.nn.Module,
                        input_size_per_partition: int,
                        output_partition_sizes: list[int], input_size: int,
@@ -194,7 +233,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
               layer: torch.nn.Module,
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-
+        bridge = UnquantizedLinearMethod._get_bridge()
+        if bridge is not None and x.dtype == torch.float16:
+            return bridge.linear(x, layer.weight, bias)
         return F.linear(x, layer.weight, bias)
 
 
