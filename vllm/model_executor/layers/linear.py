@@ -177,28 +177,44 @@ class LinearMethodBase(QuantizeMethodBase):
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
 
-    # ix_moe_bridge.linear: ixformer GEMV, 2.6x-3.6x faster for M<=1
+    # Lazy-loaded ix_moe_bridge.so for fp16 GEMV acceleration.
+    # ix_moe_bridge.linear: 31μs vs F.linear: 115μs on BI-V100 (M=1 decode).
     _bridge = None
-    @staticmethod
-    def _load_bridge():
-        if UnquantizedLinearMethod._bridge is not None:
-            return
-        import importlib.util, os
-        for p in [
-            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-                os.path.abspath(__file__)))), "ix_moe_bridge.so"),
-        ]:
+    _bridge_checked = False
+
+    @classmethod
+    def _get_bridge(cls):
+        if cls._bridge_checked:
+            return cls._bridge
+        cls._bridge_checked = True
+        import os, importlib.util
+        search = []
+        try:
+            import vllm as _vllm
+            search.append(os.path.join(
+                os.path.dirname(_vllm.__file__), "ix_moe_bridge.so"))
+        except ImportError:
+            pass
+        search.append(
+            "/workspace/qwen3_6_scripts/prebuilt/"
+            "corex-3.2.3-ivcore10/ix_moe_bridge.so")
+        for p in search:
             if os.path.isfile(p):
                 try:
-                    spec = importlib.util.spec_from_file_location("ix_moe_bridge", p)
+                    spec = importlib.util.spec_from_file_location(
+                        "ix_moe_bridge", p)
                     mod = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(mod)
                     if hasattr(mod, "linear"):
-                        UnquantizedLinearMethod._bridge = mod
-                        return
-                except Exception:
-                    pass
-
+                        cls._bridge = mod
+                        logger.info(
+                            "UnquantizedLinearMethod: ix_moe_bridge.linear "
+                            "loaded from %s", p)
+                        return cls._bridge
+                except Exception as e:
+                    logger.debug(
+                        "ix_moe_bridge load failed from %s: %s", p, e)
+        return None
 
     def create_weights(self, layer: torch.nn.Module,
                        input_size_per_partition: int,
@@ -217,25 +233,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
               layer: torch.nn.Module,
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # bridge.linear: 2.6x-3.6x faster than F.linear on BI-V100 decode
-        # Verified: max_relative_diff=0.000000 across all Qwen3.6 GEMM shapes
-        _cnt = getattr(UnquantizedLinearMethod, '_call_cnt', 0)
-        UnquantizedLinearMethod._call_cnt = _cnt + 1
-        if _cnt < 5:
-            import sys
-            print(f"[LINEAR] call={_cnt} bridge={UnquantizedLinearMethod._bridge is not None} x.dtype={x.dtype} w.dtype={layer.weight.dtype} x={list(x.shape)}", file=sys.stderr, flush=True)
-        if (UnquantizedLinearMethod._bridge is not None
-                and x.dtype == torch.float16
-                and layer.weight.dtype == torch.float16):
-            return UnquantizedLinearMethod._bridge.linear(x, layer.weight, bias)
+        bridge = UnquantizedLinearMethod._get_bridge()
+        if bridge is not None and x.dtype == torch.float16:
+            return bridge.linear(x, layer.weight, bias)
         return F.linear(x, layer.weight, bias)
 
-
-# Auto-load bridge at import time
-try:
-    UnquantizedLinearMethod._load_bridge()
-except Exception:
-    pass
 
 class LinearBase(torch.nn.Module):
     """Base linear layer.
